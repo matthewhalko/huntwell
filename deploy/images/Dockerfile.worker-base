@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+#
+# The Huntwell worker TOOLCHAIN base — Node, the Playwright MCP server and the
+# Cursor CLI. It contains no Huntwell code.
+#
+# This is the one image that cannot be assembled by crane, because installing
+# things means RUNNING commands and crane only appends layers. So it is built
+# with a builder, rarely — its contents change when a tool version changes, not
+# when the product does.
+#
+# Build and publish it once:
+#   ./deploy/images/build-worker-base.sh
+#
+# After that, every code change is a crane append onto this base, with no
+# builder involved at all:
+#   ./build.sh --images
+#
+# ARG BINDIR is gone on purpose: the executable is NOT copied in here. It
+# arrives as the layer deploy/images/build-images.sh appends.
+FROM ubuntu:24.04
+# The architecture of the image being built, in Node's naming (x64 | arm64).
+ARG NODE_ARCH=x64
+ARG NODE_VERSION=22.23.2
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl python3 bash xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node from the official tarball rather than apt: noble ships Node 18, and
+# @playwright/mcp wants a current one. Pinned, so an image built today and one
+# built in six months run the same runtime.
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1 \
+            --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md \
+            --exclude='*/include/node' --exclude='*/share/doc' --exclude='*/share/man' \
+ && node --version && npm --version
+
+# The browser MCP server the agent drives (connects to the remote browser over
+# CDP — no local Chrome, no Playwright browser download).
+RUN npm install -g @playwright/mcp@latest && npm cache clean --force
+
+# The Cursor agent CLI. Installs to /root/.local/share + symlinks /root/.local/bin.
+RUN curl https://cursor.com/install -fsS | bash
+ENV PATH="/root/.local/bin:${PATH}"

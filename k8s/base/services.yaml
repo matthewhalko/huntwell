@@ -1,0 +1,224 @@
+# The six Huntwell services, one Deployment each.
+#
+# Everything runs on one server. What decides the shape of each entry is not
+# size but two questions: does anything call it, and can you run two of it?
+#
+#   website       called by the edge          scale freely (stateless)
+#   admin         called by an operator       one — it reconciles clusters
+#   planning      called by website + curl    scale freely (atomic claim)
+#   scheduling    called by nothing           one fires; more are warm standbys
+#   notification  called by nothing           scale freely (atomic claim)
+#
+# Workers are deliberately absent. A run executes as a Job the website creates
+# per run (RUN_DISPATCH=k8s), so worker capacity is "how many Jobs may run at
+# once", not a Deployment to size. When there is a second machine, the admin's
+# host registry takes over and puts warm worker pools on each — that is the same
+# knob, moved, and it is why the admin is here from the start.
+apiVersion: v1
+kind: Service
+metadata:
+  name: website
+  namespace: huntwell
+spec:
+  selector: { app: website }
+  ports: [{ port: 80, targetPort: 8611 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: website
+  namespace: huntwell
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: website }
+  template:
+    metadata:
+      labels: { app: website }
+    spec:
+      # The website creates a Job per run and reads its pod log, so it carries
+      # the dispatch rights. It is the only service that talks to the Kubernetes
+      # API at all.
+      serviceAccountName: huntwell-runs
+      containers:
+        - name: website
+          image: huntwell-website:dev
+          ports: [{ containerPort: 8611 }]
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8611 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8611 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin
+  namespace: huntwell
+spec:
+  selector: { app: admin }
+  ports: [{ port: 80, targetPort: 8710 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin
+  namespace: huntwell
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two admins reconciling the same hosts would
+  # fight over the same StatefulSets during a rollout.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: admin }
+  template:
+    metadata:
+      labels: { app: admin }
+    spec:
+      serviceAccountName: huntwell-admin
+      containers:
+        - name: admin
+          image: huntwell-admin:dev
+          ports: [{ containerPort: 8710 }]
+          env:
+            # Inside the cluster it must bind every interface, not loopback —
+            # the default is loopback precisely because the usual deployment is
+            # a server where only a tunnel should reach it.
+            - { name: HUNTWELL_ADMIN_ADDR, value: "0.0.0.0:8710" }
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8710 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: planning
+  namespace: huntwell
+spec:
+  selector: { app: planning }
+  ports: [{ port: 80, targetPort: 8612 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planning
+  namespace: huntwell
+spec:
+  # Raise this to draft more plans at once. Claiming is an atomic
+  # queued -> drafting UPDATE, so replicas take different plans and never the
+  # same one. This is the "many planner nodes" knob.
+  replicas: 1
+  selector:
+    matchLabels: { app: planning }
+  template:
+    metadata:
+      labels: { app: planning }
+    spec:
+      containers:
+        - name: planning
+          image: huntwell-planning:dev
+          ports: [{ containerPort: 8612 }]
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8612 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          # Drafting runs an agent: it wants room, and it is the reason this
+          # image is the big one.
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits: { cpu: "2", memory: "3Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduling
+  namespace: huntwell
+spec:
+  selector: { app: scheduling }
+  ports: [{ port: 80, targetPort: 8614 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduling
+  namespace: huntwell
+spec:
+  # One is enough. More is safe but pointless: they take a Postgres advisory
+  # lock and only the holder fires, so the rest are warm standbys.
+  replicas: 1
+  selector:
+    matchLabels: { app: scheduling }
+  template:
+    metadata:
+      labels: { app: scheduling }
+    spec:
+      containers:
+        - name: scheduling
+          image: huntwell-scheduling:dev
+          ports: [{ containerPort: 8614 }]
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8614 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { cpu: "250m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: huntwell
+spec:
+  selector: { app: notification }
+  ports: [{ port: 80, targetPort: 8615 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: huntwell
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: notification }
+  template:
+    metadata:
+      labels: { app: notification }
+    spec:
+      containers:
+        - name: notification
+          image: huntwell-notification:dev
+          ports: [{ containerPort: 8615 }]
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8615 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { cpu: "250m", memory: "256Mi" }

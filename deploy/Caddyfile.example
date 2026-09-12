@@ -1,0 +1,9 @@
+# Terminate TLS in front of huntwell. The download API's tokens travel in
+# URLs, so plain HTTP off the machine would put them on the wire.
+#
+# Set HUNTWELL_TRUST_PROXY=1 in `global` so rate limiting and key address
+# restrictions key off the real client address from X-Forwarded-For.
+huntwell.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8611
+}

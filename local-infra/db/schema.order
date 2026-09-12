@@ -1,0 +1,30 @@
+# Order the DDL in db/public/ is applied — foreign keys need their targets
+# first. Both local-infra/start.sh and cmd/build.rs read this file, so the
+# server's startup migration and the local cluster agree exactly.
+account.sql
+session.sql
+# Team: other people granted access to an account's workspace.
+membership.sql
+invite.sql
+plan.sql
+prospect.sql
+artifact.sql
+report.sql
+asset.sql
+search_frontier.sql
+search_query.sql
+visited_page.sql
+# The edges between them: the plan's knowledge graph.
+trail_edge.sql
+prompt_variant.sql
+execution.sql
+execution_log.sql
+api_key.sql
+api_audit.sql
+account_browser.sql
+account_usage.sql
+host.sql
+control_setting.sql
+admin_user.sql
+route_log.sql
+mail_outbox.sql

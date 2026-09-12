@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "multidev-default": {
+      "url": "http://192.168.1.143:1357/mcp/5fb5f6043ceae93417b694e9cd65a7a47db087cdbdba365a"
+    }
+  }
+}

@@ -1,0 +1,86 @@
+# One Postgres for the cluster, two logical databases: `auth` (auth service) and
+# `core` (plans + prospects + runs services and the run-worker). A StatefulSet
+# with a PVC keeps the data across restarts. For production this is replaced by
+# a managed database — the services only need the connection URLs in the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: huntwell-postgres-init
+  namespace: huntwell
+data:
+  # Run once, on first cluster init, as the superuser POSTGRES_USER (huntwell).
+  init.sql: |
+    CREATE DATABASE auth;
+    CREATE DATABASE core;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: huntwell
+spec:
+  selector:
+    app: huntwell
+    component: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: huntwell
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: huntwell
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: huntwell
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: huntwell
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: huntwell-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: huntwell
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "huntwell", "-d", "core"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: init
+          configMap:
+            name: huntwell-postgres-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

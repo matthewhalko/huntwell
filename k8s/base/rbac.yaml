@@ -1,0 +1,89 @@
+# The runs service creates and deletes run-worker Jobs and reads their pods'
+# logs through the in-cluster Kubernetes API, so it needs a ServiceAccount with
+# exactly those rights — and nothing else. The worker itself needs no API
+# access (it only talks to Postgres, Cursor and Browserbase).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: huntwell-runs
+  namespace: huntwell
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: huntwell-worker
+  namespace: huntwell
+---
+# The admin drives clusters through kubectl. On this one server that is this
+# cluster, reached with the pod's own ServiceAccount instead of a pasted
+# kubeconfig. Its rights are wider than the website's on purpose: it creates the
+# StatefulSets that carry warm worker pools, which is the whole job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: huntwell-admin
+  namespace: huntwell
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: huntwell-admin
+  namespace: huntwell
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "statefulsets/scale", "deployments"]
+    verbs: ["create", "update", "patch", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["create", "update", "patch", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Pull secrets for a private registry, written when a host is registered.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "patch", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: huntwell-admin
+  namespace: huntwell
+subjects:
+  - kind: ServiceAccount
+    name: huntwell-admin
+    namespace: huntwell
+roleRef:
+  kind: Role
+  name: huntwell-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: huntwell-run-dispatch
+  namespace: huntwell
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: huntwell-run-dispatch
+  namespace: huntwell
+subjects:
+  - kind: ServiceAccount
+    name: huntwell-runs
+    namespace: huntwell
+roleRef:
+  kind: Role
+  name: huntwell-run-dispatch
+  apiGroup: rbac.authorization.k8s.io

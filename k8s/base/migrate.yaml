@@ -1,0 +1,44 @@
+# Applies the schema before anything serves.
+#
+# One database now, not the auth/core pair. That split existed because auth ran
+# as its own service with its own connection; the website serves auth and
+# everything else in one process, so two databases would mean one process
+# holding two pools and no boundary between them. Worth being explicit that this
+# is a boundary given up, not one that was never there.
+#
+# The Job is idempotent and so is the schema — every statement is
+# IF NOT EXISTS, and `store::migrate` takes an advisory lock, so re-running this
+# or racing a service that migrates on its own start is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: huntwell
+  annotations:
+    # Kustomize re-applies a Job with the same name on every deploy, and a Job's
+    # spec is immutable. Deleting on completion keeps the name free.
+    kubectl.kubernetes.io/last-applied-configuration: ""
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # Postgres accepts connections a little after the pod is Ready. Waiting
+        # here turns a crash-and-retry into a pause.
+        - name: wait-for-db
+          image: postgres:18
+          command: ["sh", "-c", 'until pg_isready -d "$DATABASE_URL"; do sleep 1; done']
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: huntwell-secrets, key: HUNTWELL_DATABASE_URL } }
+      containers:
+        - name: migrate
+          # The website image: it is the one the cluster already pulls, and the
+          # website binary answers `migrate`.
+          image: huntwell-website:dev
+          args: ["migrate"]
+          envFrom:
+            - secretRef: { name: huntwell-secrets }
+            - configMapRef: { name: huntwell-config }

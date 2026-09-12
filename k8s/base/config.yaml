@@ -1,0 +1,36 @@
+# Non-secret settings shared by every Huntwell pod (services and run-worker
+# Jobs, via envFrom). Secrets — database URLs, Cursor and Browserbase keys, the
+# session secret — live in the `huntwell-secrets` Secret instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: huntwell-config
+  namespace: huntwell
+data:
+  HUNTWELL_ADDR: "0.0.0.0:8611"
+  HUNTWELL_OPEN_SIGNUP: "1"
+  # The local k3d cluster is served over plain http on huntwell.localhost, so
+  # session cookies must not be Secure-only or the browser won't send them back.
+  # Dev mode drops the Secure flag. A real deployment sets this to 0 behind TLS.
+  HUNTWELL_DEV: "1"
+  # Runs drive a remote Browserbase browser — no Chrome in any pod.
+  HUNTWELL_BROWSER: "browserbase"
+  HUNTWELL_DATA_DIR: "/tmp/huntwell-data"
+  # Usage-based billing: dollars charged to the customer per million billable
+  # (input+output) tokens. Set above Cursor's own per-token cost for margin;
+  # each run also records Cursor's reported cost (COGS) so the spread is visible.
+  HUNTWELL_SELL_USD_PER_MTOKEN: "5.00"
+  # The image the website launches for each run Job. Imported into the cluster
+  # by k3d/up.sh; no registry involved.
+  RUN_WORKER_IMAGE: "huntwell-worker:dev"
+  # One Job per run, created by the website through the in-cluster API. On one
+  # server this is the whole of worker scheduling: Kubernetes decides when a Job
+  # gets to run. `pool` is the multi-machine answer — the admin places runs on
+  # warm pods across registered hosts — and needs a host registered first.
+  RUN_DISPATCH: "k8s"
+  # Drafting goes to the planning service rather than happening in the website,
+  # which is why the website image carries no agent.
+  DRAFT_DISPATCH: "queue"
+  # The event bus, in-cluster. Unset would mean no bus: every publish a no-op
+  # and the notification service deaf to draft failures.
+  HUNTWELL_NATS_URL: "nats://nats.huntwell.svc.cluster.local:4222"

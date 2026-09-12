@@ -1,0 +1,88 @@
+# Nightly database dump.
+#
+# This is the only thing standing between one disk and every customer's data.
+# It is not a replacement for a managed Postgres with point-in-time recovery —
+# a restore from here loses up to a day — but "last night" beats "nothing", and
+# nothing is what an unbacked StatefulSet gives you.
+#
+# The dump goes into MinIO, on a different volume from Postgres. That matters
+# less than it sounds on one machine, where both volumes are the same disk:
+# **copy these off the server**. `mc mirror` to a bucket somewhere else, or a
+# nightly rsync — a backup that dies with the machine it is backing up is a
+# feeling, not a backup.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: huntwell
+spec:
+  # 03:00 UTC daily.
+  schedule: "0 3 * * *"
+  # If a dump is still running, skip the next rather than starting a second one
+  # against the same database.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # A missed window (the node was down) should not fire a burst of catch-up runs.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: dump
+              # Postgres and mc in one step would need two images; this one runs
+              # pg_dump and pipes to mc through a shared emptyDir instead.
+              image: postgres:18
+              command:
+                - sh
+                - -c
+                - |
+                  set -euo pipefail
+                  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+                  OUT="/scratch/huntwell-$STAMP.sql.gz"
+                  echo "dumping to $OUT"
+                  # --clean --if-exists so the dump can be restored over an
+                  # existing database without hand-editing it first.
+                  pg_dump --clean --if-exists "$DATABASE_URL" | gzip -9 > "$OUT"
+                  ls -lh "$OUT"
+                  echo "$OUT" > /scratch/READY
+              env:
+                - name: DATABASE_URL
+                  valueFrom: { secretKeyRef: { name: huntwell-secrets, key: HUNTWELL_DATABASE_URL } }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+            - name: upload
+              image: minio/mc:RELEASE.2026-08-13T00-00-00Z
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  # Wait for the dump container to say it finished. Sidecar
+                  # containers in a Job start together; there is no ordering.
+                  for _ in $(seq 1 720); do
+                    [ -f /scratch/READY ] && break
+                    sleep 5
+                  done
+                  [ -f /scratch/READY ] || { echo "dump never finished"; exit 1; }
+                  FILE="$(cat /scratch/READY)"
+                  mc alias set hw http://minio:9000 "$AK" "$SK"
+                  mc mb --ignore-existing hw/huntwell-backups
+                  mc cp "$FILE" "hw/huntwell-backups/$(basename "$FILE")"
+                  # Keep a month. Older dumps are the ones you will never use
+                  # and will pay to store forever.
+                  mc rm --recursive --force --older-than 30d hw/huntwell-backups/ || true
+                  echo "uploaded $(basename "$FILE")"
+              env:
+                - name: AK
+                  valueFrom: { secretKeyRef: { name: huntwell-secrets, key: HUNTWELL_S3_ACCESS_KEY } }
+                - name: SK
+                  valueFrom: { secretKeyRef: { name: huntwell-secrets, key: HUNTWELL_S3_SECRET_KEY } }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+          volumes:
+            - name: scratch
+              emptyDir: { sizeLimit: 20Gi }

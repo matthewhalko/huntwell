@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "stop": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "afterAgentThought": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+      }
+    ]
+  }
+}

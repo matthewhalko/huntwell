@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+
+# The Secret every pod reads (envFrom / secretKeyRef). Generated from
+# secrets.env (gitignored) — k3d/up.sh writes it from local-infra/global plus a
+# random Postgres password. A fixed name (no hash suffix) is required because
+# the run-worker Job references it by name at dispatch time.
+secretGenerator:
+  - name: huntwell-secrets
+    namespace: huntwell
+    envs:
+      - secrets.env
+
+generatorOptions:
+  disableNameSuffixHash: true

@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+/bin/
+/cmd/target/
+
+# macOS
+.DS_Store
+
+# ── Secrets — never commit ───────────────────────────────────────────────────
+#
+# Matched by NAME at any depth: a `global` beside a deployed binary holds the
+# same credentials as local-infra/global. A rule without a slash matches a
+# whole path component, so `global.css` and `GlobalSearch.tsx` are unaffected.
+#
+# .gitignore is only the first layer — `git add -f` walks straight past it.
+# .githooks/pre-commit is what actually blocks the commit. Enable it with:
+#   git config core.hooksPath .githooks
+global
+global-*
+!global.example
+
+# The genesis key — AES-256 for the sealed `global`. The two travel apart on
+# purpose: `global` is useless without this, and this is useless without
+# `global`, so committing either defeats the arrangement.
+#
+# `genesis.rs` is deliberately unmatched: a rule without a slash matches a
+# whole path component, and none of these patterns is a prefix match.
+genesis
+genesis_*
+genesis*.txt
+
+# Vendored tools, fetched not committed. Each has a fetch.sh beside it that
+# pins a version and checks the download — the script is the thing worth
+# reviewing, and a 20 MB binary in a diff is not.
+/local-infra/applications/*/nats-server
+/local-infra/applications/*/crane
+/local-infra/applications/*/kubectl-*
+
+# local-infra runtime: the cluster, its logs, pid files, Chrome profiles and
+# agent workspaces, per instance
+/local-infra/data/
+/local-infra/data-*/
+/local-infra/config
+
+# k3d secrets: the generated Secret env file (holds DB creds + API keys)
+/k8s/overlays/*/secrets.env
+secrets.env

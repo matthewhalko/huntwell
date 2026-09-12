@@ -1,0 +1,148 @@
+# ── local-infra/global ───────────────────────────────────────────────────────
+#
+# The settings the server and every run read at startup. start.sh writes the
+# database URL and ports into this file each time it brings the cluster up and
+# preserves everything else, so put your own keys below the marker.
+#
+# Resolution order everywhere: process environment → this file. A value in
+# the environment always wins, so a one-off override never needs an edit.
+#
+# This file is gitignored — it holds live credentials.
+#
+# In production it is sealed: `huntwell genesis seal-file` turns it into one
+# enc:v1: line that only the separate `genesis` key file opens. See
+# docs/SECRETS.md. A dev checkout leaves it plain — there is nothing here worth
+# encrypting when the database is on loopback.
+
+# ── written by start.sh ──────────────────────────────────────────────────────
+HUNTWELL_DATABASE_URL=postgres://postgres@127.0.0.1:6511/huntwell
+HUNTWELL_ADDR=127.0.0.1:8611
+HUNTWELL_INSTANCE=default
+HUNTWELL_CDP_PORT_BASE=20611
+HUNTWELL_DATA_DIR=/abs/path/local-infra/data/huntwell
+
+# ── yours ────────────────────────────────────────────────────────────────────
+
+# The Cursor agent key the runner drives scrapes with. Required for runs and
+# the AI plan wizard; the rest of the app works without it.
+#CURSOR_API_KEY=...
+
+# Secret the session cookies are signed with. Generated once by start.sh if
+# absent; rotate it to sign everyone out.
+#HUNTWELL_SESSION_SECRET=...
+
+# Set to 1 to let anyone sign up. Default: open. Set to 0 to require an
+# existing account to create others (`huntwell account create`).
+#HUNTWELL_OPEN_SIGNUP=1
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+#
+# Where passwords live. Unset: a configured Cognito pool means `cognito`, no
+# pool means `local` (argon2 in the account row) — so a dev box needs no AWS.
+# Production is `cognito`, and those rows store no hash at all.
+#HUNTWELL_IDENTITY=local
+#
+# The pool. Production reads these from Secrets Manager; here is for pointing a
+# dev box at a real pool. The app client needs ALLOW_USER_PASSWORD_AUTH.
+#COGNITO_USER_POOL_ID=us-east-1_AbC123
+#COGNITO_CLIENT_ID=...
+#COGNITO_CLIENT_SECRET=...
+#COGNITO_REGION=us-east-1
+# An IAM user allowed AdminCreateUser / AdminSetUserPassword / AdminDeleteUser
+# on that pool and nothing else — never the bootstrap key.
+#AWS_COGNITO_KEY=AKIA...
+#AWS_COGNITO_SECRET=...
+
+# Chrome display mode for runs: headed | xvfb | headless. Omit to detect.
+#HUNTWELL_CHROME_DISPLAY=headless
+
+# Browser backend. If the two keys below are set, runs use Browserbase (so
+# Watch the browser works). Force the laptop Chrome with HUNTWELL_BROWSER=local.
+# HUNTWELL_BROWSER=browserbase without the keys fails a run rather than
+# falling through to Chrome.
+#HUNTWELL_BROWSER=browserbase
+#BROWSERBASE_API_KEY=bb_...
+#BROWSERBASE_PROJECT_ID=...
+# Optional: residential proxies, a region, and a persistent Context (the cloud
+# equivalent of a per-account Chrome profile, so logins survive between runs).
+#BROWSERBASE_PROXIES=1
+#BROWSERBASE_REGION=us-east-1
+#BROWSERBASE_CONTEXT_ID=...
+
+# Full path to the browser binary, if not on PATH or in a standard location.
+#HUNTWELL_CHROME=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+
+# ── Admin control plane (the fleet) ──────────────────────────────────────────
+#
+# Only `huntwell admin` reads these. It manages many k3d/k3s hosts, keeps a
+# warm `hw-pool` StatefulSet on each, and assigns queued executions to pods.
+#
+# Its own login — not a product Account. Seeded (and reset) at every start.
+#HUNTWELL_ADMIN_EMAIL=ops@example.com
+#HUNTWELL_ADMIN_PASSWORD=...
+#HUNTWELL_ADMIN_ADDR=127.0.0.1:8710
+#
+# The core database URL AS THE POOL PODS REACH IT. Pool pods claim their work
+# from the database — that is the only path a run takes to a worker — so when
+# the admin's own HUNTWELL_DATABASE_URL is loopback, this must be the address
+# the remote clusters can dial, or every pod starts and then sits retrying.
+#HUNTWELL_POOL_DATABASE_URL=postgres://huntwell:...@db.example.com:5432/core
+#
+# Where the pool image is pulled from, when it is private. The admin
+# materializes these into a `huntwell-registry` pull secret on every host.
+#HUNTWELL_REGISTRY_SERVER=ghcr.io
+#HUNTWELL_REGISTRY_USERNAME=...
+#HUNTWELL_REGISTRY_PASSWORD=...
+# Defaults to Always for a registry image and IfNotPresent for a bare name.
+#HUNTWELL_POOL_PULL_POLICY=Always
+#
+# Dev only: run the pool as child processes of the admin, no Kubernetes.
+#HUNTWELL_LOCAL_POOL=2
+
+# ── What the admin deploys to a host that runs the application ───────────────
+#
+# Tick "Run the application here" on a host and the admin deploys the website,
+# planning, scheduling, notification and the bus to that cluster, from the same
+# release as the pool image. These are the settings those pods get that a pure
+# compute host has no use for — read from here, on the admin server, so a
+# rotation is one file and one reconcile rather than a redeploy.
+#
+# Where the app lives, for the links in verification email, and the hostname
+# the Ingress rule matches. Without it the rule is a catch-all, which is right
+# behind a tunnel and wrong behind a shared load balancer.
+#HUNTWELL_PUBLIC_URL=https://app.example.com
+#
+# The IngressClass that cluster actually has. k3s ships Traefik, which is the
+# default; an Ingress no controller claims is not an error, it is an object
+# nothing serves.
+#HUNTWELL_INGRESS_CLASS=traefik
+#
+# Outbound mail. Without these, verification email is written to the pod log
+# instead of sent, and nobody can confirm an account.
+#HUNTWELL_MAIL_API_KEY=...
+#HUNTWELL_MAIL_FROM=Huntwell <hello@example.com>
+#
+# Object storage for `assets` runs. The worker writes the bytes and a website
+# pod serves them later, so both need the same store — a pod-local directory
+# is not one.
+#HUNTWELL_S3_ENDPOINT=https://s3.example.com
+#HUNTWELL_S3_BUCKET=huntwell
+#HUNTWELL_S3_ACCESS_KEY=...
+#HUNTWELL_S3_SECRET_KEY=...
+# The same store AS THE PODS REACH IT, when that differs from the admin's own
+# view — the object-store twin of HUNTWELL_POOL_DATABASE_URL, and wrong in the
+# same silent way.
+#HUNTWELL_POOL_S3_ENDPOINT=http://minio.internal:9000
+#
+# Signups on the deployed app. Default 0: anyone who finds the URL would
+# otherwise get an account and start spending your agent tokens.
+#HUNTWELL_OPEN_SIGNUP=0
+
+# ── NOT here ─────────────────────────────────────────────────────────────────
+#
+# Environment only (never read from this file):
+#   HUNTWELL_DEV — turns on the Vite dev proxy hints and relaxed cookies
+#
+# Per-run only (set by the server when it spawns a run, never by hand):
+#   HUNTWELL_RUN_ID, HUNTWELL_CDP_PORT, HUNTWELL_CHROME_DIR,
+#   HUNTWELL_AGENT_WORKSPACE, HUNTWELL_NAV_ALLOWLIST

@@ -1,0 +1,38 @@
+# Edge routing. One backend, because the website serves the whole product: the
+# UI, /api, the versioned /v1 and the token-authenticated /dl downloads.
+#
+# This replaces a five-way split that routed each /api prefix to its own
+# service. That split had a failure mode worth remembering: a path with no rule
+# fell through to the SPA fallback and answered with the index page and a 200,
+# so a missing route looked to a caller like an API returning HTML. Four paths
+# were in that state (/api/executions, /api/assets, /api/reports, /api/team).
+# One backend cannot drift that way — there is nothing to keep in step.
+#
+# Auth is no longer an edge concern either. The forward-auth middleware existed
+# to resolve a session cookie for services that had no session table; the
+# website has one and checks it in process.
+#
+# The admin is deliberately NOT here. Reaching it is an operator's job, through
+# `kubectl port-forward svc/admin 8710:80` or a tunnel — an operator can see
+# every workspace's routing and kill any pod in the fleet, and that does not
+# belong behind the same front door as the product.
+# A plain Ingress, not a Traefik IngressRoute. The CRD was needed for the
+# middlewares — forward-auth and strip-account-id — and those are gone with the
+# service split. One rule to one backend is expressible in the standard API,
+# which means no CRD to wait for at apply time and no controller lock-in.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: huntwell
+  namespace: huntwell
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: website
+                port:
+                  number: 80

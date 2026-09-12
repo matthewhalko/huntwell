@@ -1,0 +1,26 @@
+# Huntwell — one unit runs the web app; it spawns runs as children.
+#
+#   systemctl status huntwell
+#   journalctl -u huntwell -f
+#
+# Install to /etc/systemd/system/huntwell.service with @APP_DIR@ and
+# @APP_USER@ substituted. @APP_DIR@ holds the binary and its `global` file.
+# Runs need the Cursor `agent` CLI, Node (for npx @playwright/mcp), and a
+# Chrome — with Xvfb for a headed browser on a machine without a display.
+
+[Unit]
+Description=Huntwell web application
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=@APP_USER@
+WorkingDirectory=@APP_DIR@
+Environment=HUNTWELL_GLOBAL=@APP_DIR@/global
+ExecStart=@APP_DIR@/huntwell serve
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Refuse to commit Huntwell secrets.
+#
+# .gitignore is advisory: `git add -f` ignores it, and a file already staged
+# stays staged. This runs on every commit and looks at what is ACTUALLY about
+# to be written, by name and by content.
+#
+# Enable (once per clone):
+#   git config core.hooksPath .githooks
+#
+# Deliberate override, for a genuine false positive:
+#   ALLOW_SECRET_COMMIT=1 git commit ...
+set -euo pipefail
+
+if [ "${ALLOW_SECRET_COMMIT:-0}" = "1" ]; then
+    echo "pre-commit: secret scan skipped (ALLOW_SECRET_COMMIT=1)" >&2
+    exit 0
+fi
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+[ -n "$staged" ] || exit 0
+
+fail=0
+note() { printf '  %s\n' "$*" >&2; }
+
+# A Postgres URL carrying a real password, ignoring the ones documentation and
+# unit tests are made of. Without this, the test that asserts a password is
+# percent-encoded into a URL reads as the password it is testing.
+#
+# Two rules, both about the password itself rather than the host — a host
+# allowlist is one `rds.aws` away from being wrong in both directions:
+#
+#   8 characters, because `postgres://postgres:p@127.0.0.1` is a fixture and
+#   nobody's production password is one letter.
+#
+#   and not a placeholder, for the ones long enough to look real.
+PLACEHOLDER_PW=':(THE_SAME_PASSWORD|CHANGEME|CHANGE_ME|REPLACE_ME|YOUR_PASSWORD|PASSWORD|password|secret|s3cret|example)@'
+pg_urls_with_passwords() {
+    grep -oE 'postgres(ql)?://[^:/@[:space:]]+:[^@[:space:]]{8,}@[^/[:space:]"]*' \
+        | grep -qvE "$PLACEHOLDER_PW"
+}
+blocked() { [ "$fail" = 0 ] && { echo "" >&2; echo "BLOCKED: refusing to commit secrets" >&2; echo "" >&2; }; fail=1; }
+
+# --- 1. by name -------------------------------------------------------------
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$(basename "$f")" in
+        global|global-*|secrets.env)
+            case "$f" in *.example|*.example.env) continue ;; esac
+            blocked; note "$f — this file holds credentials (name rule)" ;;
+        # The AES key for the sealed `global`. `genesis.rs` is the module and
+        # is not matched: these are whole names, not prefixes.
+        genesis|genesis_*|genesis.txt|genesis_*.txt)
+            blocked; note "$f — this is the genesis key that opens the sealed global (name rule)" ;;
+    esac
+done <<< "$staged"
+
+# --- 2. by content ----------------------------------------------------------
+for f in $staged; do
+    git cat-file -e ":$f" 2>/dev/null || continue
+    body="$(git show ":$f" 2>/dev/null | head -c 200000 || true)"
+    [ -n "$body" ] || continue
+    hit=""
+    # `*.example.env` as well as `*.example`: the name rule above already
+    # excluded it, and the two lists disagreeing is what made every example
+    # file report its own placeholders as secrets.
+    case "$f" in
+        *.example|*.example.env|*.md|.githooks/*) ;;
+        *)
+            # A value, not a reference. `CURSOR_API_KEY=${CURSOR_API_KEY:-}` in
+            # a script is a passthrough, and `crsr_...` is a placeholder —
+            # neither is a key, and both matched `.{8,}`.
+            printf '%s' "$body" | grep -qE '^CURSOR_API_KEY=[A-Za-z0-9_-]{8,}' && hit="a CURSOR_API_KEY value"
+            [ -z "$hit" ] && printf '%s' "$body" | pg_urls_with_passwords && hit="a Postgres URL with an inline password"
+            [ -z "$hit" ] && printf '%s' "$body" | grep -qE 'BEGIN [A-Z ]*PRIVATE KEY' && hit="a private key block"
+            [ -z "$hit" ] && printf '%s' "$body" | grep -qE 'psk_[0-9a-f]{48}' && hit="a download API key"
+            [ -z "$hit" ] && printf '%s' "$body" | grep -qE 'bb_live_[A-Za-z0-9_-]{8,}' && hit="a Browserbase API key"
+            ;;
+    esac
+    if [ -n "$hit" ]; then
+        blocked; note "$f — contains $hit"
+    fi
+done
+
+if [ "$fail" = 1 ]; then
+    echo "" >&2
+    echo "  Unstage them:  git restore --staged <file>" >&2
+    echo "  If this is genuinely a false positive:" >&2
+    echo "    ALLOW_SECRET_COMMIT=1 git commit ..." >&2
+    echo "" >&2
+    exit 1
+fi
+exit 0

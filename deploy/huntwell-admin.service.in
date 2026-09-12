@@ -1,0 +1,47 @@
+# Huntwell admin control plane — the fleet's brain, on its own server.
+#
+#   systemctl status huntwell-admin
+#   journalctl -u huntwell-admin -f
+#
+# Install to /etc/systemd/system/huntwell-admin.service with @APP_DIR@ and
+# @APP_USER@ substituted. Same binary as the web app, different subcommand:
+# this one registers k3d/k3s hosts, keeps a `hw-pool` StatefulSet warm on each,
+# and assigns queued executions to pods.
+#
+# On the first start it reads `global` (beside the binary, or the file
+# HUNTWELL_GLOBAL names) and logs which file it used, then connects to
+# Postgres — creating the database if the server does not have it yet. That
+# first start therefore needs a role with CREATEDB; later starts do not.
+#
+# It needs, beyond the web app's settings:
+#
+#   kubectl on PATH                  every host operation shells out to it
+#   HUNTWELL_ADMIN_EMAIL/_PASSWORD the operator seed (its own login, not an
+#                                    Account)
+#   HUNTWELL_POOL_DATABASE_URL     the core database URL AS THE PODS REACH
+#                                    IT. Pods claim work from the database, so
+#                                    a loopback URL here means every pod starts
+#                                    and then sits retrying the connection.
+#   HUNTWELL_REGISTRY_SERVER/_USERNAME/_PASSWORD
+#                                    if the pool image is in a private registry
+#
+# Bind it to loopback and reach it over a tunnel, or put it behind a TLS proxy
+# with its own access control: an operator here can read every workspace's
+# execution routing and kill any pod in the fleet.
+
+[Unit]
+Description=Huntwell admin control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=@APP_USER@
+WorkingDirectory=@APP_DIR@
+Environment=HUNTWELL_GLOBAL=@APP_DIR@/global
+ExecStart=@APP_DIR@/huntwell admin --addr 127.0.0.1:8710
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

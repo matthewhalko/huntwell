@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Mcp(multidev-default, memory_topics)",
+      "Mcp(multidev-default, memory_recall)",
+      "Mcp(multidev-default, memory_search)",
+      "Mcp(multidev-default, memory_list)",
+      "Mcp(multidev-default, memory_links)",
+      "Mcp(multidev-default, skill_sets)",
+      "Mcp(multidev-default, skill_list)",
+      "Mcp(multidev-default, skill_recall)",
+      "Mcp(multidev-default, project_brief)",
+      "Mcp(multidev-*, memory_topics)",
+      "Mcp(multidev-*, memory_recall)",
+      "Mcp(multidev-*, memory_search)",
+      "Mcp(multidev-*, memory_list)",
+      "Mcp(multidev-*, memory_links)",
+      "Mcp(multidev-*, skill_sets)",
+      "Mcp(multidev-*, skill_list)",
+      "Mcp(multidev-*, skill_recall)",
+      "Mcp(multidev-*, project_brief)"
+    ],
+    "deny": []
+  }
+}

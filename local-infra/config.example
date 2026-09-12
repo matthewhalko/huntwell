@@ -1,0 +1,31 @@
+# Huntwell local-infra settings. Copy to `config` (gitignored) and edit.
+#
+# INSTANCE names this stack. Everything derived from it — ports, the data
+# directory, the Chrome profiles, the env file — is separate per name, so
+# `INSTANCE=pra ./local-infra/start.sh` in a second checkout runs a whole
+# second Huntwell beside the first with nothing shared.
+#
+# Ports are BASE + PORT_OFFSET. The offset is derived from INSTANCE (a stable
+# hash, 100..4000 in steps of 100) unless you set it here, so two instances
+# never collide and you never allocate numbers by hand. `default` has offset 0.
+#
+#   INSTANCE=default   PG 6511   API 8611   UI 5611   CDP from 20611
+#   INSTANCE=pra       PG 6511+N ...
+#
+INSTANCE=default
+#PORT_OFFSET=0
+
+# Base ports. Chosen to stay clear of the other ~/Desktop/projects stacks
+# (parkriver 1223/7779/8195/5195, multidev 1357, atech 5432/4222).
+#PG_PORT=6511
+#API_PORT=8611
+#UI_PORT=5611
+#CDP_PORT_BASE=20611
+
+#BIND_ADDR=127.0.0.1
+#PG_USER=postgres
+#DB_NAME=huntwell
+
+# Where the Postgres binaries are. Resolved in this order: PG_BIN here, then
+# local-infra/applications/postgres/bin (vendored), then Homebrew, then PATH.
+#PG_BIN=/opt/homebrew/opt/postgresql@18/bin

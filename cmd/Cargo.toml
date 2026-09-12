@@ -1,0 +1,80 @@
+[package]
+name = "huntwell"
+version = "0.1.0"
+edition = "2021"
+description = "Hosted prospecting plans: accounts, plans, runs, prospects"
+default-run = "huntwell"
+
+# One library, many executables: the services share every module and differ
+# only in which concerns they own. See src/lib.rs.
+[lib]
+name = "huntwell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "huntwell"
+path = "src/main.rs"
+
+[[bin]]
+name = "admin"
+path = "src/bin/admin.rs"
+
+[[bin]]
+name = "website"
+path = "src/bin/website.rs"
+
+[[bin]]
+name = "planning"
+path = "src/bin/planning.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "scheduling"
+path = "src/bin/scheduling.rs"
+
+[[bin]]
+name = "notification"
+path = "src/bin/notification.rs"
+
+[dependencies]
+anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
+axum = { version = "0.8", features = ["macros", "json", "query"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+futures-util = "0.3"
+hex = "0.4"
+mime_guess = "2"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+sha1 = "0.10"
+sha2 = "0.10"
+# The sealed `global` file: AES-256-GCM through ring, which rustls already
+# brings in, so these are direct names for crates the tree already builds.
+ring = "0.17"
+base64 = "0.22"
+zeroize = "1"
+hmac = "0.12"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "fs", "io-util", "signal", "time", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1.25"
+wait-timeout = "0.2"
+async-nats = "0.50.0"
+
+[profile.release]
+strip = true

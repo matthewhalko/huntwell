@@ -1,0 +1,24 @@
+# More room than the 2Gi a dev cluster gets, and a note about what this is not.
+#
+# This is Postgres on one machine, on one disk. It is backed up nightly by the
+# CronJob in backup.yaml, and that is the whole story: no replica, no
+# point-in-time recovery, and a restore means last night's dump.
+#
+# When that stops being acceptable, move to a managed Postgres: drop
+# postgres.yaml from the base resources, point HUNTWELL_DATABASE_URL at the
+# managed writer endpoint, and delete this patch. Nothing in the application
+# changes — it has always just read a URL.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: huntwell
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi

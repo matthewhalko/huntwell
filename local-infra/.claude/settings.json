@@ -1,0 +1,137 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__multidev-default__memory_topics",
+      "mcp__multidev-default__memory_recall",
+      "mcp__multidev-default__memory_search",
+      "mcp__multidev-default__memory_list",
+      "mcp__multidev-default__memory_links",
+      "mcp__multidev-default__skill_sets",
+      "mcp__multidev-default__skill_list",
+      "mcp__multidev-default__skill_recall",
+      "mcp__multidev-default__project_brief"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+          }
+        ]
+      }
+    ]
+  }
+}
