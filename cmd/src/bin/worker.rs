@@ -1,9 +1,9 @@
-//! A Huntwell worker: claims the runs assigned to this pod and executes them.
+//! A Huntwell worker: claims the runs assigned to this slot and executes them.
 //!
-//! The pod entrypoint for the admin's `hw-pool` StatefulSet, so it needs
-//! HOST_ID and POD_NAME — the StatefulSet supplies both, the second from
-//! `metadata.name`. Work arrives through the database, never over HTTP: the
-//! admin writes (HostId, PodName) onto an Execution and this process claims it.
+//! One slot of a worker VM, run by the `huntwell-worker@N` unit, which supplies
+//! HOST_ID (from /huntwell/env) and SLOT_NAME (`<vm>-N`). Work arrives through
+//! the database, never over HTTP: the admin writes (host_id, slot) onto an
+//! Execution and this process claims it.
 //!
 //! Needs the agent CLI and the Playwright MCP server, which is what makes the
 //! worker image the large one.

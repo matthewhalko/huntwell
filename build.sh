@@ -6,10 +6,6 @@
 #   ./build.sh windows    Windows x86_64, cross-compiled with zig -> bin/windows/
 #   ./build.sh host       native build for this machine          -> bin/macos/ (or bin/linux/)
 #
-#   ./build.sh --images         ...and package it as the Huntwell pod images
-#   ./build.sh arm64 --images   the same, for an arm64 cluster or node
-#   REGISTRY=ghcr.io/you ./build.sh --images --push    ...and publish them
-#
 # Every OS builds on this machine, at native speed: the cross targets are a
 # plain cargo build with zig as the C compiler and linker. No Docker, no VM, no
 # emulation. Same mechanism as the parkriver and atech projects.
@@ -25,15 +21,9 @@
 # The UI is embedded in `website` at compile time, so the bundle is built first
 # on every path — there is no "build the UI first" step to forget.
 #
-# --images then wraps that one binary in the two images the k3d/k8s deployment
-# runs: huntwell-services (the five services + the migrate Jobs) and
-# huntwell-worker (one Job per execution). Packaging is handed off to
-# deploy/images/build-images.sh, which compiles nothing and uses crane, not
-# Docker — the images land beside the binaries as bin/images/<name>.tar.
-#
-# --push publishes them to $REGISTRY. A remote k3d/k3s host has no way to see an
-# image built here, so a fleet of worker hosts needs a registry; a single local
-# cluster does not (k3d image import reads the tar directly).
+# To deploy, copy bin/ubuntu (or bin/ubuntu-arm64) into the admin's build
+# folder and press Deploy: the admin pushes these executables into the VMs
+# itself. There is nothing to package.
 #
 # One-time setup for the cross builds:
 #
@@ -42,21 +32,30 @@
 #   rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
 #                     x86_64-pc-windows-gnu
 #
-# The binary reads its settings from a `global` file beside it (or the one
-# local-infra/global on a dev checkout); see local-infra/global.example.
+# Which environment the binaries are for — as in Park River:
+#
+#   --prod   (default)  embeds genesis_prod, reads the Huntwell_Production secret
+#   --local             embeds genesis_local, reads the Huntwell_Local secret
+#
+# The genesis key is COMPILED IN, so this is the one place the choice is made.
+# HUNTWELL_GENESIS_DIR moves the key files out of the repo:
+#
+#   HUNTWELL_GENESIS_DIR=~/keys ./build.sh
+#
+# The binary reads the nearest encrypted `global` at or above its own folder
+# (/yaksoft/bin/admin reads /yaksoft/global); see local-infra/global.example.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TARGET=""
-WANT_IMAGES=0
-WANT_PUSH=0
+GENESIS_VARIANT="prod"
 for arg in "$@"; do
     case "$arg" in
-        --images)  WANT_IMAGES=1 ;;
-        --push)    WANT_IMAGES=1; WANT_PUSH=1 ;;
-        -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        --*) echo "unknown flag '$arg' — expected: --images | --push"; exit 1 ;;
+        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --prod)  GENESIS_VARIANT="prod" ;;
+        --local|--test) GENESIS_VARIANT="local" ;;
+        --*) echo "unknown flag '$arg'"; exit 1 ;;
         *)
             [ -z "$TARGET" ] || { echo "give one target, not '$TARGET' and '$arg'"; exit 1; }
             TARGET="$arg" ;;
@@ -72,31 +71,18 @@ EXE=""
 case "$TARGET" in
     ubuntu|linux|amd64)
         TRIPLE="x86_64-unknown-linux-gnu";  OUT="$ROOT/bin/ubuntu"
-        IMAGE_ARCH="amd64"; EXPECT="ELF 64-bit.*x86-64" ;;
+        LINUX=1; EXPECT="ELF 64-bit.*x86-64" ;;
     arm64|aarch64)
         TRIPLE="aarch64-unknown-linux-gnu"; OUT="$ROOT/bin/ubuntu-arm64"
-        IMAGE_ARCH="arm64"; EXPECT="ELF 64-bit.*aarch64" ;;
+        LINUX=1; EXPECT="ELF 64-bit.*aarch64" ;;
     windows|win)
         TRIPLE="x86_64-pc-windows-gnu";     OUT="$ROOT/bin/windows"
-        IMAGE_ARCH="";      EXPECT="PE32\+ executable"; EXE=".exe" ;;
+        LINUX="";  EXPECT="PE32\+ executable"; EXE=".exe" ;;
     host|native|macos|mac|darwin)
-        TRIPLE="";          IMAGE_ARCH="";  EXPECT=""
+        TRIPLE="";          LINUX="";  EXPECT=""
         case "$(uname -s)" in Darwin) OUT="$ROOT/bin/macos" ;; *) OUT="$ROOT/bin/linux" ;; esac ;;
     *) echo "unknown target '$TARGET' — expected: ubuntu | arm64 | windows | host"; exit 1 ;;
 esac
-
-# Fail before compiling, not after. A host binary cannot go in a Linux image,
-# and finding that out at the end of a long build is a waste.
-# Pods run Linux, so only the two Linux targets can be packaged.
-if [ "$WANT_IMAGES" = 1 ] && [ -z "$IMAGE_ARCH" ]; then
-    echo "--images needs a Linux target: ./build.sh --images  or  ./build.sh arm64 --images" >&2
-    exit 1
-fi
-if [ "$WANT_PUSH" = 1 ] && [ -z "${REGISTRY:-}" ]; then
-    echo "--push needs REGISTRY — e.g. REGISTRY=ghcr.io/you ./build.sh --push" >&2
-    exit 1
-fi
-
 
 # --- preflight ---------------------------------------------------------------
 # Every missing tool at once, each with the command that installs it, rather
@@ -123,9 +109,36 @@ if [ ! -d "$ROOT/UI/web/node_modules" ] || [ "$ROOT/UI/web/package-lock.json" -n
 fi
 (cd "$ROOT/UI/web" && npm run build)
 
+# --- genesis key ---------------------------------------------------------------
+# A binary that cannot open its `global` fails on the server with "database URL
+# is not set" — a long way from the cause. Refuse to build it instead.
+GENESIS_DIR="${HUNTWELL_GENESIS_DIR:-$ROOT/local-infra}"
+GENESIS_KEY="$GENESIS_DIR/genesis_$GENESIS_VARIANT"
+[ -f "$GENESIS_KEY" ] || GENESIS_KEY="$GENESIS_DIR/genesis_$GENESIS_VARIANT.txt"
+if [ -f "$GENESIS_KEY" ] || [ -n "${HUNTWELL_GENESIS_KEY:-}" ]; then
+    echo "==> genesis: embedding the $(echo "$GENESIS_VARIANT" | tr a-z A-Z) key${HUNTWELL_GENESIS_KEY:+ from HUNTWELL_GENESIS_KEY}${HUNTWELL_GENESIS_KEY:-" from $GENESIS_KEY"}"
+elif [ "${ALLOW_NO_GENESIS:-0}" = "1" ]; then
+    echo "==> genesis: no key, and ALLOW_NO_GENESIS=1 — these binaries need a genesis_$GENESIS_VARIANT file beside them on the host."
+else
+    cat >&2 <<EOF
+
+error: no genesis_$GENESIS_VARIANT in $GENESIS_DIR
+
+  A --$GENESIS_VARIANT build embeds that genesis key. Without it the binary cannot
+  decrypt its global. Point at the directory holding your keys:
+    HUNTWELL_GENESIS_DIR=~/keys ./build.sh $TARGET --$GENESIS_VARIANT
+  or, to build without a key on purpose (the host must then carry it):
+    ALLOW_NO_GENESIS=1 ./build.sh $TARGET --$GENESIS_VARIANT
+
+EOF
+    exit 1
+fi
+export HUNTWELL_GENESIS_VARIANT="$GENESIS_VARIANT" HUNTWELL_GENESIS_DIR="$GENESIS_DIR"
+
 # --- compile -----------------------------------------------------------------
 # Every executable the crate defines. Keep in step with the [[bin]] list in
-# cmd/Cargo.toml and with deploy/images/build-images.sh, which packages them.
+# cmd/Cargo.toml and with the roles in cmd/src/admin/incus_driver.rs, which
+# decide which of them each VM is given.
 BINARIES="huntwell website admin planning worker scheduling notification"
 
 if [ -n "$TRIPLE" ]; then
@@ -153,9 +166,9 @@ for b in $BINARIES; do
 done
 
 # The glibc floor these impose on whatever runs them — the number that decides
-# which base image works. They all come from one compile, so one is
+# which VM image works. They all come from one compile, so one is
 # representative. objdump is not installed everywhere: information, not a gate.
-if [ -n "$IMAGE_ARCH" ] && command -v objdump >/dev/null 2>&1; then
+if [ -n "$LINUX" ] && command -v objdump >/dev/null 2>&1; then
     glibc="$(objdump -T "$OUT/website" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
     [ -n "$glibc" ] && echo "    needs $glibc or newer"
 fi
@@ -164,14 +177,3 @@ cp "$ROOT/local-infra/global.example" "$OUT/"
 echo
 echo "==> $OUT"
 ls -lh "$OUT" | awk 'NR>1 {print "    "$5"\t"$9}'
-
-# The packaging hand-off. The architecture is passed explicitly so the images
-# wrap the binary just built, not whatever the packaging script would have
-# defaulted to on this machine.
-if [ "$WANT_IMAGES" = 1 ]; then
-    # PUSH carries the registry, and is empty unless --push was actually given:
-    # an exported REGISTRY must never be enough on its own to publish.
-    push_to=""
-    [ "$WANT_PUSH" = 1 ] && push_to="${REGISTRY:-}"
-    ARCH="$IMAGE_ARCH" PUSH="$push_to" "$ROOT/deploy/images/build-images.sh"
-fi

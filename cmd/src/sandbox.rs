@@ -340,7 +340,7 @@ fn make_executable(path: &Path) {
 /// so that a refusal that ever failed would still find an empty directory on
 /// a tmpfs rather than the machine.
 ///
-/// `HUNTWELL_AGENT_WORKSPACE` still overrides, which is how a pod pins it to
+/// `HUNTWELL_AGENT_WORKSPACE` still overrides, which is how a slot pins it to
 /// a volume it controls.
 fn root_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("HUNTWELL_AGENT_WORKSPACE") {

@@ -42,6 +42,14 @@ export const api = {
 
 // ---- types (mirroring the Rust side) ----
 
+/// `GET /api/auth/config`: what the sign-in and sign-up pages need before
+/// anyone is signed in. A site key means the server will demand a Turnstile
+/// token with those forms.
+export interface AuthConfig {
+  open_signup: boolean
+  turnstile_site_key: string | null
+}
+
 export interface Me {
   account_id: number
   email: string
@@ -56,6 +64,9 @@ export interface Me {
   platform_ack_at?: string | null
   theme: 'light' | 'dark' | 'system'
   created_at: string
+  /// False until the link in the verification email is followed; the app
+  /// shows the check-your-email screen instead of anything else until then.
+  email_verified: boolean
   open_signup: boolean
   /// False until first-run setup is done; the app shows the setup dialog on it.
   onboarded: boolean

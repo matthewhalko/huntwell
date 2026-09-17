@@ -5,7 +5,7 @@
 //! calls into this library. What separates them is which of these concerns
 //! they own, and therefore what has to be installed alongside them.
 //!
-//!   admin         hosts, warm pod pools, placement, run routing
+//!   admin         hosts, warm slot pools, placement, run routing
 //!   website       the UI and the whole public API
 //!   planning      drafting plans and plan chat        — needs the agent CLI
 //!   worker        executing plans                     — needs the agent CLI
@@ -23,6 +23,7 @@ pub mod browser;
 pub mod browserbase;
 pub mod bus;
 pub mod cidr;
+pub mod cloudflare;
 pub mod cognito;
 pub mod config;
 pub mod csv;
@@ -46,6 +47,8 @@ pub mod sandbox;
 pub mod setup;
 pub mod store;
 pub mod svc;
+pub mod throttle;
+pub mod turnstile;
 pub mod trail;
 pub mod web;
 pub mod worker_pool;
@@ -75,9 +78,10 @@ pub fn init_tracing() {
 pub fn boot(service: &str) {
     config::export_to_env();
     init_tracing();
-    match config::source_file() {
-        Some(p) => tracing::info!("{service}: settings from {}", p.display()),
-        None => tracing::warn!("{service}: no global settings file found — using the process environment only"),
+    match (config::source_file(), config::source_error()) {
+        (Some(_), Some(e)) => tracing::error!("{service}: {e}"),
+        (Some(p), None) => tracing::info!("{service}: settings from {}", p.display()),
+        (None, _) => tracing::warn!("{service}: no global settings file found — using the process environment only"),
     }
 }
 

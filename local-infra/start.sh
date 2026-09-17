@@ -284,9 +284,8 @@ fi
 # Vendored, unlike Postgres and MinIO: one static Go binary with no runtime and
 # no dependencies, so `applications/nats/fetch.sh` is the whole install.
 #
-# JetStream is on. Core NATS drops a message with no listener, which is right
-# for "something happened" but wrong for the moment a service is restarting;
-# the stream holds those until it comes back.
+# Core NATS only — JetStream stays off. An event with no listener is dropped,
+# which is fine: events are doorbells, and Postgres holds anything durable.
 NATS_BIN="${NATS_BIN:-$DIR/applications/nats/nats-server}"
 [ -x "$NATS_BIN" ] || NATS_BIN="$(command -v nats-server 2>/dev/null || true)"
 NATS_PID_FILE="$TMP_DIR/nats.pid"
@@ -306,7 +305,6 @@ else
     nohup "$NATS_BIN" \
         --addr "$BIND_ADDR" --port "$NATS_PORT" \
         --http_port "$NATS_MONITOR_PORT" \
-        --jetstream --store_dir "$DATA_DIR/nats" \
         --name "huntwell-$INSTANCE" \
         > "$LOG_DIR/nats.log" 2>&1 &
     echo $! > "$NATS_PID_FILE"

@@ -37,7 +37,6 @@ genesis*.txt
 # reviewing, and a 20 MB binary in a diff is not.
 /local-infra/applications/*/nats-server
 /local-infra/applications/*/crane
-/local-infra/applications/*/kubectl-*
 
 # local-infra runtime: the cluster, its logs, pid files, Chrome profiles and
 # agent workspaces, per instance
@@ -45,6 +44,5 @@ genesis*.txt
 /local-infra/data-*/
 /local-infra/config
 
-# k3d secrets: the generated Secret env file (holds DB creds + API keys)
-/k8s/overlays/*/secrets.env
+# Any secrets env file, wherever it lands.
 secrets.env

@@ -64,6 +64,10 @@ sha2 = "0.10"
 ring = "0.17"
 base64 = "0.22"
 zeroize = "1"
+# Park River's other `global` form: a file written by `openssl enc -aes-256-cbc
+# -pbkdf2`. Pure Rust, so the Linux cross-build needs no native OpenSSL.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 hmac = "0.12"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "fs", "io-util", "signal", "time", "net"] }

@@ -55,28 +55,26 @@ directory (`data-<name>/`), an env file (`global-<name>`) and a port offset
 beside the first with nothing shared — including Chrome profiles, because the
 data dir is what `HUNTWELL_DATA_DIR` points at.
 
-## Hosted (k3d) microservices
+## In production: VMs
 
-The same binary also runs as a set of independent services on Kubernetes — see
-[K3D.md](K3D.md) for how to bring it up. The seams:
+Production runs in Incus VMs driven by the admin control plane — see
+[PRODUCTION.md](PRODUCTION.md). The seams:
 
-- **One binary, a role per deployment.** `huntwell service --role
-  <auth|plans|prospects|runs|gateway>` mounts only that slice of the `web/`
-  router (`web::serve_service`); `serve` is still the all-in-one for `dev.sh`.
-  The gateway serves the embedded UI; Traefik routes `/api/*` to the services.
-- **Edge auth.** Only auth-svc handles cookies. Traefik forward-auth calls its
-  `/api/internal/introspect`, which returns `X-Account-Id`; the other services
-  run with `HUNTWELL_TRUST_HEADER_AUTH=1` and read that header instead of a
-  session table (`web/auth.rs`). The ingress strips any client-supplied copy.
-- **Two databases.** `auth` (account, session) is isolated; `plans`, `prospects`
-  and `runs` share a `core` database in this phase, so the cross-cutting run
-  pipeline keeps one connection and stays a minimal-diff port. The two
-  `auth`↔`core` foreign keys were dropped; account scoping is still enforced in
-  every query. Schema is applied per database by `huntwell migrate --schema
-  <auth|core>` Jobs. Splitting `core` ownership (DB roles, then physically) is
-  the next phase.
-- **A run is a Job, not a child process.** With `RUN_DISPATCH=k8s`, runs-svc
-  creates one `run-<id>` Job per run through the in-cluster API (`web/dispatch.rs`)
-  and streams its pod log into `execution_log`; cancel deletes the Job. One run per pod
-  preserves the pipeline's process-wide state. Runs drive Browserbase, so no pod
-  needs Chrome. The scheduler runs only in the single-replica runs-svc.
+- **One app VM, many worker VMs.** The app VM runs `website` (the UI and the
+  whole API, in one process), `planning`, `scheduling`, `notification` and
+  NATS under systemd. Every worker VM connects to that NATS — at the app host's
+  private IP, forwarded by its edge container, with the NATS user and password
+  from the secret. Worker VMs run `huntwell-worker@1..N`, one slot
+  per concurrent plan. The admin pushes the executables in; nothing is pulled
+  from a registry.
+- **One database, outside every VM.** Every VM reaches Postgres over the
+  network; account scoping is enforced in every query.
+- **A run is claimed, not dispatched.** With `RUN_DISPATCH=pool` the website
+  queues a run, the admin's placement loop assigns it to a free slot, and that
+  slot claims it from Postgres and heartbeats while it executes
+  (`worker_pool.rs`). Workers need no route to the app VM. One run per slot
+  preserves the pipeline's process-wide state, and runs drive Browserbase, so
+  no VM needs Chrome.
+- **Credentials by role.** A worker VM's settings file carries the database,
+  Cursor and Browserbase keys and nothing else; identity, mail, billing and the
+  session secret exist only on the app VM (`admin/incus_driver.rs`).

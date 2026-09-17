@@ -98,14 +98,47 @@ pub async fn connect(service: &str) {
         let _ = CLIENT.set(None);
         return;
     };
-    match async_nats::connect(&url).await {
-        Ok(c) => {
-            tracing::info!("bus: connected to {url}");
-            let _ = CLIENT.set(Some(c));
+    // The app VM's NATS takes a login (HUNTWELL_NATS_USER / _PASSWORD, from the
+    // secret). Separate settings rather than user:password in the URL, which
+    // this function logs. A dev box's NATS has none, and sets neither. In a VM
+    // the bus is TLS, verified against the CA the admin pushed in.
+    let login = (
+        crate::config::get("HUNTWELL_NATS_USER").filter(|v| !v.trim().is_empty()),
+        crate::config::get("HUNTWELL_NATS_PASSWORD").filter(|v| !v.trim().is_empty()),
+    );
+    let ca = crate::config::get("HUNTWELL_NATS_CA_FILE").filter(|v| !v.trim().is_empty());
+    let options = || {
+        let mut o = async_nats::ConnectOptions::new();
+        if let (Some(user), Some(password)) = &login {
+            o = o.user_and_password(user.clone(), password.clone());
         }
-        Err(e) => {
-            tracing::warn!("bus: could not connect to {url} ({e}) — events will be dropped");
-            let _ = CLIENT.set(None);
+        if let Some(ca) = &ca {
+            o = o.add_root_certificates(ca.trim().into()).require_tls(true);
+        }
+        o
+    };
+    // Tried for a while, not once. A deploy restarts the bus and the services
+    // that use it together, and the services are up before nats-server has
+    // bound its listener — the first attempt is refused every time. Twenty
+    // seconds covers that and a slow VM; a bus that is really down still only
+    // costs a warning, as before.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match options().connect(&url).await {
+            Ok(c) => {
+                tracing::info!("bus: connected to {url}");
+                let _ = CLIENT.set(Some(c));
+                break;
+            }
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!("bus: could not connect to {url} ({e}) — events will be dropped");
+                    let _ = CLIENT.set(None);
+                    break;
+                }
+                tracing::debug!("bus: {url} not ready ({e}) — retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     }
     // After the attempt, not only on success: the loop no-ops when there is no
@@ -129,12 +162,12 @@ pub fn source() -> String {
 }
 
 /// Who this process is, so two replicas of the same service do not look like
-/// one. A k8s pod uses its name; everywhere else it is `host:pid`.
+/// one. A worker slot uses its name; everything else is `host:pid`.
 pub fn instance_id() -> String {
-    if let Ok(pod) = std::env::var("POD_NAME") {
-        let pod = pod.trim();
-        if !pod.is_empty() {
-            return pod.to_string();
+    if let Ok(slot) = std::env::var("SLOT_NAME") {
+        let slot = slot.trim();
+        if !slot.is_empty() {
+            return slot.to_string();
         }
     }
     let host = std::env::var("HOSTNAME")

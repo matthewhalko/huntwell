@@ -60,6 +60,32 @@ pub fn provider() -> Provider {
     }
 }
 
+/// Whether identity settings say `local` in so many words. Only that opts a
+/// production build out of Cognito; silence never does.
+fn explicitly_local() -> bool {
+    crate::config::get("HUNTWELL_IDENTITY").is_some_and(|v| v.trim().eq_ignore_ascii_case("local"))
+}
+
+/// What a production build refuses to run without: a pool. The fallback to
+/// local identity exists for a dev box, and on a production build silence
+/// about Cognito would otherwise mean password hashes quietly landing in the
+/// `account` table — which is the one thing the pool is there to prevent.
+/// `HUNTWELL_IDENTITY=local` still works, because it is said out loud.
+pub fn enforce_production_provider() -> Result<()> {
+    if crate::genesis::embedded_variant() != "prod" || explicitly_local() {
+        return Ok(());
+    }
+    if provider() == Provider::Cognito {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "this is a production build and no Cognito pool is configured, so sign-ups would store \
+         password hashes in the database. Add COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION \
+         (and COGNITO_CLIENT_SECRET, AWS_COGNITO_KEY, AWS_COGNITO_SECRET) to the Secrets Manager secret — \
+         see docs/SECRETS.md — or set HUNTWELL_IDENTITY=local to mean it"
+    ))
+}
+
 pub fn is_cognito() -> bool {
     provider() == Provider::Cognito
 }

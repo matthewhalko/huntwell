@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- The favicon, as a page: the website's own logo markup (a ✦ in Lato 900
+     with the brand gradient, exactly as .topbar-brand .spark draws it) on the
+     plum tile the old favicon.svg used. A hand-drawn path never quite matched
+     the glyph the browser renders, so the icon is rendered by the browser too:
+
+       chrome --headless=new --hide-scrollbars --window-size=512,512 \
+         --default-background-color=00000000 --virtual-time-budget=4000 \
+         --screenshot=favicon-512.png file://$PWD/favicon.html
+       sips -z 192 192 favicon-512.png --out ../public/favicon.png
+       sips -z 180 180 favicon-512.png --out ../public/apple-touch-icon.png
+       sips -z  32  32 favicon-512.png --out ../public/favicon-32.png
+       cp ../public/favicon.png ../../../cmd/assets/favicon.png   # the admin's
+
+     The Slack workspace icon is the same page without the tile at 1024px. -->
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--brand-sky:#36c5f0;--brand-green:#2eb67d;--brand-yellow:#ecb22e;--brand-pink:#e01e5a;
+  --grad:linear-gradient(120deg,var(--brand-sky),var(--brand-green) 38%,var(--brand-yellow) 66%,var(--brand-pink));
+  --display:'Lato',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
+html,body{margin:0;width:512px;height:512px;overflow:hidden;background:transparent}
+/* The tile the old favicon.svg drew: plum, corners 14/64 of the side. */
+.tile{width:512px;height:512px;border-radius:112px;background:#3f0e40;display:flex;align-items:center;justify-content:center}
+/* The website's logo glyph and gradient, sized to fill the tile the way the old star did. */
+.spark{font-family:var(--display);font-weight:900;font-size:560px;line-height:1;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;transform:translateY(-3%)}
+</style></head><body><div class="tile"><span class="spark">✦</span></div></body></html>

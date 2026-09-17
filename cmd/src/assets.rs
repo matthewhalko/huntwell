@@ -12,7 +12,7 @@
 //! hostname can resolve to 169.254.169.254 just as easily as an IP literal can
 //! say so). Size is capped while streaming, not after.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
@@ -85,7 +85,7 @@ pub fn check_url(url: &str) -> Result<(), String> {
     }
     // An IP literal can be judged now; names need DNS, which happens in fetch.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden(ip) {
+        if forbidden_now(ip) {
             return Err(format!("address {ip} is private or link-local"));
         }
     }
@@ -109,55 +109,109 @@ fn host_of(url: &str) -> Option<String> {
     }
 }
 
-/// Resolves a host and rejects it if any address it answers with is one we
-/// refuse to talk to.
-async fn resolve_is_safe(host: &str, port: u16) -> Result<()> {
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(()); // already judged by check_url
+/// Test-only: let a server on 127.0.0.1 stand in for "the internet", so the
+/// redirect handling can be exercised against a real listener. Link-local and
+/// the rest stay forbidden, which is what the tests then check.
+#[cfg(test)]
+static ALLOW_LOOPBACK_FOR_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn forbidden_now(ip: IpAddr) -> bool {
+    #[cfg(test)]
+    if ALLOW_LOOPBACK_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed) && ip.is_loopback() {
+        return false;
+    }
+    is_forbidden(ip)
+}
+
+/// Resolve a host and return the addresses it answered with — every one of
+/// them vetted. The connection is then pinned to exactly these, so a name
+/// that answers differently a moment later (DNS rebinding) changes nothing.
+async fn safe_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if forbidden_now(ip) {
+            anyhow::bail!("address {ip} is private or link-local");
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolve {host}"))?
         .collect::<Vec<_>>();
     if addrs.is_empty() {
-        return Err(anyhow!("{host} did not resolve"));
+        anyhow::bail!("{host} did not resolve");
     }
-    for a in addrs {
-        if is_forbidden(a.ip()) {
-            return Err(anyhow!("{host} resolves to {} which is private or link-local", a.ip()));
+    for a in &addrs {
+        if forbidden_now(a.ip()) {
+            anyhow::bail!("{host} resolves to {} which is private or link-local", a.ip());
         }
     }
-    Ok(())
+    Ok(addrs)
 }
+
+/// The port a URL connects to: explicit, else the scheme's.
+fn port_of(url: &str) -> u16 {
+    let https = url.to_ascii_lowercase().starts_with("https://");
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").rsplit('@').next().unwrap_or("");
+    let after_host = if authority.starts_with('[') {
+        authority.find(']').map(|i| &authority[i + 1..]).unwrap_or("")
+    } else {
+        authority.find(':').map(|i| &authority[i..]).unwrap_or("")
+    };
+    after_host
+        .strip_prefix(':')
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(if https { 443 } else { 80 })
+}
+
+/// Where a redirect points, as an absolute URL.
+fn next_hop(current: &str, location: &str) -> Result<String> {
+    let base = reqwest::Url::parse(current).with_context(|| format!("parse {current}"))?;
+    Ok(base.join(location.trim()).with_context(|| format!("bad redirect {location:?}"))?.to_string())
+}
+
+const MAX_HOPS: usize = 5;
 
 /// Downloads one file, enforcing the size cap while streaming so an
 /// unbounded response is dropped rather than buffered.
+///
+/// Every hop — the URL given and each redirect after it — is checked the same
+/// way: the literal, then what it resolves to, and the connection is pinned to
+/// the addresses that passed. Redirects are followed here rather than by the
+/// client, because a client that follows on its own resolves the next name
+/// itself, and that resolution is the one nobody checked.
 pub async fn fetch(url: &str) -> Result<FetchedFile> {
-    check_url(url).map_err(|e| anyhow!("{e}"))?;
-    let host = host_of(url).ok_or_else(|| anyhow!("no host in url"))?;
-    let port = if url.to_ascii_lowercase().starts_with("https://") { 443 } else { 80 };
-    resolve_is_safe(&host, port).await?;
-
-    // Redirects are re-checked: the first hop being safe says nothing about
-    // where it points. Names on a hop are resolved by the policy's own check
-    // in the next request anyway, so the literal check here is the backstop.
-    let policy = reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.stop();
+    let mut current = url.trim().to_string();
+    let mut resp = None;
+    for hop in 0..=MAX_HOPS {
+        check_url(&current).map_err(|e| anyhow!("{e}"))?;
+        let host = host_of(&current).ok_or_else(|| anyhow!("no host in url"))?;
+        let port = port_of(&current);
+        let addrs = safe_addrs(&host, port).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .user_agent("huntwell-assets/1.0")
+            .build()
+            .context("build download client")?;
+        let r = client.get(&current).send().await.with_context(|| format!("GET {current}"))?;
+        if r.status().is_redirection() {
+            if hop == MAX_HOPS {
+                anyhow::bail!("too many redirects");
+            }
+            let location = r
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("redirect without a location"))?;
+            current = next_hop(&current, location)?;
+            continue;
         }
-        match check_url(attempt.url().as_str()) {
-            Ok(()) => attempt.follow(),
-            Err(_) => attempt.stop(),
-        }
-    });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .redirect(policy)
-        .user_agent("huntwell-assets/1.0")
-        .build()
-        .context("build download client")?;
-
-    let resp = client.get(url).send().await.with_context(|| format!("GET {url}"))?;
+        resp = Some(r);
+        break;
+    }
+    let resp = resp.ok_or_else(|| anyhow!("too many redirects"))?;
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("server answered {status}");
@@ -199,7 +253,8 @@ pub async fn fetch(url: &str) -> Result<FetchedFile> {
         anyhow::bail!("file was empty");
     }
 
-    let filename = disposition_name.unwrap_or_else(|| filename_from_url(url));
+    // Named for where it ended up, not where it started.
+    let filename = disposition_name.unwrap_or_else(|| filename_from_url(&current));
     let ext = extension_for(&filename, &content_type);
     let filename = if filename.contains('.') { filename } else { format!("{filename}.{ext}") };
     let sha256 = crate::objstore::sha256_hex(&bytes);
@@ -331,4 +386,52 @@ mod tests {
             Some("annual_report.pdf")
         );
     }
+
+    #[test]
+    fn ports_and_hops_are_read_from_the_url() {
+        assert_eq!(port_of("https://a.example/x"), 443);
+        assert_eq!(port_of("http://a.example/x"), 80);
+        assert_eq!(port_of("http://a.example:8080/x?y=1"), 8080);
+        assert_eq!(port_of("http://[::1]:9/x"), 9);
+        assert_eq!(next_hop("https://a.example/dir/f.pdf", "/other").unwrap(), "https://a.example/other");
+        assert_eq!(next_hop("https://a.example/dir/f.pdf", "g.pdf").unwrap(), "https://a.example/dir/g.pdf");
+        assert_eq!(next_hop("https://a.example/", "http://b.example/z").unwrap(), "http://b.example/z");
+    }
+
+    /// A real listener: a public-looking first hop that redirects to link-local
+    /// must stop at the redirect, and a redirect to another allowed address
+    /// must be followed with the file named for where it ended up.
+    #[tokio::test]
+    async fn redirects_are_checked_hop_by_hop_and_pinned() {
+        use axum::{response::Redirect, routing::get, Router};
+        ALLOW_LOOPBACK_FOR_TESTS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/to-metadata", get(|| async { Redirect::temporary("http://169.254.169.254/latest/meta-data/") }))
+            .route("/to-localhost", get(|| async { Redirect::temporary("http://localhost/secret") }))
+            .route("/to-file", get(|| async { Redirect::temporary("/final.txt") }))
+            .route("/final.txt", get(|| async { "hello" }))
+            .route("/loop", get(|| async { Redirect::temporary("/loop") }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{port}");
+        async fn fails(url: String) -> String {
+            match fetch(&url).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{url} should have been refused"),
+            }
+        }
+
+        let e = fails(format!("{base}/to-metadata")).await;
+        assert!(e.contains("link-local") || e.contains("private"), "{e}");
+        let e = fails(format!("{base}/to-localhost")).await;
+        assert!(e.contains("not reachable"), "{e}");
+        let e = fails(format!("{base}/loop")).await;
+        assert!(e.contains("too many redirects"), "{e}");
+        let f = fetch(&format!("{base}/to-file")).await.unwrap();
+        assert_eq!(f.bytes, b"hello");
+        assert_eq!(f.filename, "final.txt");
+        ALLOW_LOOPBACK_FOR_TESTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
 }

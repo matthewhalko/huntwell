@@ -1,7 +1,8 @@
-//! The warm-pool worker: entrypoint of each `hw-pool-N` pod.
+//! The warm-pool worker: one slot of a worker VM (`huntwell-worker@N`), or one
+//! child of the admin's process pool on a dev box.
 //!
-//! The admin control plane assigns queued runs to a (host, pod) pair; this
-//! supervisor polls for runs assigned to *this* pod, claims one atomically,
+//! The admin control plane assigns queued runs to a (host, slot) pair; this
+//! supervisor polls for runs assigned to *this* slot, claims one atomically,
 //! and executes it as a child `huntwell run --execution-id N` — the same child the
 //! local runner spawns, so the pipeline is completely unchanged. The child's
 //! stdout/stderr are tailed into `ExecutionLog` (the web UI's SSE reader polls that
@@ -12,8 +13,12 @@
 //! heartbeat lets the admin's reaper fail the run, and a cancel kills the
 //! child's whole process group (agent and Chrome go with it).
 //!
-//! One run per pod at a time — that is the isolation contract: a runaway
-//! search can only starve its own pod's cgroup.
+//! One run per slot at a time — that is the isolation contract: a runaway
+//! search can only starve its own slot's cgroup. A VM of ten slots runs ten.
+//!
+//! On SIGTERM it finishes the run in hand and then exits, which is what lets a
+//! deploy roll a worker VM without killing plans (the unit's KillMode=mixed
+//! sends the signal to this process alone).
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,14 +36,14 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 
 pub async fn main() -> Result<()> {
     let host_id: i64 = std::env::var("HOST_ID")
-        .context("HOST_ID not set (the StatefulSet manifest sets it)")?
+        .context("HOST_ID not set (a worker VM's /huntwell/env sets it)")?
         .trim()
         .parse()
         .context("HOST_ID is not a number")?;
-    let pod = std::env::var("POD_NAME").context("POD_NAME not set (downward API fieldRef)")?;
+    let slot = std::env::var("SLOT_NAME").context("SLOT_NAME not set (the huntwell-worker@ unit sets it per slot)")?;
 
-    // The central database is this pod's only dependency; keep retrying so a
-    // brief outage or a pod that starts before the tunnel does self-heals.
+    // The central database is this slot's only dependency; keep retrying so a
+    // brief outage or a slot that starts before the tunnel does self-heals.
     let url = crate::config::service_database_url()?;
     let db = loop {
         match store::connect(&url, 2).await {
@@ -49,7 +54,7 @@ pub async fn main() -> Result<()> {
             }
         }
     };
-    println!("worker-pool {pod} on host {host_id}: ready");
+    println!("worker-pool {slot} on host {host_id}: ready");
     crate::boot_bus("worker").await;
 
     let term = Arc::new(AtomicBool::new(false));
@@ -66,28 +71,28 @@ pub async fn main() -> Result<()> {
 
     loop {
         if term.load(Ordering::SeqCst) {
-            println!("worker-pool {pod}: terminating (idle)");
+            println!("worker-pool {slot}: terminating (idle)");
             return Ok(());
         }
-        let execution_id = match store::claim_next_execution(&db, host_id, &pod).await {
+        let execution_id = match store::claim_next_execution(&db, host_id, &slot).await {
             Ok(Some(id)) => id,
             Ok(None) => {
                 tokio::time::sleep(CLAIM_POLL).await;
                 continue;
             }
             Err(e) => {
-                eprintln!("worker-pool {pod}: claim query failed ({e:#}); retrying");
+                eprintln!("worker-pool {slot}: claim query failed ({e:#}); retrying");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
-        let _ = store::append_execution_log(&db, execution_id, "stdout", &format!("picked up by {pod} on host {host_id}")).await;
-        if let Err(e) = execute(&db, execution_id, &pod, &term).await {
+        let _ = store::append_execution_log(&db, execution_id, "stdout", &format!("picked up by {slot} on host {host_id}")).await;
+        if let Err(e) = execute(&db, execution_id, &slot, &term).await {
             let _ = store::append_execution_log(&db, execution_id, "stderr", &format!("worker error: {e:#}")).await;
             let _ = store::finish_execution(&db, execution_id, "failed", Some(-1)).await;
         }
         if term.load(Ordering::SeqCst) {
-            println!("worker-pool {pod}: terminating after run {execution_id}");
+            println!("worker-pool {slot}: terminating after run {execution_id}");
             return Ok(());
         }
     }
@@ -96,7 +101,7 @@ pub async fn main() -> Result<()> {
 /// Runs one claimed run to completion. The child writes its own terminal
 /// status (guarded, first writer wins); the mappings here only apply when it
 /// died before it could, or was killed.
-async fn execute(db: &Db, execution_id: i64, pod: &str, term: &Arc<AtomicBool>) -> Result<()> {
+async fn execute(db: &Db, execution_id: i64, slot: &str, term: &Arc<AtomicBool>) -> Result<()> {
     let exe = std::env::current_exe().context("locate own executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg("run")
@@ -110,7 +115,7 @@ async fn execute(db: &Db, execution_id: i64, pod: &str, term: &Arc<AtomicBool>) 
     #[cfg(unix)]
     {
         // Own process group, same as the local runner: a cancel signals the
-        // group so the agent CLI and Chrome die with the run, not the pod.
+        // group so the agent CLI and Chrome die with the run, not the slot.
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().context("spawn run child")?;
@@ -132,7 +137,7 @@ async fn execute(db: &Db, execution_id: i64, pod: &str, term: &Arc<AtomicBool>) 
     });
 
     // Wait for the child while heartbeating; a heartbeat that reports a
-    // cancel (or a pod SIGTERM) kills the group and lets the wait finish.
+    // cancel (or a slot SIGTERM) kills the group and lets the wait finish.
     let mut killed = false;
     let mut hb = tokio::time::interval(HEARTBEAT_EVERY);
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -142,7 +147,7 @@ async fn execute(db: &Db, execution_id: i64, pod: &str, term: &Arc<AtomicBool>) 
             _ = hb.tick() => {
                 let cancel = store::heartbeat_execution(db, execution_id).await.unwrap_or(false);
                 if (cancel || term.load(Ordering::SeqCst)) && !killed {
-                    let why = if cancel { "cancel requested" } else { "pod terminating" };
+                    let why = if cancel { "cancel requested" } else { "slot terminating" };
                     let _ = store::append_execution_log(db, execution_id, "stderr", &format!("{why} — stopping the run")).await;
                     crate::web::runner::kill_group(pid).await;
                     killed = true;
@@ -161,7 +166,7 @@ async fn execute(db: &Db, execution_id: i64, pod: &str, term: &Arc<AtomicBool>) 
         (false, None) => ("failed", Some(-1)),
     };
     let _ = store::finish_execution(db, execution_id, status_str, code).await;
-    println!("worker-pool {pod}: run {execution_id} finished ({status_str})");
+    println!("worker-pool {slot}: run {execution_id} finished ({status_str})");
     Ok(())
 }
 

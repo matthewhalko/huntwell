@@ -55,12 +55,14 @@ pub fn team_routes() -> Router<App> {
 /// Owned by the auth service (the `Account`/`Session` tables).
 pub fn auth_routes() -> Router<App> {
     Router::new()
+        .route("/auth/config", get(auth::config))
         .route("/auth/signup", post(auth::signup))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me).put(auth::update_me))
         .route("/auth/password", post(auth::change_password))
-        .route("/internal/introspect", get(auth::introspect))
+        .route("/auth/verify", post(auth::verify))
+        .route("/auth/resend", post(auth::resend))
 }
 
 /// The dashboard aggregate and the server-capability probe. In the split
@@ -92,7 +94,6 @@ pub fn plans_routes() -> Router<App> {
         .route("/plans/{id}/graph", get(plan_graph))
         .route("/plans/{id}/queue", delete(clear_queue))
         // Internal: the runs service asks for a plan's summary for /overview.
-        .route("/internal/plan-summary", get(internal_plan_summary))
 }
 
 /// A plan as the user's own: what they asked for, what it collects, when it
@@ -146,7 +147,7 @@ pub fn listen_metered_runs(state: App) {
 }
 
 /// Run lifecycle and live logs. Owned by the runs service (which also hosts the
-/// scheduler and dispatches run-worker Jobs).
+/// scheduler).
 pub fn runs_routes() -> Router<App> {
     Router::new()
         .route("/executions", get(list_executions).post(start_execution))
@@ -185,47 +186,11 @@ pub fn prospects_routes() -> Router<App> {
         .route("/keys/{id}/revoke", post(revoke_key))
         .route("/keys/{id}/allow", post(allow_key))
         // Internal: the runs service asks for prospect counts for /overview.
-        .route("/internal/prospect-summary", get(internal_prospect_summary))
 }
 
 // ---- overview / status -------------------------------------------------------
 
 async fn overview(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
-    // Split deployment: the runs service owns only Run data, so it fans out to
-    // the plans and prospects services for their counts. Detected by the
-    // presence of a sibling URL (unset in the all-in-one `serve`).
-    if let Some(plans_url) = crate::config::sibling_url("PLANS") {
-        let id = acc.tenant();
-        let runs: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM execution WHERE account_id = $1"#)
-            .bind(id).fetch_one(&state.db).await.unwrap_or(0);
-        let active_executions: i64 = sqlx::query_scalar(
-            r#"SELECT count(*) FROM execution WHERE account_id = $1 AND status IN ('queued','running')"#,
-        ).bind(id).fetch_one(&state.db).await.unwrap_or(0);
-        let last_execution_at: Option<chrono::DateTime<chrono::Utc>> =
-            sqlx::query_scalar(r#"SELECT max(started_at) FROM execution WHERE account_id = $1"#)
-                .bind(id).fetch_one(&state.db).await.unwrap_or(None);
-        let recent = store::list_executions(&state.db, id, None, 8).await.unwrap_or_default();
-
-        let plans_sum = sibling_json(&plans_url, "/api/internal/plan-summary", id).await.unwrap_or_default();
-        let prospects_sum = crate::config::sibling_url("PROSPECTS")
-            .map(|u| async move { sibling_json(&u, "/api/internal/prospect-summary", id).await.unwrap_or_default() });
-        let prospects_sum = match prospects_sum {
-            Some(f) => f.await,
-            None => Value::Null,
-        };
-        let jget = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
-        let o = json!({
-            "plans": jget(&plans_sum, "plans"),
-            "prospects": jget(&prospects_sum, "prospects"),
-            "prospects_7d": jget(&prospects_sum, "prospects_7d"),
-            "executions": runs,
-            "active_executions": active_executions,
-            "last_execution_at": last_execution_at.map(|t| t.to_rfc3339()),
-        });
-        let latest = prospects_sum.get("latest").cloned().unwrap_or_else(|| json!([]));
-        return Ok(Json(json!({ "overview": o, "recent_executions": recent, "latest_prospects": latest })));
-    }
-
     let o = store::overview(&state.db, acc.tenant()).await?;
     let recent = store::list_executions(&state.db, acc.tenant(), None, 8).await?;
     let (latest, _) = store::list_prospects(
@@ -237,41 +202,8 @@ async fn overview(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<J
     Ok(Json(json!({ "overview": o, "recent_executions": recent, "latest_prospects": latest })))
 }
 
-/// A GET to a sibling service, forwarding the caller's account id as the
-/// internal header the split services authenticate by.
-async fn sibling_json(base: &str, path: &str, account_id: i64) -> anyhow::Result<Value> {
-    let resp = reqwest::Client::new()
-        .get(format!("{base}{path}"))
-        .header(auth::ACCOUNT_HEADER, account_id.to_string())
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await?;
-    Ok(resp.json().await?)
-}
 
-/// Internal: how many plans this account has (called by the runs service).
-async fn internal_plan_summary(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
-    let plans: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM plan WHERE account_id = $1"#)
-        .bind(acc.tenant()).fetch_one(&state.db).await?;
-    Ok(Json(json!({ "plans": plans })))
-}
 
-/// Internal: prospect counts + the newest few (called by the runs service).
-async fn internal_prospect_summary(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
-    let id = acc.tenant();
-    let prospects: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM prospect WHERE account_id = $1"#)
-        .bind(id).fetch_one(&state.db).await?;
-    let prospects_7d: i64 = sqlx::query_scalar(
-        r#"SELECT count(*) FROM prospect WHERE account_id = $1 AND first_seen_utc > now() - interval '7 days'"#,
-    ).bind(id).fetch_one(&state.db).await?;
-    let (latest, _) = store::list_prospects(
-        &state.db,
-        id,
-        &store::ProspectFilter { plan_id: None, min_value: 0, search: String::new(), limit: 8, offset: 0 },
-    )
-    .await?;
-    Ok(Json(json!({ "prospects": prospects, "prospects_7d": prospects_7d, "latest": latest })))
-}
 
 /// The account's token budget and consumption for the current period — the
 /// meter the UI shows and the cap the run dispatcher enforces.
@@ -390,6 +322,11 @@ async fn invite(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): J
     if !email.contains('@') || email.len() > 320 {
         return Err(bad_request("that does not look like an email address"));
     }
+    // Each invitation is an email from this domain carrying the sender's own
+    // words, so one account gets a day's worth, not an unlimited supply.
+    crate::throttle::INVITES.hit(&acc.account_id.to_string()).map_err(|_| {
+        ApiError(StatusCode::TOO_MANY_REQUESTS, "that is enough invitations for today — try again tomorrow".into())
+    })?;
     let role = match body.role.trim() {
         "admin" => "admin",
         _ => "member",

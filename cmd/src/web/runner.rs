@@ -56,7 +56,7 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     let execution_id = store::create_execution(&state.db, account_id, plan_id, trigger, &args_json, cdp).await?;
     // Published here, before the dispatch branches, so every mode announces a
     // queued run identically — a listener should not have to know whether this
-    // deployment forks a child, creates a Job, or waits for a pool pod.
+    // deployment forks a child or waits for a worker slot.
     crate::bus::publish(
         crate::bus::subject::RUN_QUEUED,
         Some(account_id),
@@ -65,25 +65,11 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     .await;
 
     // Pool path: the run stays queued; the admin control plane's placement
-    // loop routes it to a warm worker pod (random / round-robin / pinned) and
-    // that pod's supervisor claims and executes it. Nothing to spawn here.
+    // loop routes it to a warm worker slot (random / round-robin / pinned) and
+    // that slot's supervisor claims and executes it. Nothing to spawn here.
     if super::dispatch::mode() == super::dispatch::Mode::Pool {
-        let _ = store::append_execution_log(&state.db, execution_id, "stdout", "queued — waiting for a worker pod").await;
+        let _ = store::append_execution_log(&state.db, execution_id, "stdout", "queued — waiting for a worker slot").await;
         tracing::info!(execution_id, plan_id, account_id, "run queued for pool dispatch");
-        return Ok(execution_id);
-    }
-
-    // Hosted (k3d) path: run as a Kubernetes Job instead of a child process. The
-    // Job's pod is one-run-per-process just like the child, so the pipeline's
-    // process-wide state is unaffected; its log is streamed into RunLog by
-    // `dispatch::track`.
-    if super::dispatch::enabled() {
-        if let Err(e) = super::dispatch::start_job(state, execution_id).await {
-            let _ = store::append_execution_log(&state.db, execution_id, "stderr", &format!("could not start run: {e:#}")).await;
-            let _ = store::finish_execution(&state.db, execution_id, "failed", Some(-1)).await;
-            return Err(anyhow!("dispatch run: {e:#}"));
-        }
-        tracing::info!(execution_id, plan_id, account_id, "run dispatched as Job");
         return Ok(execution_id);
     }
 
@@ -170,7 +156,7 @@ async fn tail<R: tokio::io::AsyncRead + Unpin>(state: &App, execution_id: i64, s
 /// tidies Chrome), SIGKILL after a grace period if it is still there.
 pub async fn cancel(state: &App, account_id: i64, execution_id: i64) -> Result<bool> {
     // Pool path: mark the run cancelled (guarded — first writer wins) and set
-    // the flag the pod supervisor polls with its heartbeat; the supervisor
+    // the flag the slot supervisor polls with its heartbeat; the supervisor
     // kills the child within one heartbeat interval. A queued-unclaimed run
     // simply never gets picked up once terminal.
     if super::dispatch::mode() == super::dispatch::Mode::Pool {
@@ -179,18 +165,6 @@ pub async fn cancel(state: &App, account_id: i64, execution_id: i64) -> Result<b
             return Ok(false);
         }
         store::request_execution_cancel(&state.db, execution_id).await?;
-        store::finish_execution(&state.db, execution_id, "cancelled", Some(130)).await?;
-        let _ = store::append_execution_log(&state.db, execution_id, "stderr", "execution cancelled from the UI").await;
-        return Ok(true);
-    }
-    // Hosted (k3d) path: there is no in-memory child; cancel means delete the
-    // Job. Ownership is checked against the account-scoped Run row.
-    if super::dispatch::enabled() {
-        let Some(run) = store::get_execution(&state.db, account_id, execution_id).await? else { return Ok(false) };
-        if !matches!(run.status.as_str(), "queued" | "running") {
-            return Ok(false);
-        }
-        let _ = super::dispatch::cancel_job(execution_id).await;
         store::finish_execution(&state.db, execution_id, "cancelled", Some(130)).await?;
         let _ = store::append_execution_log(&state.db, execution_id, "stderr", "execution cancelled from the UI").await;
         return Ok(true);

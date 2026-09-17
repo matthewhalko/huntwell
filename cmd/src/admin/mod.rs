@@ -1,8 +1,8 @@
-//! The admin control plane: a separate server that manages many k3d/k3s
-//! hosts, keeps a warm pool of `worker-pool` pods on each, and routes queued
-//! runs to pods (random / round-robin / pinned). See `docs/K3D.md`.
+//! The admin control plane: a separate server that manages bare-metal Incus
+//! hosts, provisions the application's VMs on them, and routes queued runs to
+//! worker slots (random / round-robin / pinned). See `docs/PRODUCTION.md`.
 //!
-//! It owns three background loops — host reconcile (kubectl, parallel per
+//! It owns three background loops — host reconcile (Incus, parallel per
 //! host), placement, and the heartbeat reaper — plus a small JSON API and an
 //! embedded single-page dashboard. Operator auth is its own table
 //! (`AdminUser`), seeded from `HUNTWELL_ADMIN_EMAIL` / `_PASSWORD`; it never
@@ -10,6 +10,8 @@
 
 mod api;
 mod hosts;
+pub mod incus;
+pub mod incus_driver;
 mod placement;
 mod ui;
 
@@ -26,12 +28,49 @@ use crate::store::Db;
 /// dead process looks dead on the next dashboard poll.
 pub const STALE_AFTER_SECS: i64 = 15;
 
-/// One pod as last seen by kubectl on a host.
+/// Whether this process can run the process-backed local pool.
+///
+/// Only the all-in-one `huntwell` executable can: it spawns `current_exe()
+/// worker-pool`, and it is the one binary that answers `worker-pool`. The
+/// standalone `admin` service turns this off at startup. Without that, a
+/// database carrying a local host row — a restored dev database, or one a
+/// `huntwell admin` once ran against — would make the service fork copies of
+/// itself every reconcile, each failing to bind the port the first one holds.
+static LOCAL_POOL_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn disable_local_pool() {
+    LOCAL_POOL_SUPPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn local_pool_supported() -> bool {
+    LOCAL_POOL_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How long a sighting from a VM check stays fresh. Hosts are checked every 20
+/// seconds, so a window shorter than a few checks would show a healthy service
+/// flickering to stale between them.
+pub const VM_CHECK_FRESH_SECS: i64 = 60;
+
+/// One sighting of a service instance, and how long it stands for.
+///
+/// Two sources report at different rhythms. A process on the bus heartbeats
+/// every few seconds; a service inside a VM is seen only when the reconcile
+/// asks systemd, every 20. Judging both by one window would either call VM
+/// services stale between checks or let a dead bus process look alive for a
+/// minute — so each sighting carries its own.
+#[derive(Debug, Clone, Copy)]
+pub struct Ping {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub fresh_for: i64,
+}
+
+/// One worker slot as last seen on a host: a named process that claims the runs
+/// addressed to it.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PodInfo {
+pub struct SlotInfo {
     pub name: String,
     pub ready: bool,
-    /// The node this pod is running on. Empty while it is still being
+    /// The node this slot is running on. Empty while it is still being
     /// scheduled, and on the process-backed local pool, which has no nodes.
     ///
     /// Shown because "the new machine is in the cluster" and "the new machine
@@ -44,14 +83,18 @@ pub struct AdminState {
     pub db: Db,
     /// token → operator email. In-memory: restarting the admin logs out.
     pub sessions: Mutex<HashMap<String, String>>,
-    /// host_id → pods from the last successful reconcile. Placement and the
-    /// UI read this cache; kubectl is never called on the request path.
-    pub pods: Mutex<HashMap<i64, Vec<PodInfo>>>,
-    /// (host_id, pod name) → child for process-backed "local" hosts (dev mode:
+    /// host_id → slots from the last successful reconcile. Placement and the
+    /// UI read this cache; Incus is never called on the request path.
+    pub slots: Mutex<HashMap<i64, Vec<SlotInfo>>>,
+    /// (host_id, slot name) → child for process-backed "local" hosts (dev mode:
     /// the pool runs as worker-pool child processes of the admin itself).
-    pub local_pods: Mutex<HashMap<(i64, String), tokio::process::Child>>,
-    /// (service, instance) → last heartbeat seen on the bus.
-    pub pings: Mutex<HashMap<(String, String), chrono::DateTime<chrono::Utc>>>,
+    pub local_slots: Mutex<HashMap<(i64, String), tokio::process::Child>>,
+    /// (service, instance) → the last sighting: a bus heartbeat, or a unit
+    /// systemd reported active inside a VM.
+    pub pings: Mutex<HashMap<(String, String), Ping>>,
+    /// VMs with a provision, deploy or start in flight. One at a time per VM:
+    /// two deploys renaming the same executables can leave it running neither.
+    pub busy: Mutex<std::collections::HashSet<i64>>,
 }
 
 pub type Admin = Arc<AdminState>;
@@ -130,51 +173,51 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     }
 
     // Dev convenience: HUNTWELL_LOCAL_POOL=N registers a process-backed
-    // "local" host (pool pods run as children of this admin — no k8s needed),
-    // so the whole routing path works on a laptop.
+    // "local" host (worker slots run as children of this admin — no VMs), so
+    // the whole routing path works on a laptop.
     if let Some(n) = crate::config::get("HUNTWELL_LOCAL_POOL").and_then(|v| v.parse::<i32>().ok()) {
         let existing = crate::store::list_hosts(&db).await?.into_iter().any(|h| h.name == "local");
         if !existing && n > 0 {
             let h = crate::store::Host {
                 host_id: 0,
                 name: "local".into(),
-                kubeconfig_yaml: "local".into(),
-                kube_context: None,
                 enabled: true,
                 pool_size: n,
-                cpu_request: "-".into(),
-                cpu_limit: "-".into(),
-                mem_request: "-".into(),
-                mem_limit: "-".into(),
-                image: "(this machine)".into(),
-                // Never: the dev stack already runs the services as processes
-                // (./dev.sh), and this host has no cluster to deploy them to.
-                runs_services: false,
-                web_replicas: 1,
                 notes: "process-backed dev pool, auto-registered by HUNTWELL_LOCAL_POOL".into(),
                 last_error: None,
                 last_seen_at: None,
                 created_at: chrono::Utc::now(),
+                // No endpoint is what makes it the local host (hosts::is_local).
+                endpoint: String::new(),
+                status: "Active".into(),
+                base_image: String::new(),
+                priority: 100,
+                // It carries no VMs; its capacity is pool_size children.
+                max_vms: 0,
+                vm_cpu: 0,
+                vm_memory: String::new(),
+                vm_disk: String::new(),
+                vm_slots: 0,
+                ingress_domain: String::new(),
+                edge_scheme: "http".into(),
+                edge_port: 0,
+                arch: String::new(),
+                incus_version: String::new(),
+                cpu_total: 0,
+                memory_total_mb: 0,
             };
             let id = crate::store::create_host(&db, &h).await?;
             tracing::info!("registered local process pool as host #{id} ({n} workers)");
         }
     }
 
-    // Kubeconfigs are files on disk for kubectl; rematerialize the lot at
-    // startup so a fresh server (or a wiped temp dir) is self-healing.
-    for h in crate::store::list_hosts(&db).await? {
-        if let Err(e) = hosts::write_kubeconfig(&h) {
-            tracing::warn!(host = h.name, "could not write kubeconfig: {e:#}");
-        }
-    }
-
     let state: Admin = Arc::new(AdminState {
         db,
         sessions: Mutex::new(HashMap::new()),
-        pods: Mutex::new(HashMap::new()),
-        local_pods: Mutex::new(HashMap::new()),
+        slots: Mutex::new(HashMap::new()),
+        local_slots: Mutex::new(HashMap::new()),
         pings: Mutex::new(HashMap::new()),
+        busy: Mutex::new(std::collections::HashSet::new()),
     });
 
     hosts::spawn_reconcile(state.clone());
@@ -184,7 +227,7 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("admin control plane on http://{addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }
 
@@ -205,7 +248,7 @@ fn spawn_heartbeat_listener(state: Admin) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            state.pings.lock().await.insert((event.source, instance), event.at);
+            state.pings.lock().await.insert((event.source, instance), Ping { at: event.at, fresh_for: STALE_AFTER_SECS });
         }
         tracing::warn!("service heartbeat subscription ended");
     });
@@ -213,7 +256,7 @@ fn spawn_heartbeat_listener(state: Admin) {
 
 /// Fleet health from the pings we have heard. Pure so a test can pin the clock.
 pub fn health_snapshot(
-    pings: &HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    pings: &HashMap<(String, String), Ping>,
     now: chrono::DateTime<chrono::Utc>,
     stale_after_secs: i64,
 ) -> Value {
@@ -229,12 +272,12 @@ pub fn health_snapshot(
             let mut instances: Vec<Value> = pings
                 .iter()
                 .filter(|((svc, _), _)| svc == name)
-                .map(|((_, instance), at)| {
-                    let age = (now - *at).num_seconds().max(0);
-                    let status = if age <= stale_after_secs { "ok" } else { "stale" };
+                .map(|((_, instance), ping)| {
+                    let age = (now - ping.at).num_seconds().max(0);
+                    let status = if age <= ping.fresh_for { "ok" } else { "stale" };
                     json!({
                         "id": instance,
-                        "last_ping": at,
+                        "last_ping": ping.at,
                         "age_seconds": age,
                         "status": status,
                     })
@@ -286,8 +329,9 @@ mod tests {
     fn a_fresh_ping_is_ok_and_a_quiet_one_is_stale() {
         let now = ts(1_000);
         let mut pings = HashMap::new();
-        pings.insert(("website".into(), "web-a".into()), ts(995));
-        pings.insert(("admin".into(), "adm-a".into()), ts(980));
+        let bus = |at| Ping { at, fresh_for: STALE_AFTER_SECS };
+        pings.insert(("website".into(), "web-a".into()), bus(ts(995)));
+        pings.insert(("admin".into(), "adm-a".into()), bus(ts(980)));
         let snap = health_snapshot(&pings, now, STALE_AFTER_SECS);
         let find = |name: &str| {
             snap["services"].as_array().unwrap().iter().find(|s| s["name"] == name).cloned().unwrap()
@@ -299,9 +343,25 @@ mod tests {
     }
 
     #[test]
+    fn a_vm_sighting_stays_fresh_between_checks_but_a_bus_one_does_not() {
+        // Seen 40s ago. From the bus that is a dead process; from a VM check
+        // run every 20s it is simply the last check but one.
+        let now = ts(1_000);
+        let mut pings = HashMap::new();
+        pings.insert(("website".into(), "hw-app".into()), Ping { at: ts(960), fresh_for: VM_CHECK_FRESH_SECS });
+        pings.insert(("planning".into(), "laptop:42".into()), Ping { at: ts(960), fresh_for: STALE_AFTER_SECS });
+        let snap = health_snapshot(&pings, now, STALE_AFTER_SECS);
+        let find = |name: &str| {
+            snap["services"].as_array().unwrap().iter().find(|s| s["name"] == name).cloned().unwrap()
+        };
+        assert_eq!(find("website")["status"], "ok");
+        assert_eq!(find("planning")["status"], "stale");
+    }
+
+    #[test]
     fn an_unknown_service_still_appears() {
         let mut pings = HashMap::new();
-        pings.insert(("edge".into(), "e1".into()), ts(1_000));
+        pings.insert(("edge".into(), "e1".into()), Ping { at: ts(1_000), fresh_for: STALE_AFTER_SECS });
         let snap = health_snapshot(&pings, ts(1_000), STALE_AFTER_SECS);
         let extra = snap["services"].as_array().unwrap().iter().find(|s| s["name"] == "edge").unwrap();
         assert_eq!(extra["expected"], false);

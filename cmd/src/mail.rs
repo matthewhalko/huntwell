@@ -22,12 +22,21 @@ pub struct Email {
     pub text: String,
 }
 
-const BRAND: &str = "#007a5a";
-const SPARK: &str = "#2eb67d";
-const INK: &str = "#1d1c1d";
-const MUTED: &str = "#616061";
-const RULE: &str = "#e0e0e0";
-const PAPER: &str = "#f8f8f8";
+// The app's own tokens (UI/web/src/styles.css, light theme). Email clients
+// ignore CSS variables and most of dark mode, so they are spelled out here;
+// change them together with the stylesheet.
+const BRAND: &str = "#007a5a"; // --accent
+const BRAND_DEEP: &str = "#00604a"; // --accent-deep
+const BRAND_SOFT: &str = "#e6f3ee"; // --accent-soft
+const CHROME: &str = "#3f0e40"; // --chrome: the topbar the wordmark sits on
+const SPARK: &str = "#2eb67d"; // --brand-green: the ✦, where a gradient cannot be
+const INK: &str = "#1d1c1d"; // --text
+const MUTED: &str = "#616061"; // --text-2
+const RULE: &str = "#e0e0e0"; // --border
+const PAPER: &str = "#f8f8f8"; // --bg-2
+/// The app's display face, with the stack it falls back to. Gmail drops the
+/// web font and uses the fallbacks; Apple Mail and most others load it.
+const FONT: &str = "'Lato',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 
 /// Escapes text going into the HTML part. Every value here comes from a person
 /// — a display name, a workspace name — so none of it can be trusted as markup.
@@ -35,30 +44,34 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// The shell every message shares: the wordmark, a white card on a grey ground,
-/// and a footer. `body` is already-escaped HTML; `preview` is not, and is
-/// escaped here — it carries names too, and the preheader is still the page.
+/// The shell every message shares, dressed like the app: the plum topbar with
+/// the ✦ wordmark, a white card on the grey ground, and a footer. `body` is
+/// already-escaped HTML; `preview` is not, and is escaped here — it carries
+/// names too, and the preheader is still the page.
 fn layout(preview: &str, body: &str) -> String {
     let preview = esc(preview);
     format!(
         r#"<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light only"><title>Huntwell</title></head>
-<body style="margin:0;padding:0;background:{PAPER};color:{INK};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<meta name="color-scheme" content="light only"><title>Huntwell</title>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet"></head>
+<body style="margin:0;padding:0;background:{PAPER};color:{INK};font-family:{FONT};">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0;">{preview}</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAPER};padding:32px 12px;">
 <tr><td align="center">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">
-    <tr><td style="padding:0 4px 18px;">
-      <span style="font-size:20px;font-weight:900;letter-spacing:-0.5px;color:{INK};">
-        <span style="color:{SPARK};">&#10022;</span> huntwell
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;border-radius:10px;overflow:hidden;border:1px solid {RULE};">
+    <tr><td style="background:{CHROME};padding:14px 24px;">
+      <span style="font-family:{FONT};font-size:21px;font-weight:900;letter-spacing:-0.4px;color:#ffffff;line-height:1;">
+        <span style="color:{SPARK};font-size:25px;vertical-align:-2px;">&#10022;</span> huntwell
       </span>
     </td></tr>
-    <tr><td style="background:#ffffff;border:1px solid {RULE};border-radius:10px;padding:28px 28px 24px;">
+    <tr><td style="background:#ffffff;padding:28px 28px 24px;">
       {body}
     </td></tr>
-    <tr><td style="padding:16px 4px 0;color:{MUTED};font-size:12px;line-height:1.6;">
+  </table>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">
+    <tr><td style="padding:16px 8px 0;color:{MUTED};font-size:12px;line-height:1.6;font-family:{FONT};">
       You're receiving this because someone used this address on Huntwell.
     </td></tr>
   </table>
@@ -92,34 +105,41 @@ fn fallback(url: &str) -> String {
 }
 
 fn h1(text: &str) -> String {
-    format!(r#"<h1 style="margin:0 0 10px;font-size:22px;line-height:1.25;color:{INK};">{}</h1>"#, esc(text))
+    format!(
+        r#"<h1 style="margin:0 0 10px;font-family:{FONT};font-size:22px;font-weight:900;letter-spacing:-0.3px;line-height:1.25;color:{INK};">{}</h1>"#,
+        esc(text)
+    )
 }
 
 fn p(text: &str) -> String {
-    format!(r#"<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:{INK};">{}</p>"#, esc(text))
+    format!(r#"<p style="margin:0 0 14px;font-family:{FONT};font-size:15px;line-height:1.6;color:{INK};">{}</p>"#, esc(text))
 }
 
-/// Sent on signup. Nothing else can happen until this link is followed, so the
-/// message says one thing and asks for one click.
-pub fn verification(name: &str, link: &str) -> Email {
+/// Sent on signup. Nothing else can happen until this code is typed into the
+/// page that asked for it, so the message says one thing and shows one number.
+pub fn verification(name: &str, code: &str) -> Email {
     let hello = if name.trim().is_empty() { "Hi".to_string() } else { format!("Hi {}", name.trim()) };
+    let code = code.trim();
     let body = format!(
-        "{}{}{}{}{}",
-        h1("Confirm your email"),
-        p(&format!("{hello} — confirm this address and your Huntwell account is ready to use.")),
-        button("Confirm my email", link),
-        fallback(link),
+        "{}{}{}{}",
+        h1("Your confirmation code"),
+        p(&format!("{hello} — enter this code on the page you signed up from and your Huntwell account is ready to use.")),
         format!(
-            r#"<p style="margin:14px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">This link works once and expires in 24 hours. If you didn't create a Huntwell account, ignore this email — nothing happens without the click.</p>"#
+            r#"<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;"><tr>
+  <td style="background:{BRAND_SOFT};border-radius:10px;padding:14px 26px;font-size:34px;font-weight:700;letter-spacing:.28em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:{BRAND_DEEP};">{}</td>
+</tr></table>"#,
+            esc(code)
+        ),
+        format!(
+            r#"<p style="margin:14px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">It expires in 15 minutes. If you didn't create a Huntwell account, ignore this email — nothing happens without the code.</p>"#
         ),
     );
     Email {
-        subject: "Confirm your email for Huntwell".into(),
-        html: layout("Confirm your email and start hunting.", &body),
+        subject: format!("{code} is your Huntwell code"),
+        html: layout(&format!("Your Huntwell code is {code}."), &body),
         text: format!(
-            "{hello} — confirm this address and your Huntwell account is ready to use.\n\n\
-             Confirm your email:\n{link}\n\n\
-             This link works once and expires in 24 hours.\n\
+            "{hello} — your Huntwell confirmation code is:\n\n    {code}\n\n\
+             Enter it on the page you signed up from. It expires in 15 minutes.\n\
              If you didn't create a Huntwell account, ignore this email.\n"
         ),
     }
@@ -356,11 +376,26 @@ mod tests {
     use super::*;
 
     /// Both parts carry the link, because either one may be what gets read.
+    /// Writes each message to target/mail-samples/ so it can be opened in a
+    /// browser: `cargo test dump_mail_samples -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_mail_samples() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mail-samples");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, m) in [
+            ("verification", verification("Ada", "482913")),
+            ("welcome", welcome("Ada", "https://app.example.com/app")),
+            ("invite", invite("Acme", "Bob", "member", "https://app.example.com/join/tok")),
+        ] {
+            std::fs::write(dir.join(format!("{name}.html")), &m.html).unwrap();
+        }
+    }
+
     #[test]
     fn every_message_carries_its_link_in_both_parts() {
-        let link = "https://app.example.com/verify/abc123";
-        let v = verification("Ada", link);
-        assert!(v.html.contains(link) && v.text.contains(link));
+        let v = verification("Ada", "482913");
+        assert!(v.html.contains("482913") && v.text.contains("482913") && v.subject.contains("482913"));
         let i = invite("Alice", "Bob", "member", "https://app.example.com/join/tok");
         assert!(i.html.contains("/join/tok") && i.text.contains("/join/tok"));
         let w = welcome("Ada", "https://app.example.com/app");
@@ -369,7 +404,7 @@ mod tests {
 
     #[test]
     fn subjects_say_what_the_message_is() {
-        assert_eq!(verification("", "x").subject, "Confirm your email for Huntwell");
+        assert_eq!(verification("", "000111").subject, "000111 is your Huntwell code");
         assert_eq!(welcome("", "x").subject, "You're in — here's how Huntwell works");
         assert_eq!(invite("Acme", "Bob", "member", "x").subject, "Bob invited you to Acme on Huntwell");
     }
@@ -384,7 +419,7 @@ mod tests {
 
     #[test]
     fn a_missing_name_still_reads_as_a_sentence() {
-        assert!(verification("", "x").text.starts_with("Hi — confirm"));
+        assert!(verification("", "000111").text.starts_with("Hi — your"));
         assert!(welcome("", "x").text.starts_with("You're in\n"));
         assert!(invite("Acme", "", "member", "x").text.starts_with("Someone invited you"));
     }

@@ -34,17 +34,29 @@ ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS cache_write_tokens bigint 
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS cost_usd_micros bigint NOT NULL DEFAULT 0;
 
 -- Pool-dispatch placement (RUN_DISPATCH=pool): the admin control plane
--- assigns a queued execution to a warm worker pod on a host; the pod's supervisor
--- claims it and heartbeats while it executes. host_id deliberately has NO
--- foreign key — execution history must survive host deletion (admin refuses to
--- delete a host with non-terminal executions, in code).
+-- assigns a queued execution to a worker slot on a host — `huntwell-worker@N`
+-- in a worker VM — and that slot claims it and heartbeats while it executes.
+-- host_id deliberately has NO foreign key — execution history must survive host
+-- deletion (admin refuses to delete a host with non-terminal executions, in code).
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS host_id          bigint;
-ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS pod_name         varchar(80);
+
+-- slot_name had an earlier name. Renamed in place rather than added beside it,
+-- so an existing database keeps every run's placement; guarded so it runs once.
+DO $$ BEGIN
+	IF EXISTS (SELECT 1 FROM information_schema.columns
+	           WHERE table_schema = 'public' AND table_name = 'execution' AND column_name = 'pod_name')
+	   AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+	           WHERE table_schema = 'public' AND table_name = 'execution' AND column_name = 'slot_name') THEN
+		ALTER TABLE public.execution RENAME COLUMN pod_name TO slot_name;
+	END IF;
+END $$;
+ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS slot_name        varchar(80);
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS claimed_at       timestamptz;
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS heartbeat_at     timestamptz;
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
--- The pod supervisor's claim query: assigned to me, still unclaimed.
-CREATE INDEX IF NOT EXISTS execution_pool_claim_idx ON public.execution (host_id, pod_name)
+-- A slot's claim query: assigned to me, still unclaimed. (On a renamed
+-- database the existing index already follows the column.)
+CREATE INDEX IF NOT EXISTS execution_pool_claim_idx ON public.execution (host_id, slot_name)
 	WHERE status = 'queued' AND claimed_at IS NULL;
 
 -- The remote browser session this execution drove, so the owner can watch it

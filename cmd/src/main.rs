@@ -1,7 +1,7 @@
 //! huntwell — the Huntwell operator multi-tool.
 //!
 //! The services are their own executables (see `src/bin/`); this binary is
-//! everything an operator runs by hand, plus the entrypoints k8s Jobs use.
+//! everything an operator runs by hand.
 //!
 //!   huntwell serve                    the web app (API + embedded UI + scheduler)
 //!   huntwell run --execution-id N           one run, spawned by `serve` (or by hand)
@@ -38,27 +38,24 @@ enum Cmd {
         #[arg(long)]
         execution_id: i64,
     },
-    /// Execute one queued run — the Kubernetes Job entrypoint. Same as `run`.
+    /// Execute one queued run. Same as `run`; kept for old callers.
     RunWorker {
         #[arg(long)]
         execution_id: i64,
     },
-    /// Warm-pool worker: claims runs assigned to this pod and executes them.
-    /// The StatefulSet pod entrypoint (needs HOST_ID + POD_NAME).
+    /// Warm-pool worker: claims runs assigned to this slot and executes them.
+    /// A worker slot (needs HOST_ID + SLOT_NAME).
     WorkerPool,
-    /// The admin control plane: manages k3d hosts, worker pod pools, and run
+    /// The admin control plane: manages Incus hosts, their VMs, and run
     /// routing. Deployed on its own server, talks to the core database.
     Admin {
         /// host:port to listen on (default HUNTWELL_ADMIN_ADDR or 127.0.0.1:8710)
         #[arg(long)]
         addr: Option<String>,
     },
-    /// Apply a schema slice to DATABASE_URL. The k3d migrate Jobs' entrypoint.
-    Migrate {
-        /// all | auth | core
-        #[arg(long, default_value = "all")]
-        schema: String,
-    },
+    /// Apply the schema to DATABASE_URL. Every service also does this at
+    /// startup; this is for doing it on its own, ahead of a deploy.
+    Migrate,
     /// The read-only MCP server the scraping agent is given. Started by the agent.
     #[command(hide = true)]
     McpProspects {
@@ -323,9 +320,10 @@ async fn dispatch(cmd: Cmd) -> Result<i32> {
             // Say where the secrets came from. On a production server the
             // release binary reads `global` beside itself, and a missing or
             // shadowed file is otherwise invisible until something fails.
-            match config::source_file() {
-                Some(p) => tracing::info!("settings from {}", p.display()),
-                None => tracing::warn!("no global settings file found — using the process environment only"),
+            match (config::source_file(), config::source_error()) {
+                (Some(_), Some(e)) => tracing::error!("{e}"),
+                (Some(p), None) => tracing::info!("settings from {}", p.display()),
+                (None, _) => tracing::warn!("no global settings file found — using the process environment only"),
             }
             let addr = addr.unwrap_or_else(|| config::get_or("HUNTWELL_ADMIN_ADDR", "127.0.0.1:8710"));
             // The control plane starts first on a fresh server, so it is the
@@ -335,10 +333,10 @@ async fn dispatch(cmd: Cmd) -> Result<i32> {
             admin::serve(db, &addr).await?;
             Ok(0)
         }
-        Cmd::Migrate { schema } => {
+        Cmd::Migrate => {
             let db = store::connect(&config::service_database_url()?, 2).await?;
-            store::migrate_schema(&db, &schema).await?;
-            println!("applied schema '{schema}'");
+            store::migrate(&db).await?;
+            println!("applied the schema");
             Ok(0)
         }
         Cmd::Account { cmd } => {

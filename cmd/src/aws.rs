@@ -107,13 +107,14 @@ pub fn credentials(get: impl Fn(&str) -> Option<String>) -> Option<Credentials> 
     let pick = |names: &[&str]| -> Option<String> {
         names.iter().find_map(|n| get(n).filter(|v| !v.trim().is_empty()))
     };
-    let access_key = pick(&["HUNTWELL_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"])?;
-    let secret_key = pick(&["HUNTWELL_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"])?;
+    // KEY and SECRET first: the names the sealed global uses, as in Park River.
+    let access_key = pick(&["KEY", "HUNTWELL_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"])?;
+    let secret_key = pick(&["SECRET", "HUNTWELL_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"])?;
     Some(Credentials {
         access_key,
         secret_key,
         session_token: pick(&["HUNTWELL_AWS_SESSION_TOKEN", "AWS_SESSION_TOKEN"]),
-        region: pick(&["HUNTWELL_AWS_REGION", "AWS_REGION"]).unwrap_or_else(|| "us-east-1".into()),
+        region: pick(&["AWS_SECRETS_REGION", "HUNTWELL_AWS_REGION", "AWS_REGION"]).unwrap_or_else(|| "us-east-1".into()),
     })
 }
 
@@ -408,8 +409,9 @@ pub async fn ses_send(to: &str, from: &str, subject: &str, html: &str, text: &st
 /// them, and a secret that almost works is worse than one that does not.
 const PG_PREFIXES: [&str; 3] = ["HUNTWELL_PG", "PG", "DB"];
 
-/// The pool URL — the database *as the worker pods reach it* — falls back to
-/// the main connection, because on one server they are the same machine.
+/// The pool URL — the database *as the VMs reach it* — falls back to the main
+/// connection, because when the admin shares a network with the VMs they are
+/// the same address.
 const POOL_PREFIXES: [&str; 4] = ["POOL_PG", "HUNTWELL_PG", "PG", "DB"];
 
 /// Compose `HUNTWELL_DATABASE_URL` from separate fields when it is not given
@@ -429,7 +431,7 @@ pub fn assemble_urls(map: &mut Vec<(String, String)>) {
         }
     }
     // Only when something actually names a pool host: inventing one would point
-    // every worker pod at a database that may not be reachable from a pod.
+    // every VM at a database that may not be reachable from a VM.
     if !has("HUNTWELL_POOL_DATABASE_URL") && field(&snapshot, &["POOL_PG"], "HOST", &[]).is_some() {
         if let Some(url) = compose(&snapshot, &POOL_PREFIXES, "huntwell") {
             map.push(("HUNTWELL_POOL_DATABASE_URL".into(), url));
@@ -464,8 +466,7 @@ fn compose(
     default_db: &str,
 ) -> Option<String> {
     // A host is the one part with no sensible default: without it there is
-    // nothing to connect to and guessing localhost would point production at
-    // its own pod.
+    // nothing to connect to, and guessing localhost would point a VM at itself.
     let host = field(map, prefixes, "HOST", &[])?;
     let port = field(map, prefixes, "PORT", &[]).unwrap_or_else(|| "5432".into());
     let user = field(map, prefixes, "USERNAME", &["USER"]).unwrap_or_else(|| "postgres".into());
@@ -590,16 +591,16 @@ mod tests {
 
     #[test]
     fn no_host_means_no_url_rather_than_a_wrong_one() {
-        // Guessing localhost would point production at its own pod.
+        // Guessing localhost would point a VM at itself.
         let m = settings(r#"{"HUNTWELL_PG_PASSWORD":"p","HUNTWELL_PG_DATABASE":"hw"}"#);
         assert!(!m.contains_key("HUNTWELL_DATABASE_URL"), "{m:?}");
     }
 
     #[test]
     fn the_pool_url_is_only_built_when_asked_for() {
-        // It exists to say "the pods reach the database somewhere else". With
+        // It exists to say "the VMs reach the database somewhere else". With
         // no POOL_PG_HOST there is nothing to say, and inventing one would send
-        // every worker pod at an address that may not resolve from a pod.
+        // every VM at an address that may not resolve from a VM.
         let m = settings(r#"{"HUNTWELL_PG_HOST":"db","HUNTWELL_PG_PASSWORD":"p"}"#);
         assert!(!m.contains_key("HUNTWELL_POOL_DATABASE_URL"));
 
@@ -662,5 +663,14 @@ mod tests {
         assert!(with(&[("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "B")]).is_none());
         let c = with(&[("AWS_ACCESS_KEY_ID", "A"), ("AWS_SECRET_ACCESS_KEY", "B")]).unwrap();
         assert_eq!(c.region, "us-east-1", "a missing region should not be a failure");
+    }
+
+    #[test]
+    fn the_sealed_globals_key_and_secret_open_secrets_manager() {
+        let m: std::collections::HashMap<&str, &str> = [("KEY", "AKIAFROMGLOBAL"), ("SECRET", "shh")].into_iter().collect();
+        let c = credentials(|k| m.get(k).map(|v| v.to_string())).expect("KEY and SECRET are enough");
+        assert_eq!(c.access_key, "AKIAFROMGLOBAL");
+        assert_eq!(c.secret_key, "shh");
+        assert_eq!(c.region, "us-east-1");
     }
 }

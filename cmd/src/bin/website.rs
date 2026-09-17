@@ -38,6 +38,10 @@ async fn main() {
         _ => {}
     }
     huntwell::boot_bus("website").await;
+    if let Err(e) = huntwell::identity::enforce_production_provider() {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
     if let Err(e) = run().await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -101,7 +105,7 @@ async fn run() -> Result<()> {
         anyhow::bail!(
             "RUN_DISPATCH=local runs plans as child processes of the web server, which the \
              website service cannot do — it has no agent. Use RUN_DISPATCH=pool with the admin \
-             control plane and worker pods, or run the all-in-one `huntwell serve` for local dev."
+             control plane and worker slots, or run the all-in-one `huntwell serve` for local dev."
         );
     }
     let addr = config::get_or("HUNTWELL_ADDR", "0.0.0.0:8611");

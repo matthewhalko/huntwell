@@ -24,7 +24,9 @@ api_audit.sql
 account_browser.sql
 account_usage.sql
 host.sql
+vm.sql
 control_setting.sql
 admin_user.sql
 route_log.sql
 mail_outbox.sql
+setting.sql

@@ -9,7 +9,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-static FILE: OnceLock<(Option<PathBuf>, HashMap<String, String>)> = OnceLock::new();
+static FILE: OnceLock<(Option<PathBuf>, HashMap<String, String>, Option<String>)> = OnceLock::new();
+
+/// The nearest `name` above the working directory, then above the executable's
+/// directory — each start included. Park River's rule: how deep the executable
+/// sits under the shared files is the deployment's choice, so `/yaksoft/admin`
+/// beside `/yaksoft/global` and `/yaksoft/bin/admin` below it both work, and
+/// any fixed depth would get one of them wrong.
+///
+/// Symlinks are resolved first, so `/usr/local/bin/admin` pointing into
+/// `/yaksoft/bin` searches from the real install.
+pub fn find_upward(name: &str, want_dir: bool) -> Option<PathBuf> {
+    let starts = [
+        std::env::current_dir().ok(),
+        std::env::current_exe()
+            .ok()
+            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
+            .and_then(|exe| exe.parent().map(PathBuf::from)),
+    ];
+    starts.into_iter().flatten().find_map(|start| upward_from(start, name, want_dir))
+}
+
+fn upward_from(mut current: PathBuf, name: &str, want_dir: bool) -> Option<PathBuf> {
+    loop {
+        let candidate = current.join(name);
+        if (want_dir && candidate.is_dir()) || (!want_dir && candidate.is_file()) {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
 
 fn candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
@@ -26,18 +57,17 @@ fn candidates() -> Vec<PathBuf> {
     } else {
         format!("global-{instance}")
     };
-    // A debug build reads the repo's local-infra; a release binary reads
-    // beside itself and in the cwd.
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../local-infra");
-    v.push(repo.join(&name));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            v.push(dir.join(&name));
-            v.push(dir.join("local-infra").join(&name));
-        }
+    // Park River's rule. A debug build reads the repo's local-infra. A release
+    // build reads the nearest `global` above the working directory or the
+    // executable — /yaksoft/bin/admin reads /yaksoft/global — and nothing
+    // compiled in from the machine that built it.
+    if cfg!(debug_assertions) {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../local-infra");
+        v.push(repo.join(&name));
+        v.push(PathBuf::from("local-infra").join(&name));
+    } else if let Some(found) = find_upward(&name, false) {
+        v.push(found);
     }
-    v.push(PathBuf::from("local-infra").join(&name));
-    v.push(PathBuf::from(&name));
     v
 }
 
@@ -52,7 +82,11 @@ fn settable(key: &str) -> bool {
         // likes, and AWS_* includes things like AWS_CA_BUNDLE.
         || matches!(
             key,
-            "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN" | "AWS_REGION"
+            // KEY and SECRET are what Park River's sealed global holds, and what
+            // Huntwell's holds too; the AWS_* spellings are what every other AWS
+            // tool uses, so a box set up for the CLI needs nothing added.
+            "KEY" | "SECRET" | "AWS_SECRETS_REGION"
+                | "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN" | "AWS_REGION"
         )
         // Per-service credentials: AWS_SES_KEY, AWS_S3_SECRET and friends. Each
         // is an IAM user scoped to one service, which is the point — the
@@ -71,9 +105,13 @@ fn settable(key: &str) -> bool {
         // touches — this is so a dev box can point at a pool by editing one
         // file, and so a missing entry is not silently ignored.
         || key.starts_with("COGNITO_")
+        // A host's Cloudflare tunnel edge (cloudflare.rs).
+        || key.starts_with("CLOUDFLARE_")
+        // The bot check on sign-up and sign-in (turnstile.rs).
+        || key.starts_with("TURNSTILE_")
 }
 
-fn load() -> &'static (Option<PathBuf>, HashMap<String, String>) {
+fn load() -> &'static (Option<PathBuf>, HashMap<String, String>, Option<String>) {
     FILE.get_or_init(|| {
         for path in candidates() {
             if !path.is_file() {
@@ -83,12 +121,11 @@ fn load() -> &'static (Option<PathBuf>, HashMap<String, String>) {
             // learns the difference. A sealed file that will not open is loud
             // and then empty — silently reading as "nothing configured" would
             // send every credential down its "not set" path.
+            // The first file found is the file, as in Park River: one that will
+            // not open is reported, never skipped for another further down.
             let text = match crate::genesis::read_config(&path) {
                 Ok(text) => text,
-                Err(e) => {
-                    eprintln!("{e}");
-                    continue;
-                }
+                Err(e) => return (Some(path), HashMap::new(), Some(e)),
             };
             let mut map = HashMap::new();
             for line in text.lines() {
@@ -107,15 +144,21 @@ fn load() -> &'static (Option<PathBuf>, HashMap<String, String>) {
                 let Some(v) = crate::genesis::resolve(k, v) else { continue };
                 map.insert(k.to_string(), v);
             }
-            return (Some(path), map);
+            return (Some(path), map, None);
         }
-        (None, HashMap::new())
+        (None, HashMap::new(), None)
     })
 }
 
 /// Which file settings came from, for `doctor`.
 pub fn source_file() -> Option<&'static Path> {
     load().0.as_deref()
+}
+
+/// Why the settings file could not be read, when it was found but would not
+/// open — wrong genesis key, wrong encoding.
+pub fn source_error() -> Option<&'static str> {
+    load().2.as_deref()
 }
 
 /// Settings fetched from AWS Secrets Manager at startup.
@@ -125,26 +168,151 @@ pub fn source_file() -> Option<&'static Path> {
 /// and "it is coming from somewhere you forgot" look identical otherwise.
 static REMOTE: OnceLock<HashMap<String, String>> = OnceLock::new();
 
-/// The resolution order, highest first:
+/// Operator settings from the `setting` table, installed once the database is
+/// open. Empty until then — the bootstrap window, where only the environment,
+/// Secrets Manager and the sealed `global` exist. See `local-infra/db/public/setting.sql`.
+static DB: OnceLock<std::sync::RwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn db_layer() -> &'static std::sync::RwLock<HashMap<String, String>> {
+    DB.get_or_init(Default::default)
+}
+
+/// Values this process copied into its own environment (`export_to_env`), so a
+/// child inherits them. Remembered so they are not then mistaken for an
+/// operator's override: without this, every value exported from Secrets
+/// Manager would sit at the environment's rank, above the database, and an
+/// `admin config set` for any such name would silently do nothing.
+static EXPORTED: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn exported() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    EXPORTED.get_or_init(Default::default)
+}
+
+fn export(key: &str, value: &str) {
+    std::env::set_var(key, value);
+    if let Ok(mut m) = exported().lock() {
+        m.insert(key.to_string(), value.to_string());
+    }
+}
+
+/// The resolution order, highest first — the same as Park River's:
 ///
-/// 1. the process environment — always wins, so a one-off override works
-/// 2. AWS Secrets Manager — the deployed source of truth, rotatable without
-///    touching the host
-/// 3. the `global` file — the bootstrap credential, and everything on a dev box
+/// 1. the process environment — an emergency override, and how a VM's settings
+///    file reaches its services. Values this process exported itself do not
+///    count; they are copies of the layers below.
+/// 2. the `setting` table — where an operator sets things (`admin config set`),
+///    and the home of anything that is configuration rather than a credential
+/// 3. AWS Secrets Manager — credentials and connection strings
+/// 4. the sealed `global` file — the bootstrap credential, and a dev box
 ///
-/// Secrets Manager sits above the file because the file is what holds the
-/// credentials that opened it: if a value is in both, the remote one is the
-/// deliberate, rotatable copy.
+/// The database sits above Secrets Manager because it is what an operator can
+/// actually edit; the environment stays on top so a bad row can be overridden
+/// without a database round trip. Anything read before the database is open
+/// sees an empty database layer — which is why the connection string can never
+/// live there.
 pub fn get(key: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(key) {
-        if !v.is_empty() {
+    let live = std::env::var(key).ok();
+    let ours = exported().lock().ok().and_then(|m| m.get(key).cloned());
+    let db = db_layer().read().ok().and_then(|m| m.get(key).cloned());
+    let remote = REMOTE.get().and_then(|m| m.get(key).cloned());
+    let file = load().1.get(key).cloned();
+    pick(live, ours, db, remote, file)
+}
+
+/// The layering itself, apart from where each value lives, so the order is
+/// testable without touching the process environment.
+fn pick(
+    live: Option<String>,
+    exported_by_us: Option<String>,
+    db: Option<String>,
+    remote: Option<String>,
+    file: Option<String>,
+) -> Option<String> {
+    let nonempty = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    if let Some(v) = nonempty(live) {
+        // An operator's value, or one this process set at run time for itself —
+        // either way not a copy of a lower layer, so it wins.
+        if exported_by_us.as_deref() != Some(v.as_str()) {
             return Some(v);
         }
     }
-    if let Some(v) = REMOTE.get().and_then(|m| m.get(key)).filter(|v| !v.is_empty()) {
-        return Some(v.clone());
+    nonempty(db).or_else(|| nonempty(remote)).or_else(|| nonempty(file))
+}
+
+/// Replace the database layer. Called whenever a process opens the database.
+///
+/// Also exported into this process's environment — over values it exported
+/// itself, never over an operator's — so a child process (a run, the agent's
+/// MCP server) inherits the same view.
+pub fn install_db_settings(rows: Vec<(String, String)>) {
+    let map: HashMap<String, String> =
+        rows.into_iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k, v.trim().to_string())).collect();
+    for (k, v) in &map {
+        let live = std::env::var(k).ok();
+        let ours = exported().lock().ok().and_then(|m| m.get(k).cloned());
+        if live.is_none() || live == ours {
+            export(k, v);
+        }
     }
-    load().1.get(key).cloned().filter(|v| !v.is_empty())
+    if let Ok(mut w) = db_layer().write() {
+        *w = map;
+    }
+}
+
+/// The database layer's names and values, for `admin config list`. Values are
+/// safe to show: credentials are refused there (`is_credential_name`).
+pub fn db_settings() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> =
+        db_layer().read().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// `--addr ADDR` from `admin serve`'s arguments — Park River's shape. `None`
+/// when absent, so the setting or the default applies. Validated here, so a
+/// typo fails at the command line rather than as a bind error.
+pub fn parse_serve_addr(args: &[String]) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let mut i = 0;
+    let mut addr = None;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--addr" => {
+                i += 1;
+                let Some(v) = args.get(i) else { anyhow::bail!("--addr requires a value") };
+                addr = Some(v.parse().map_err(|_| anyhow::anyhow!("invalid --addr {v:?} — expected host:port, e.g. 10.121.17.195:8710"))?);
+            }
+            other if other.starts_with('-') => anyhow::bail!("unknown flag: {other}"),
+            other => anyhow::bail!("unexpected argument: {other}"),
+        }
+        i += 1;
+    }
+    Ok(addr)
+}
+
+/// Whether a name looks like a credential.
+///
+/// The `setting` table is readable by every process with the database — which
+/// includes every worker VM. A credential stored there would undo the whole
+/// point of giving each VM only its role's secrets, so such names are refused
+/// and sent to Secrets Manager instead.
+pub fn is_credential_name(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k == "KEY"
+        || k == "SECRET"
+        || k.contains("PASSWORD")
+        || k.contains("TOKEN")
+        || k.ends_with("_SECRET")
+        || k.ends_with("_KEY")
+        || k.ends_with("DATABASE_URL")
+        || k.starts_with("HUNTWELL_PG_")
+        || k.starts_with("POOL_PG_")
+}
+
+/// Every name in the Secrets Manager layer, for `admin config list`. Names only.
+pub fn remote_setting_names() -> Vec<String> {
+    let mut v: Vec<String> = REMOTE.get().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    v.sort();
+    v
 }
 
 /// Which secret this deployment reads.
@@ -158,7 +326,19 @@ pub fn secret_id() -> String {
     }
     match file_or_env("HUNTWELL_ENV").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
         "production" | "prod" => "Huntwell_Production".to_string(),
-        _ => "Huntwell_Local".to_string(),
+        "local" | "dev" | "development" => "Huntwell_Local".to_string(),
+        // Unset — the normal case, with nothing configured anywhere: the build
+        // decides, on the same axis Park River uses. `./build.sh` makes release
+        // executables and they are what a server runs; `./dev.sh` builds debug.
+        _ => default_secret_name(crate::genesis::embedded_variant() == "prod").to_string(),
+    }
+}
+
+fn default_secret_name(release: bool) -> &'static str {
+    if release {
+        "Huntwell_Production"
+    } else {
+        "Huntwell_Local"
     }
 }
 
@@ -213,29 +393,24 @@ pub fn get_or(key: &str, default: &str) -> String {
 /// (runs, the MCP server the agent starts) inherit them without each one
 /// re-reading the file. Environment values already set are left alone.
 pub fn export_to_env() {
-    // File first, then remote over the top: a child process should see the same
-    // precedence this process does. Anything already in the environment is left
-    // alone in both passes, so an explicit override still wins.
-    for (k, v) in &load().1 {
-        if std::env::var_os(k).is_none() {
-            std::env::set_var(k, v);
-        }
-    }
-    if let Some(remote) = REMOTE.get() {
-        for (k, v) in remote {
-            match std::env::var(k) {
-                // Set by us from the file a moment ago, not by the operator —
-                // the remote value is the one that should reach the child.
-                Ok(existing) if load().1.get(k).map(|f| f == &existing).unwrap_or(false) => {
-                    std::env::set_var(k, v)
-                }
-                Ok(_) => {}
-                Err(_) => std::env::set_var(k, v),
+    // Lowest layer first, each overwriting only what this process exported
+    // before — never an operator's value — so the environment a child inherits
+    // ends up holding the same winner `get` would return.
+    let layers: [Vec<(String, String)>; 3] = [
+        load().1.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        REMOTE.get().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
+        db_layer().read().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
+    ];
+    for layer in layers {
+        for (k, v) in layer {
+            let live = std::env::var(&k).ok();
+            let ours = exported().lock().ok().and_then(|m| m.get(&k).cloned());
+            if live.is_none() || live == ours {
+                export(&k, &v);
             }
         }
     }
 }
-
 pub fn database_url() -> anyhow::Result<String> {
     get("HUNTWELL_DATABASE_URL").ok_or_else(|| {
         anyhow::anyhow!(
@@ -244,35 +419,10 @@ pub fn database_url() -> anyhow::Result<String> {
     })
 }
 
-/// The database a split microservice connects to. In k8s each service sets
-/// `DATABASE_URL` to its own logical database (auth/plans/prospects/runs);
-/// the all-in-one `serve` and the local-infra path fall back to the shared
-/// `HUNTWELL_DATABASE_URL`.
+/// The database a service connects to. The same as `database_url`; a separate
+/// name only because every service calls it.
 pub fn service_database_url() -> anyhow::Result<String> {
-    if let Ok(u) = std::env::var("DATABASE_URL") {
-        if !u.trim().is_empty() {
-            return Ok(u);
-        }
-    }
     database_url()
-}
-
-/// When set, HTTP handlers trust the `X-Account-Id` header (injected by the
-/// gateway's forward-auth) instead of resolving the session cookie against a
-/// local `Session`/`Account` table — which a split service does not have. Off
-/// for `serve`/`dev.sh`, so the cookie path (and its tests) are unchanged.
-pub fn trust_header_auth() -> bool {
-    matches!(get("HUNTWELL_TRUST_HEADER_AUTH").as_deref(), Some("1") | Some("true") | Some("yes"))
-}
-
-/// Base URL of a sibling service, when one is configured.
-///
-/// Nothing sets these any more: the website serves the whole API in one
-/// process, so the dashboard aggregate reads the database directly. Kept
-/// because the call sites fall back to a local read when it returns `None`,
-/// which is exactly what a service that is split out again would need.
-pub fn sibling_url(name: &str) -> Option<String> {
-    get(&format!("{name}_SVC_URL")).map(|u| u.trim_end_matches('/').to_string())
 }
 
 /// Where per-account Chrome profiles and per-run agent workspaces live.
@@ -337,4 +487,84 @@ mod tests {
         assert!(!settable("PATH"));
         assert!(!settable("HUNTWELL_lowercase"));
     }
+
+    fn o(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn the_layers_resolve_like_park_river() {
+        // environment > setting table > Secrets Manager > global file
+        assert_eq!(pick(o("env"), None, o("db"), o("remote"), o("file")), o("env"));
+        assert_eq!(pick(None, None, o("db"), o("remote"), o("file")), o("db"));
+        assert_eq!(pick(None, None, None, o("remote"), o("file")), o("remote"));
+        assert_eq!(pick(None, None, None, None, o("file")), o("file"));
+        assert_eq!(pick(None, None, None, None, None), None);
+    }
+
+    #[test]
+    fn a_value_this_process_exported_does_not_outrank_the_database() {
+        // The trap: Secrets Manager values are copied into the environment for
+        // child processes. Counted as "the environment", they would sit above
+        // the setting table and `admin config set` would do nothing for them.
+        assert_eq!(pick(o("from-remote"), o("from-remote"), o("operator-set"), o("from-remote"), None), o("operator-set"));
+        // But a live value that differs from what we exported is an operator's
+        // (or set at run time, like --dev), and still wins.
+        assert_eq!(pick(o("override"), o("from-remote"), o("operator-set"), o("from-remote"), None), o("override"));
+    }
+
+    #[test]
+    fn blank_values_fall_through_rather_than_winning() {
+        assert_eq!(pick(o("  "), None, o(""), o("remote"), None), o("remote"));
+    }
+
+    #[test]
+    fn a_release_build_reads_production_and_a_debug_build_local() {
+        // No environment variable decides it — the build does, as in Park River.
+        assert_eq!(default_secret_name(true), "Huntwell_Production");
+        assert_eq!(default_secret_name(false), "Huntwell_Local");
+    }
+
+    #[test]
+    fn credentials_are_recognised_so_the_setting_table_refuses_them() {
+        for cred in ["KEY", "SECRET", "AWS_COGNITO_SECRET", "AWS_SES_KEY", "CURSOR_API_KEY", "BROWSERBASE_API_KEY",
+                     "HUNTWELL_SESSION_SECRET", "HUNTWELL_DATABASE_URL", "HUNTWELL_POOL_DATABASE_URL",
+                     "HUNTWELL_PG_PASSWORD", "HUNTWELL_PG_HOST", "POOL_PG_HOST", "STRIPE_WEBHOOK_SECRET", "SOME_TOKEN"] {
+            assert!(is_credential_name(cred), "{cred} should be refused");
+        }
+        for ok in ["HUNTWELL_ADMIN_ADDR", "HUNTWELL_PUBLIC_URL", "HUNTWELL_BUILD_DIR", "HUNTWELL_OPEN_SIGNUP",
+                   "HUNTWELL_MAIL_FROM", "COGNITO_REGION"] {
+            assert!(!is_credential_name(ok), "{ok} is configuration, not a credential");
+        }
+    }
+
+    #[test]
+    fn the_global_file_may_hold_park_rivers_bootstrap_names() {
+        assert!(settable("KEY"));
+        assert!(settable("SECRET"));
+    }
+
+    #[test]
+    fn serve_takes_its_address_as_a_parameter() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_serve_addr(&a(&["--addr", "10.121.17.195:8710"])).unwrap().unwrap().to_string(), "10.121.17.195:8710");
+        assert!(parse_serve_addr(&a(&[])).unwrap().is_none());
+        assert!(parse_serve_addr(&a(&["--addr"])).is_err());
+        assert!(parse_serve_addr(&a(&["--addr", "not-an-address"])).is_err());
+        assert!(parse_serve_addr(&a(&["--port", "1"])).is_err());
+    }
+    #[test]
+    fn shared_files_are_found_above_the_executable() {
+        let root = std::env::temp_dir().join(format!("hw-upward-{}", std::process::id()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(bin.join("build")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("global"), "KEY=x\n").unwrap();
+        assert_eq!(upward_from(bin.clone(), "global", false), Some(root.join("global")));
+        // The nearest wins.
+        assert_eq!(upward_from(bin.clone(), "build", true), Some(bin.join("build")));
+        assert_eq!(upward_from(bin.clone(), "missing", false), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
 }

@@ -23,9 +23,6 @@ use crate::prospect::Prospect;
 pub type Db = PgPool;
 
 const SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/schema.sql"));
-/// Per-database subsets, applied by the k3d migrate Jobs (see `migrate_schema`).
-const SCHEMA_AUTH: &str = include_str!(concat!(env!("OUT_DIR"), "/schema.auth.sql"));
-const SCHEMA_CORE: &str = include_str!(concat!(env!("OUT_DIR"), "/schema.core.sql"));
 
 pub const PLAN_TYPE_BUSINESS: &str = "business";
 pub const PLAN_TYPE_INDIVIDUAL: &str = "individual";
@@ -110,11 +107,63 @@ async fn create_database(url: &str) -> Result<String> {
 }
 
 pub async fn connect(url: &str, max: u32) -> Result<Db> {
-    PgPoolOptions::new()
+    // Said before trying, and bounded: a firewall that drops packets makes a
+    // connect hang for minutes with nothing on the screen, and the last line
+    // logged is then about something else entirely.
+    tracing::info!("database: connecting to {}", redact(url));
+    let db = PgPoolOptions::new()
         .max_connections(max)
+        .acquire_timeout(std::time::Duration::from_secs(15))
         .connect(url)
         .await
-        .with_context(|| format!("connect to {}", redact(url)))
+        .with_context(|| {
+            format!(
+                "connect to {} — is Postgres listening there, is this address in its pg_hba, and does its firewall let this host in?",
+                redact(url)
+            )
+        })?;
+    // Every process that opens the database gets its operator settings — the
+    // layer that sits above Secrets Manager. Best effort: on a brand-new
+    // database the table does not exist until the schema is applied, and
+    // `migrate` loads it again then.
+    if let Ok(rows) = load_config_settings(&db).await {
+        crate::config::install_db_settings(rows);
+    }
+    Ok(db)
+}
+
+/// Every operator setting, from the `setting` table.
+pub async fn load_config_settings(db: &Db) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(r#"SELECT key, value FROM setting ORDER BY key"#).fetch_all(db).await?)
+}
+
+/// Set, or with an empty value clear, one operator setting. Refuses a
+/// credential-shaped name: this table is readable by every worker VM.
+pub async fn set_config_setting(db: &Db, key: &str, value: &str) -> Result<()> {
+    let key = key.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        anyhow::bail!("a setting name is UPPER_SNAKE_CASE, e.g. HUNTWELL_ADMIN_ADDR");
+    }
+    if crate::config::is_credential_name(key) {
+        anyhow::bail!(
+            "{key} looks like a credential. Put it in the Secrets Manager secret instead — every \
+             worker VM can read the setting table, and a credential there reaches all of them"
+        );
+    }
+    if value.trim().is_empty() {
+        sqlx::query(r#"DELETE FROM setting WHERE key=$1"#).bind(key).execute(db).await?;
+    } else {
+        sqlx::query(
+            r#"INSERT INTO setting (key, value) VALUES ($1, $2)
+               ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = now()"#,
+        )
+        .bind(key)
+        .bind(value.trim())
+        .execute(db)
+        .await?;
+    }
+    crate::config::install_db_settings(load_config_settings(db).await?);
+    Ok(())
 }
 
 /// Same pool, but every connection is opened read-only at the session level,
@@ -146,19 +195,12 @@ fn redact(url: &str) -> String {
 /// every start; it is serialised with an advisory lock so two processes
 /// starting together do not race on the same `CREATE`.
 pub async fn migrate(db: &Db) -> Result<()> {
-    migrate_sql(db, SCHEMA).await
-}
-
-/// Which slice of the schema to apply. `all` is the whole thing (one shared
-/// database, as `serve`/local-infra use); `auth` and `core` are the per-database
-/// subsets the hosted (k3d) migrate Jobs apply.
-pub fn schema_for(which: &str) -> Result<&'static str> {
-    match which {
-        "all" => Ok(SCHEMA),
-        "auth" => Ok(SCHEMA_AUTH),
-        "core" => Ok(SCHEMA_CORE),
-        other => anyhow::bail!("unknown schema {other:?} (expected all, auth or core)"),
+    migrate_sql(db, SCHEMA).await?;
+    // The first start on a new database: the setting table exists only now.
+    if let Ok(rows) = load_config_settings(db).await {
+        crate::config::install_db_settings(rows);
     }
+    Ok(())
 }
 
 async fn migrate_sql(db: &Db, schema: &str) -> Result<()> {
@@ -170,10 +212,6 @@ async fn migrate_sql(db: &Db, schema: &str) -> Result<()> {
     Ok(())
 }
 
-/// Applies one named schema slice to `db`. Used by `huntwell migrate`.
-pub async fn migrate_schema(db: &Db, which: &str) -> Result<()> {
-    migrate_sql(db, schema_for(which)?).await
-}
 
 pub fn normalize_plan_type(s: &str) -> String {
     if s.trim().eq_ignore_ascii_case(PLAN_TYPE_INDIVIDUAL) {
@@ -221,6 +259,9 @@ pub struct Account {
     /// The workspace this person is working in, when it is not their own.
     /// Resolved and membership-checked at authentication time.
     pub active_workspace_id: Option<i64>,
+    /// When the address was proven theirs. `None` gates everything but
+    /// sign-out and resend (see `web::auth::AuthUser`).
+    pub email_verified_at: Option<DateTime<Utc>>,
     /// What this account's workspace is called. Empty until somebody names it.
     pub workspace_name: String,
     /// Plan kinds this account may create, comma-separated. Empty defers to the
@@ -252,7 +293,7 @@ impl Account {
 }
 
 const ACCOUNT_COLS: &str =
-    r#"account_id,email,display_name,password_hash,cognito_sub,timezone,timezone_auto,theme,created_at,onboarded_at,active_workspace_id,workspace_name,enabled_kinds,platform_ack_at,platform_ack_by,platform_ack_text,connected_logins"#;
+    r#"account_id,email,display_name,password_hash,cognito_sub,timezone,timezone_auto,theme,created_at,onboarded_at,active_workspace_id,email_verified_at,workspace_name,enabled_kinds,platform_ack_at,platform_ack_by,platform_ack_text,connected_logins"#;
 
 pub async fn create_account(db: &Db, email: &str, display_name: &str, id: &crate::identity::NewIdentity) -> Result<Account> {
     let email = email.trim().to_lowercase();
@@ -289,6 +330,116 @@ pub async fn set_cognito_sub(db: &Db, account_id: i64, sub: &str) -> Result<()> 
 
 pub async fn account_count(db: &Db) -> Result<i64> {
     Ok(sqlx::query_scalar(r#"SELECT count(*) FROM account"#).fetch_one(db).await?)
+}
+
+/// A sign-up for an address held by an account that never verified it. The
+/// row is taken over — new credential, new name, nothing of the squatter's
+/// kept, every session ended — rather than left blocking the address forever.
+pub async fn reclaim_unverified_account(
+    db: &Db,
+    account_id: i64,
+    display_name: &str,
+    id: &crate::identity::NewIdentity,
+) -> Result<Account> {
+    let row = sqlx::query(&format!(
+        r#"UPDATE account SET display_name=$2, password_hash=$3, cognito_sub=$4, created_at=now(),
+                  verify_token_hash='', verify_sent_at=NULL, verify_attempts=0, onboarded_at=NULL, active_workspace_id=NULL
+           WHERE account_id=$1 AND email_verified_at IS NULL
+           RETURNING {ACCOUNT_COLS}"#
+    ))
+    .bind(account_id)
+    .bind(display_name.trim())
+    .bind(&id.password_hash)
+    .bind(&id.cognito_sub)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("an account with that email already exists"))?;
+    sqlx::query(r#"DELETE FROM session WHERE account_id=$1"#).bind(account_id).execute(db).await?;
+    Ok(Account::from_row(&row)?)
+}
+
+/// Record the confirmation code just sent: its hash, and when. A new code
+/// starts the guess count over — it is a new code.
+pub async fn set_verify_token(db: &Db, account_id: i64, token_hash: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE account SET verify_token_hash=$2, verify_sent_at=now(), verify_attempts=0 WHERE account_id=$1"#)
+        .bind(account_id)
+        .bind(token_hash)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Equal, in time that does not depend on where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// How many wrong guesses one code survives. Five, with a resend minting a
+/// fresh code, keeps a six-digit code out of reach of guessing.
+pub const VERIFY_MAX_ATTEMPTS: i32 = 5;
+/// How long a code stays good.
+pub const VERIFY_CODE_MINUTES: i64 = 15;
+
+/// What typing a confirmation code came to.
+pub enum CodeCheck {
+    Verified(Account),
+    /// Not the code; how many guesses this code has left.
+    Wrong { left: i32 },
+    /// Expired, spent, or never sent — a new one has to be asked for.
+    NeedNew,
+}
+
+/// Check a confirmation code for the signed-in account. Constant-time on the
+/// hash; a wrong guess is counted, and a code that is old or out of guesses is
+/// refused whatever was typed.
+pub async fn verify_email_code(db: &Db, account_id: i64, code_hash: &str) -> Result<CodeCheck> {
+    let row: Option<(String, Option<DateTime<Utc>>, i32)> = sqlx::query_as(
+        r#"SELECT verify_token_hash, verify_sent_at, verify_attempts FROM account
+           WHERE account_id=$1 AND email_verified_at IS NULL"#,
+    )
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((hash, sent_at, attempts)) = row else {
+        // Already verified: whatever they typed, they are through.
+        return get_account(db, account_id).await?.map(CodeCheck::Verified).ok_or_else(|| anyhow!("account not found"));
+    };
+    let fresh = sent_at.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(VERIFY_CODE_MINUTES));
+    if hash.trim().is_empty() || !fresh || attempts >= VERIFY_MAX_ATTEMPTS {
+        return Ok(CodeCheck::NeedNew);
+    }
+    if constant_time_eq(hash.trim().as_bytes(), code_hash.as_bytes()) {
+        let row = sqlx::query(&format!(
+            r#"UPDATE account SET email_verified_at=now(), verify_token_hash='', verify_attempts=0
+               WHERE account_id=$1 RETURNING {ACCOUNT_COLS}"#
+        ))
+        .bind(account_id)
+        .fetch_one(db)
+        .await?;
+        return Ok(CodeCheck::Verified(Account::from_row(&row)?));
+    }
+    let attempts: i32 = sqlx::query_scalar(
+        r#"UPDATE account SET verify_attempts=verify_attempts+1 WHERE account_id=$1 RETURNING verify_attempts"#,
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await?;
+    let left = VERIFY_MAX_ATTEMPTS - attempts;
+    if left <= 0 {
+        // Spent: the hash is cleared so nothing can be gained by trying on.
+        sqlx::query(r#"UPDATE account SET verify_token_hash='' WHERE account_id=$1"#).bind(account_id).execute(db).await?;
+        return Ok(CodeCheck::NeedNew);
+    }
+    Ok(CodeCheck::Wrong { left })
+}
+
+/// Verified without a link — a server that cannot send email (a dev box).
+pub async fn mark_email_verified(db: &Db, account_id: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE account SET email_verified_at=COALESCE(email_verified_at, now()) WHERE account_id=$1"#)
+        .bind(account_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn find_account_by_email(db: &Db, email: &str) -> Result<Option<Account>> {
@@ -766,7 +917,7 @@ pub async fn session_account(db: &Db, token_hash: &str) -> Result<Option<Account
         r#"UPDATE session s SET last_seen_at = now()
            FROM account a
            WHERE s.token_hash = $1 AND s.expires_at > now() AND a.account_id = s.account_id
-           RETURNING a.account_id, a.email, a.display_name, a.password_hash, a.cognito_sub, a.timezone, a.timezone_auto, a.theme, a.created_at, a.onboarded_at, a.active_workspace_id, a.workspace_name, a.enabled_kinds, a.platform_ack_at, a.platform_ack_by, a.platform_ack_text, a.connected_logins"#
+           RETURNING a.account_id, a.email, a.display_name, a.password_hash, a.cognito_sub, a.timezone, a.timezone_auto, a.theme, a.created_at, a.onboarded_at, a.active_workspace_id, a.email_verified_at, a.workspace_name, a.enabled_kinds, a.platform_ack_at, a.platform_ack_by, a.platform_ack_text, a.connected_logins"#
     ))
     .bind(token_hash)
     .fetch_optional(db)
@@ -777,6 +928,16 @@ pub async fn session_account(db: &Db, token_hash: &str) -> Result<Option<Account
 pub async fn delete_session(db: &Db, token_hash: &str) -> Result<()> {
     sqlx::query(r#"DELETE FROM session WHERE token_hash = $1"#).bind(token_hash).execute(db).await?;
     Ok(())
+}
+
+/// End every session of an account but the one making the request.
+pub async fn delete_other_sessions(db: &Db, account_id: i64, keep_token_hash: &str) -> Result<u64> {
+    Ok(sqlx::query(r#"DELETE FROM session WHERE account_id = $1 AND token_hash <> $2"#)
+        .bind(account_id)
+        .bind(keep_token_hash)
+        .execute(db)
+        .await?
+        .rows_affected())
 }
 
 pub async fn delete_expired_sessions(db: &Db) -> Result<u64> {
@@ -3486,78 +3647,112 @@ pub async fn list_browser_connections(db: &Db, account_id: i64) -> Result<Vec<Va
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Host {
     pub host_id: i64,
+    /// Also the Incus remote this control plane's certificate is registered
+    /// under, so it is a slug: lowercase, digits and hyphens.
     pub name: String,
-    /// Never serialized to the browser.
-    #[serde(skip_serializing)]
-    pub kubeconfig_yaml: String,
-    pub kube_context: Option<String>,
     pub enabled: bool,
+    /// Worker children on the process-backed local host only (./dev.sh). An
+    /// Incus host's capacity is its worker VMs' slots.
     pub pool_size: i32,
-    pub cpu_request: String,
-    pub cpu_limit: String,
-    pub mem_request: String,
-    pub mem_limit: String,
-    pub image: String,
-    /// Deploy the application services to this cluster as well as the pool.
-    pub runs_services: bool,
-    /// Website replicas, when this host runs the services.
-    pub web_replicas: i32,
     pub notes: String,
     pub last_error: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Incus API, e.g. `https://10.0.0.1:8443`. Empty on the local host.
+    pub endpoint: String,
+    /// Active | Draining | Offline.
+    pub status: String,
+    pub base_image: String,
+    pub priority: i32,
+    pub max_vms: i32,
+    pub vm_cpu: i32,
+    pub vm_memory: String,
+    pub vm_disk: String,
+    pub vm_slots: i32,
+    pub ingress_domain: String,
+    /// https | http | cloudflare.
+    pub edge_scheme: String,
+    pub edge_port: i32,
+    /// x86_64 | aarch64, from the last health check. Decides which build a VM
+    /// here is given.
+    pub arch: String,
+    pub incus_version: String,
+    pub cpu_total: i32,
+    pub memory_total_mb: i64,
 }
 
-const HOST_COLS: &str = r#"host_id,name,kubeconfig_yaml,kube_context,enabled,pool_size,
-cpu_request,cpu_limit,mem_request,mem_limit,image,runs_services,web_replicas,notes,
-last_error,last_seen_at,created_at"#;
+impl Host {
+    /// The Incus remote. Its own method so the day the name and the remote
+    /// diverge there is one place to change.
+    pub fn remote(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether browsers reach this host through a Cloudflare Tunnel.
+    pub fn is_cloudflare(&self) -> bool {
+        self.edge_scheme == "cloudflare"
+    }
+}
+
+const HOST_COLS: &str = r#"host_id,name,enabled,pool_size,notes,last_error,last_seen_at,created_at,
+endpoint,status,base_image,priority,max_vms,vm_cpu,vm_memory,vm_disk,vm_slots,
+ingress_domain,edge_scheme,edge_port,arch,incus_version,cpu_total,memory_total_mb"#;
 
 pub async fn create_host(db: &Db, h: &Host) -> Result<i64> {
     Ok(sqlx::query_scalar(
-        r#"INSERT INTO host (name,kubeconfig_yaml,kube_context,enabled,pool_size,
-           cpu_request,cpu_limit,mem_request,mem_limit,image,runs_services,web_replicas,notes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING host_id"#,
+        r#"INSERT INTO host (name,enabled,pool_size,notes,endpoint,status,base_image,priority,max_vms,
+             vm_cpu,vm_memory,vm_disk,vm_slots,ingress_domain,edge_scheme,edge_port)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING host_id"#,
     )
     .bind(&h.name)
-    .bind(&h.kubeconfig_yaml)
-    .bind(&h.kube_context)
     .bind(h.enabled)
     .bind(h.pool_size)
-    .bind(&h.cpu_request)
-    .bind(&h.cpu_limit)
-    .bind(&h.mem_request)
-    .bind(&h.mem_limit)
-    .bind(&h.image)
-    .bind(h.runs_services)
-    .bind(h.web_replicas)
     .bind(&h.notes)
+    .bind(&h.endpoint)
+    .bind(&h.status)
+    .bind(&h.base_image)
+    .bind(h.priority)
+    .bind(h.max_vms)
+    .bind(h.vm_cpu)
+    .bind(&h.vm_memory)
+    .bind(&h.vm_disk)
+    .bind(h.vm_slots)
+    .bind(&h.ingress_domain)
+    .bind(&h.edge_scheme)
+    .bind(h.edge_port)
     .fetch_one(db)
-    .await?)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => anyhow!("a host named '{}' already exists", h.name),
+        e => anyhow!(e),
+    })?)
 }
 
+/// Everything an operator edits. The name is not among them: it is the Incus
+/// remote, and renaming it would detach the certificate from the row.
 pub async fn update_host(db: &Db, h: &Host) -> Result<()> {
-    // Empty kubeconfig on update = keep the stored one (the UI never round-trips it).
     sqlx::query(
-        r#"UPDATE host SET name=$2, kubeconfig_yaml=CASE WHEN $3='' THEN kubeconfig_yaml ELSE $3 END,
-           kube_context=$4, enabled=$5, pool_size=$6, cpu_request=$7, cpu_limit=$8,
-           mem_request=$9, mem_limit=$10, image=$11, runs_services=$12, web_replicas=$13,
-           notes=$14, updated_at=now()
+        r#"UPDATE host SET enabled=$2, pool_size=$3, notes=$4, endpoint=$5, status=$6, base_image=$7,
+             priority=$8, max_vms=$9, vm_cpu=$10, vm_memory=$11, vm_disk=$12, vm_slots=$13,
+             ingress_domain=$14, edge_scheme=$15, edge_port=$16, updated_at=now()
            WHERE host_id=$1"#,
     )
     .bind(h.host_id)
-    .bind(&h.name)
-    .bind(&h.kubeconfig_yaml)
-    .bind(&h.kube_context)
     .bind(h.enabled)
     .bind(h.pool_size)
-    .bind(&h.cpu_request)
-    .bind(&h.cpu_limit)
-    .bind(&h.mem_request)
-    .bind(&h.mem_limit)
-    .bind(&h.image)
-    .bind(h.runs_services)
-    .bind(h.web_replicas)
     .bind(&h.notes)
+    .bind(&h.endpoint)
+    .bind(&h.status)
+    .bind(&h.base_image)
+    .bind(h.priority)
+    .bind(h.max_vms)
+    .bind(h.vm_cpu)
+    .bind(&h.vm_memory)
+    .bind(&h.vm_disk)
+    .bind(h.vm_slots)
+    .bind(&h.ingress_domain)
+    .bind(&h.edge_scheme)
+    .bind(h.edge_port)
     .execute(db)
     .await?;
     Ok(())
@@ -3578,9 +3773,16 @@ pub async fn get_host(db: &Db, host_id: i64) -> Result<Option<Host>> {
     row.map(|r| Host::from_row(&r).map_err(Into::into)).transpose()
 }
 
-/// Refuses while runs still reference the host and are not terminal, so run
-/// history keeps a meaningful host_id even though there is no FK.
+/// Refuses while the host carries VMs or runs still reference it. The VMs are
+/// real machines: a deleted row would orphan them with nothing tracking them.
 pub async fn delete_host(db: &Db, host_id: i64) -> Result<()> {
+    let vms: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM vm WHERE host_id=$1"#)
+        .bind(host_id)
+        .fetch_one(db)
+        .await?;
+    if vms > 0 {
+        anyhow::bail!("host still carries {vms} VM(s) — delete them first");
+    }
     let active: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM execution WHERE host_id=$1 AND status IN ('queued','running')"#)
             .bind(host_id)
@@ -3595,11 +3797,199 @@ pub async fn delete_host(db: &Db, host_id: i64) -> Result<()> {
 
 /// `err=None` marks the host healthy (clears LastError, bumps LastSeenAt).
 pub async fn set_host_health(db: &Db, host_id: i64, err: Option<&str>) -> Result<()> {
-    sqlx::query(r#"UPDATE host SET last_error=$2, last_seen_at=CASE WHEN $2 IS NULL THEN now() ELSE last_seen_at END WHERE host_id=$1"#)
+    sqlx::query(
+        r#"UPDATE host SET last_error=$2,
+             last_seen_at = CASE WHEN $2 IS NULL THEN now() ELSE last_seen_at END,
+             -- Offline and back is the machine's doing; Draining is an operator's
+             -- decision and survives any number of failed checks.
+             status = CASE WHEN $2 IS NULL AND status='Offline' THEN 'Active'
+                           WHEN $2 IS NOT NULL AND status='Active' THEN 'Offline'
+                           ELSE status END
+           WHERE host_id=$1"#,
+    )
+    .bind(host_id)
+    .bind(err)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// What the Incus API reported about a host at its last health check.
+pub async fn set_host_facts(db: &Db, host_id: i64, arch: &str, version: &str, cpus: i32, memory_mb: i64) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE host SET arch=$2, incus_version=$3, cpu_total=$4, memory_total_mb=$5 WHERE host_id=$1"#,
+    )
+    .bind(host_id)
+    .bind(arch)
+    .bind(version)
+    .bind(cpus)
+    .bind(memory_mb)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// VMs — see local-infra/db/public/vm.sql
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Vm {
+    pub vm_id: i64,
+    pub host_id: i64,
+    pub name: String,
+    /// app | worker.
+    pub role: String,
+    pub slots: i32,
+    pub cpu: i32,
+    pub memory: String,
+    pub disk: String,
+    /// Provisioning | Running | Stopped | Failed.
+    pub status: String,
+    pub version: String,
+    pub address: String,
+    pub last_error: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Vm {
+    pub fn is_worker(&self) -> bool {
+        self.role == "worker"
+    }
+
+    /// The slot names this worker offers, which are what runs are assigned to.
+    /// Numbered from 1, the systemd instance a slot runs as
+    /// (`huntwell-worker@1`).
+    pub fn slot_names(&self) -> Vec<String> {
+        if !self.is_worker() {
+            return Vec::new();
+        }
+        (1..=self.slots.max(0)).map(|n| slot_name(&self.name, n)).collect()
+    }
+}
+
+/// One worker slot's name: the VM and its systemd instance number. This string
+/// is what `execution.slot_name` holds and what `worker-pool` claims by.
+pub fn slot_name(vm: &str, n: i32) -> String {
+    format!("{vm}-{n}")
+}
+
+const VM_COLS: &str = r#"vm_id,host_id,name,role,slots,cpu,memory,disk,status,version,address,last_error,created_at"#;
+
+pub async fn create_vm(db: &Db, host_id: i64, name: &str, role: &str, slots: i32, cpu: i32, memory: &str, disk: &str) -> Result<Vm> {
+    let row = sqlx::query(&format!(
+        r#"INSERT INTO vm (host_id,name,role,slots,cpu,memory,disk) VALUES ($1,$2,$3,$4,$5,$6,$7)
+           RETURNING {VM_COLS}"#
+    ))
+    .bind(host_id)
+    .bind(name)
+    .bind(role)
+    .bind(slots)
+    .bind(cpu)
+    .bind(memory)
+    .bind(disk)
+    .fetch_one(db)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+            if role == "app" {
+                anyhow!("there is already an app VM — this installation runs one")
+            } else {
+                anyhow!("a VM named '{name}' already exists")
+            }
+        }
+        e => anyhow!(e),
+    })?;
+    Ok(Vm::from_row(&row)?)
+}
+
+pub async fn list_vms(db: &Db) -> Result<Vec<Vm>> {
+    let rows = sqlx::query(&format!(r#"SELECT {VM_COLS} FROM vm ORDER BY host_id, role, name"#))
+        .fetch_all(db)
+        .await?;
+    Ok(rows.iter().map(Vm::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+pub async fn list_host_vms(db: &Db, host_id: i64) -> Result<Vec<Vm>> {
+    let rows = sqlx::query(&format!(r#"SELECT {VM_COLS} FROM vm WHERE host_id=$1 ORDER BY role, name"#))
         .bind(host_id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.iter().map(Vm::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+pub async fn get_vm(db: &Db, vm_id: i64) -> Result<Option<Vm>> {
+    let row = sqlx::query(&format!(r#"SELECT {VM_COLS} FROM vm WHERE vm_id=$1"#))
+        .bind(vm_id)
+        .fetch_optional(db)
+        .await?;
+    row.map(|r| Vm::from_row(&r).map_err(Into::into)).transpose()
+}
+
+/// The next free worker name on a host: `hw-<host>-w1`, `-w2`, … The host is in
+/// the name so a slot name read in a run's log says which machine it ran on.
+pub async fn next_worker_name(db: &Db, host: &str) -> Result<String> {
+    let taken: Vec<String> = sqlx::query_scalar(r#"SELECT name FROM vm WHERE role='worker'"#)
+        .fetch_all(db)
+        .await?;
+    let mut n = 1;
+    loop {
+        let candidate = format!("hw-{host}-w{n}");
+        if !taken.contains(&candidate) {
+            return Ok(candidate);
+        }
+        n += 1;
+    }
+}
+
+pub async fn set_vm_status(db: &Db, vm_id: i64, status: &str, err: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE vm SET status=$2, last_error=$3, updated_at=now() WHERE vm_id=$1"#)
+        .bind(vm_id)
+        .bind(status)
         .bind(err)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+pub async fn set_vm_running(db: &Db, vm_id: i64, version: &str, address: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE vm SET status='Running', version=$2, address=$3, last_error='', updated_at=now() WHERE vm_id=$1"#,
+    )
+    .bind(vm_id)
+    .bind(version)
+    .bind(address)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_vm_slots(db: &Db, vm_id: i64, slots: i32) -> Result<()> {
+    sqlx::query(r#"UPDATE vm SET slots=$2, updated_at=now() WHERE vm_id=$1"#)
+        .bind(vm_id)
+        .bind(slots)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Refuses while a run is assigned to one of this VM's slots, so run history
+/// keeps meaning and nothing is torn down under a running plan.
+pub async fn delete_vm(db: &Db, vm: &Vm) -> Result<()> {
+    let slots = vm.slot_names();
+    if !slots.is_empty() {
+        let active: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM execution WHERE host_id=$1 AND slot_name = ANY($2) AND status IN ('queued','running')"#,
+        )
+        .bind(vm.host_id)
+        .bind(&slots)
+        .fetch_one(db)
+        .await?;
+        if active > 0 {
+            anyhow::bail!("{} has {active} active run(s) — cancel them first", vm.name);
+        }
+    }
+    sqlx::query(r#"DELETE FROM vm WHERE vm_id=$1"#).bind(vm.vm_id).execute(db).await?;
     Ok(())
 }
 
@@ -3827,34 +4217,34 @@ pub async fn get_admin_password_hash(db: &Db, email: &str) -> Result<Option<Stri
 
 // ---- pool dispatch: assignment, claiming, heartbeats -----------------------
 
-/// Admin placement: pins a queued, unplaced run to (host, pod). Guarded so a
+/// Admin placement: pins a queued, unplaced run to (host, slot). Guarded so a
 /// racing cancel (or double placement) loses cleanly.
-pub async fn assign_execution(db: &Db, execution_id: i64, host_id: i64, pod: &str) -> Result<bool> {
+pub async fn assign_execution(db: &Db, execution_id: i64, host_id: i64, slot: &str) -> Result<bool> {
     Ok(sqlx::query(
-        r#"UPDATE execution SET host_id=$2, pod_name=$3 WHERE execution_id=$1 AND status='queued' AND host_id IS NULL"#,
+        r#"UPDATE execution SET host_id=$2, slot_name=$3 WHERE execution_id=$1 AND status='queued' AND host_id IS NULL"#,
     )
     .bind(execution_id)
     .bind(host_id)
-    .bind(pod)
+    .bind(slot)
     .execute(db)
     .await?
     .rows_affected()
         > 0)
 }
 
-/// The pod supervisor's poll: claim the oldest run assigned to me. Atomic via
-/// FOR UPDATE SKIP LOCKED, so a replaced pod with the same name can't double-claim.
-pub async fn claim_next_execution(db: &Db, host_id: i64, pod: &str) -> Result<Option<i64>> {
+/// The slot supervisor's poll: claim the oldest run assigned to me. Atomic via
+/// FOR UPDATE SKIP LOCKED, so a replaced slot with the same name can't double-claim.
+pub async fn claim_next_execution(db: &Db, host_id: i64, slot: &str) -> Result<Option<i64>> {
     Ok(sqlx::query_scalar(
         r#"UPDATE execution SET claimed_at=now(), heartbeat_at=now()
            WHERE execution_id = (
                SELECT execution_id FROM execution
-               WHERE status='queued' AND host_id=$1 AND pod_name=$2 AND claimed_at IS NULL
+               WHERE status='queued' AND host_id=$1 AND slot_name=$2 AND claimed_at IS NULL
                ORDER BY execution_id LIMIT 1 FOR UPDATE SKIP LOCKED)
            RETURNING execution_id"#,
     )
     .bind(host_id)
-    .bind(pod)
+    .bind(slot)
     .fetch_optional(db)
     .await?)
 }
@@ -3878,7 +4268,7 @@ pub async fn request_execution_cancel(db: &Db, execution_id: i64) -> Result<()> 
     Ok(())
 }
 
-/// Queued runs the placement loop has not yet routed to a pod.
+/// Queued runs the placement loop has not yet routed to a slot.
 pub async fn unplaced_queued_executions(db: &Db, limit: i64) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
         r#"SELECT execution_id FROM execution WHERE status='queued' AND host_id IS NULL ORDER BY execution_id LIMIT $1"#,
@@ -3892,22 +4282,22 @@ pub async fn unplaced_queued_executions(db: &Db, limit: i64) -> Result<Vec<i64>>
 pub struct PoolExecution {
     pub execution_id: i64,
     pub host_id: i64,
-    pub pod_name: String,
+    pub slot_name: String,
     pub status: String,
 }
 
 /// Every non-terminal placed run — the busy/free map for placement and the UI.
 pub async fn pool_execution_snapshot(db: &Db) -> Result<Vec<PoolExecution>> {
     let rows = sqlx::query(
-        r#"SELECT execution_id,host_id,pod_name,status FROM execution
-           WHERE status IN ('queued','running') AND host_id IS NOT NULL AND pod_name IS NOT NULL"#,
+        r#"SELECT execution_id,host_id,slot_name,status FROM execution
+           WHERE status IN ('queued','running') AND host_id IS NOT NULL AND slot_name IS NOT NULL"#,
     )
     .fetch_all(db)
     .await?;
     Ok(rows.iter().map(PoolExecution::from_row).collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Claimed runs whose supervisor stopped heartbeating (pod SIGKILL, node
+/// Claimed runs whose supervisor stopped heartbeating (slot SIGKILL, node
 /// loss): fail them so the plan unblocks. Returns the affected run ids.
 pub async fn reap_stale_pool_executions(db: &Db, stale_secs: i64) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
@@ -3921,29 +4311,29 @@ pub async fn reap_stale_pool_executions(db: &Db, stale_secs: i64) -> Result<Vec<
     .await?)
 }
 
-/// Queued-but-unclaimed runs assigned to a pod that no longer exists on the
-/// host (scale-down, dead pod): clear the placement so they are re-routed.
+/// Queued-but-unclaimed runs assigned to a slot that no longer exists on the
+/// host (scale-down, dead slot): clear the placement so they are re-routed.
 /// Returns the affected run ids so the caller can write the routing log.
-pub async fn unassign_lost_executions(db: &Db, host_id: i64, live_pods: &[String]) -> Result<Vec<i64>> {
+pub async fn unassign_lost_executions(db: &Db, host_id: i64, live_slots: &[String]) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
-        r#"UPDATE execution SET host_id=NULL, pod_name=NULL
-           WHERE status='queued' AND claimed_at IS NULL AND host_id=$1 AND NOT (pod_name = ANY($2))
+        r#"UPDATE execution SET host_id=NULL, slot_name=NULL
+           WHERE status='queued' AND claimed_at IS NULL AND host_id=$1 AND NOT (slot_name = ANY($2))
            RETURNING execution_id"#,
     )
     .bind(host_id)
-    .bind(live_pods)
+    .bind(live_slots)
     .fetch_all(db)
     .await?)
 }
 
 /// One routing-audit row (see route_log.sql). Best-effort at every call site —
 /// a failed audit write must never fail a placement.
-pub async fn append_route_log(db: &Db, execution_id: i64, event: &str, host_id: Option<i64>, pod: Option<&str>, detail: &str) -> Result<()> {
-    sqlx::query(r#"INSERT INTO route_log (execution_id,event,host_id,pod_name,detail) VALUES ($1,$2,$3,$4,$5)"#)
+pub async fn append_route_log(db: &Db, execution_id: i64, event: &str, host_id: Option<i64>, slot: Option<&str>, detail: &str) -> Result<()> {
+    sqlx::query(r#"INSERT INTO route_log (execution_id,event,host_id,slot_name,detail) VALUES ($1,$2,$3,$4,$5)"#)
         .bind(execution_id)
         .bind(event)
         .bind(host_id)
-        .bind(pod)
+        .bind(slot)
         .bind(&detail.chars().take(200).collect::<String>())
         .execute(db)
         .await?;
@@ -3957,7 +4347,7 @@ pub struct RouteLogRow {
     pub event: String,
     pub host_id: Option<i64>,
     pub host_name: Option<String>,
-    pub pod_name: Option<String>,
+    pub slot_name: Option<String>,
     pub detail: String,
     pub source: Option<String>,
     pub account_id: Option<i64>,
@@ -3968,7 +4358,7 @@ pub struct RouteLogRow {
 /// display. Admin-only (unscoped).
 pub async fn list_route_log(db: &Db, limit: i64) -> Result<Vec<RouteLogRow>> {
     let rows = sqlx::query(
-        r#"SELECT l.route_log_id, l.execution_id, l.event, l.host_id, h.name AS host_name, l.pod_name,
+        r#"SELECT l.route_log_id, l.execution_id, l.event, l.host_id, h.name AS host_name, l.slot_name,
                   l.detail, p.source, r.account_id, l.created_at
            FROM route_log l
            LEFT JOIN execution r ON r.execution_id=l.execution_id
@@ -3992,20 +4382,20 @@ pub struct AdminExecutionRow {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub host_id: Option<i64>,
-    pub pod_name: Option<String>,
+    pub slot_name: Option<String>,
 }
 
 /// Unscoped, admin-only view of recent runs with their placement.
-pub async fn recent_executions_admin(db: &Db, host_id: Option<i64>, pod: Option<&str>, limit: i64) -> Result<Vec<AdminExecutionRow>> {
+pub async fn recent_executions_admin(db: &Db, host_id: Option<i64>, slot: Option<&str>, limit: i64) -> Result<Vec<AdminExecutionRow>> {
     let rows = sqlx::query(
         r#"SELECT r.execution_id, r.plan_id, r.account_id, p.source, r.status, r.started_at, r.finished_at,
-                  r.host_id, r.pod_name
+                  r.host_id, r.slot_name
            FROM execution r JOIN plan p ON p.plan_id=r.plan_id
-           WHERE ($1::bigint IS NULL OR r.host_id=$1) AND ($2::varchar IS NULL OR r.pod_name=$2)
+           WHERE ($1::bigint IS NULL OR r.host_id=$1) AND ($2::varchar IS NULL OR r.slot_name=$2)
            ORDER BY r.execution_id DESC LIMIT $3"#,
     )
     .bind(host_id)
-    .bind(pod)
+    .bind(slot)
     .bind(limit.clamp(1, 500))
     .fetch_all(db)
     .await?;

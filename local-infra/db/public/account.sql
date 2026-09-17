@@ -90,3 +90,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS account_cognito_sub_idx
 -- and dropping a NOT NULL column that shipped is not something a migration that
 -- has already run everywhere can do.
 ALTER TABLE public.account ALTER COLUMN password_hash SET DEFAULT '';
+
+-- Proof the address is theirs. NULL from sign-up until the link in the
+-- verification email is followed; until then nothing but sign-out and resend
+-- works, and an invitation cannot be accepted — a squatter registering
+-- someone's address proves nothing. Rows that predate this column are
+-- backfilled as verified: the DEFAULT applies once, on ADD, and is dropped.
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS email_verified_at timestamptz DEFAULT now();
+ALTER TABLE public.account ALTER COLUMN email_verified_at DROP DEFAULT;
+-- SHA-256 of the six-digit code that was emailed, when it was sent (good for
+-- 15 minutes), and how many wrong guesses it has taken (five ends it: a new
+-- code has to be asked for, which is what keeps a million-way guess out).
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS verify_token_hash char(64) NOT NULL DEFAULT '';
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS verify_sent_at timestamptz;
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS verify_attempts integer NOT NULL DEFAULT 0;

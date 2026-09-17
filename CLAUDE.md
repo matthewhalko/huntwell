@@ -45,7 +45,7 @@ do not re-derive the rules):
 - `artifacts` — custom-schema rows from `FieldsSchemaJson` → `Artifact`
 - `report` — one Markdown document about `Subject` → `Report`; read in-app,
   PDF via the browser's own print (`/api/reports/{id}/print`). No server-side
-  PDF renderer, deliberately: worker pods have no Chrome.
+  PDF renderer, deliberately: worker VMs have no Chrome.
 - `assets` — files found about `Subject` → `Asset` rows + bytes in the object
   store (`objstore.rs`: S3/MinIO, falling back to a data-dir directory that
   only works on one machine). Downloads go through `assets.rs`, which is where
@@ -53,5 +53,5 @@ do not re-derive the rules):
 
 `./dev.sh` also starts the admin control plane (`huntwell admin`) with a
 process-backed local worker pool (`HUNTWELL_LOCAL_POOL`, default 2) and runs
-the server with `RUN_DISPATCH=pool`, so run routing works locally with no k8s.
+the server with `RUN_DISPATCH=pool`, so run routing works locally with no VMs.
 `RUN_DISPATCH=local ./dev.sh` opts out. Operator creds live in `local-infra/global`.

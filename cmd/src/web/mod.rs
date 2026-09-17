@@ -80,6 +80,32 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+/// The address a request came from, seen through whatever is in front.
+///
+/// `HUNTWELL_TRUST_PROXY` says what that is. Unset: the peer, which behind an
+/// edge is the edge — every visitor looks the same, so rate limits and address
+/// allowlists apply to all of them at once. `1`: the *last* `X-Forwarded-For`
+/// entry, the one the edge appended, which a visitor cannot forge (the first
+/// entry is whatever the visitor sent). `cloudflare`: `CF-Connecting-IP`, which
+/// the tunnel sets and nothing else can reach the website to fake.
+pub fn client_ip(headers: &axum::http::HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
+    let mode = crate::config::get("HUNTWELL_TRUST_PROXY").unwrap_or_default();
+    client_ip_with(mode.trim(), headers, peer)
+}
+
+pub fn client_ip_with(mode: &str, headers: &axum::http::HeaderMap, peer: std::net::SocketAddr) -> std::net::IpAddr {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let forwarded_last = || header("x-forwarded-for").and_then(|ff| ff.rsplit(',').next().and_then(|s| s.trim().parse().ok()));
+    match mode {
+        "cloudflare" => header("cf-connecting-ip")
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(forwarded_last)
+            .unwrap_or(peer.ip()),
+        "1" | "true" | "last" => forwarded_last().unwrap_or(peer.ip()),
+        _ => peer.ip(),
+    }
+}
+
 pub fn bad_request(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
@@ -103,7 +129,7 @@ pub async fn serve_website(db: Db, addr: &str) -> Result<()> {
 async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
     // Runs left 'running' by a previous server are dead; say so before the
     // scheduler concludes those plans are busy. NOT in pool mode: pool runs
-    // execute on remote pods and survive this process — the admin's heartbeat
+    // execute on remote slots and survive this process — the admin's heartbeat
     // reaper owns their staleness.
     if dispatch::mode() != dispatch::Mode::Pool {
         let stale = crate::store::abandon_stale_executions(&db).await?;
@@ -161,9 +187,6 @@ async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
     Ok(())
 }
 
-/// One microservice in the k3d split. Each mounts only its slice of the API and
-
-
 async fn shutdown_signal(state: App) {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down — stopping active runs");
@@ -171,18 +194,28 @@ async fn shutdown_signal(state: App) {
 }
 
 async fn harden_headers(State(state): State<App>, req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path().to_string();
     let mut res = next.run(req).await;
     let h = res.headers_mut();
+    // Nothing the API answers belongs in a browser cache: on a shared machine
+    // the back button would otherwise show a signed-out user's data. A route
+    // that set its own policy (the CSV downloads use ETags) keeps it.
+    if (path.starts_with("/api/") || path.starts_with("/v1/") || path.starts_with("/dl/")) && !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    // The UI is self-contained apart from Google Fonts; the dev server proxies
-    // through, so the same policy holds there.
+    // The UI is self-contained apart from Google Fonts and the Turnstile
+    // widget, which is a script and an iframe from challenges.cloudflare.com;
+    // the dev server proxies through, so the same policy holds there.
     h.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+            "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; \
+             style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; \
+             frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     if state.dev {
@@ -219,4 +252,25 @@ fn asset_response(path: &str, data: Vec<u8>) -> Response {
         data,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_client_address_is_never_the_forgeable_end_of_the_chain() {
+        let peer: std::net::SocketAddr = "10.150.0.2:5555".parse().unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        // What a visitor sends, then what the edge appends.
+        h.insert("x-forwarded-for", "1.2.3.4, 203.0.113.9".parse().unwrap());
+        h.insert("cf-connecting-ip", "198.51.100.7".parse().unwrap());
+        assert_eq!(client_ip_with("", &h, peer).to_string(), "10.150.0.2");
+        assert_eq!(client_ip_with("1", &h, peer).to_string(), "203.0.113.9");
+        assert_eq!(client_ip_with("cloudflare", &h, peer).to_string(), "198.51.100.7");
+        h.remove("cf-connecting-ip");
+        assert_eq!(client_ip_with("cloudflare", &h, peer).to_string(), "203.0.113.9");
+        h.remove("x-forwarded-for");
+        assert_eq!(client_ip_with("1", &h, peer).to_string(), "10.150.0.2");
+    }
 }

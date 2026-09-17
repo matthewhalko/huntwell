@@ -3,8 +3,8 @@
 //! Four of the six are queue readers that nothing calls, and it would be easy to
 //! argue they need no server at all. They do:
 //!
-//! - Kubernetes decides whether to restart a pod and whether to send it traffic
-//!   by asking it. A pod with no probe is one Kubernetes cannot tell is wedged.
+//! - A deploy has to know when a service is up, and the only honest way to
+//!   know is to ask it. A service with no probe is one nobody can tell is wedged.
 //! - "Is the bus connected?" is the question you actually have when events stop
 //!   arriving, and it should be answerable without reading a log.
 //! - A service that already serves HTTP can be given a real endpoint later
@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 static NAME: OnceLock<String> = OnceLock::new();
 static STARTED: OnceLock<chrono::DateTime<chrono::Utc>> = OnceLock::new();
 
-/// Extra facts a service wants in `/statusz`, e.g. how many pods it manages.
+/// Extra facts a service wants in `/statusz`, e.g. how many drafts it holds.
 type Extra = fn() -> Value;
 static EXTRA: OnceLock<Extra> = OnceLock::new();
 
@@ -31,9 +31,8 @@ pub const SERVICES: &[&str] = &["website", "admin", "planning", "worker", "sched
 
 /// The default address for a service, `HUNTWELL_<NAME>_ADDR` if set.
 ///
-/// Each gets its own port so they can all run on one dev box; in a cluster they
-/// are separate pods and the port hardly matters, but a collision on a laptop
-/// looks like a service that will not start.
+/// Each gets its own port so they can all run on one dev box or one VM; a
+/// collision there looks like a service that will not start.
 pub fn addr_for(service: &str) -> String {
     let key = format!("HUNTWELL_{}_ADDR", service.to_uppercase());
     if let Some(a) = crate::config::get(&key).filter(|a| !a.trim().is_empty()) {
@@ -69,7 +68,11 @@ pub async fn spawn_with(service: &str, extra: Option<Extra>, routes: Router) -> 
         .route("/healthz", get(|| async { "ok" }))
         .route("/statusz", get(statusz));
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
-    tracing::info!("{service}: http on http://{addr}");
+    // The bound address, not the requested one: a worker slot asks for port 0
+    // so ten slots in one VM each get their own, and "127.0.0.1:0" in the log
+    // would tell an operator nothing.
+    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or(addr);
+    tracing::info!("{service}: http on http://{bound}");
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("ops server stopped: {e:#}");

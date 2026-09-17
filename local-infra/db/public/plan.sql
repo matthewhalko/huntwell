@@ -60,10 +60,9 @@ CREATE TABLE IF NOT EXISTS public.plan (
 	UNIQUE (account_id, source)
 );
 CREATE INDEX IF NOT EXISTS plan_schedule_idx ON public.plan (next_run_at) WHERE schedule_enabled;
--- account lives in the auth service's own database in the hosted (k3d) split,
--- so this cross-service FK cannot exist there; account ownership is enforced in
--- application code (every store fn filters by account_id). Dropped idempotently
--- for clusters created before the split.
+-- No foreign key to account: ownership is enforced in application code, where
+-- every store function filters by account_id. Dropped idempotently for a
+-- database created while the constraint still existed.
 ALTER TABLE public.plan DROP CONSTRAINT IF EXISTS plan_account_id_fkey;
 
 -- What a plan collects. 'prospects' (default) uses the fixed people/company

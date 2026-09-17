@@ -1,4 +1,0 @@
-# Tables owned by the auth service (its own `auth` database in the k3d split).
-# Applied by the auth migrate Job; a subset of db/public/*.sql.
-account.sql
-session.sql

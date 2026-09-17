@@ -1,14 +1,14 @@
-//! Routing: assigns queued runs to free pool pods, and reaps runs whose
+//! Routing: assigns queued runs to free pool slots, and reaps runs whose
 //! worker stopped heartbeating.
 //!
 //! Strategy lives in `ControlSetting`:
 //!   routing_strategy = random | round_robin | pinned
-//!   pinned_host_id / pinned_pod — the single target when pinned
-//!   rr_cursor — last "host:pod" used, so round-robin survives restarts
+//!   pinned_host_id / pinned_slot — the single target when pinned
+//!   rr_cursor — last "host:slot" used, so round-robin survives restarts
 //!
-//! A pod is a candidate when its host is enabled and healthy, kubectl saw it
-//! Ready on the last reconcile, and no non-terminal run is placed on it —
-//! one run per pod is the isolation contract.
+//! A slot is a candidate when its host is enabled and healthy, its unit was
+//! active on the last reconcile, and no non-terminal run is placed on it —
+//! one run per slot is the isolation contract.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -45,19 +45,19 @@ pub fn spawn(state: Admin) {
     });
 }
 
-/// Every free, Ready pod across enabled healthy hosts, host-major order.
-pub async fn free_pods(state: &Admin) -> anyhow::Result<Vec<(i64, String)>> {
+/// Every free, Ready slot across enabled healthy hosts, host-major order.
+pub async fn free_slots(state: &Admin) -> anyhow::Result<Vec<(i64, String)>> {
     let hosts_list = store::list_hosts(&state.db).await?;
     let busy: HashSet<(i64, String)> = store::pool_execution_snapshot(&state.db)
         .await?
         .into_iter()
-        .map(|r| (r.host_id, r.pod_name))
+        .map(|r| (r.host_id, r.slot_name))
         .collect();
-    let cache = state.pods.lock().await;
+    let cache = state.slots.lock().await;
     let mut free = Vec::new();
     for h in hosts_list.iter().filter(|h| h.enabled && h.last_error.is_none()) {
-        if let Some(pods) = cache.get(&h.host_id) {
-            for p in pods.iter().filter(|p| p.ready) {
+        if let Some(slots) = cache.get(&h.host_id) {
+            for p in slots.iter().filter(|p| p.ready) {
                 if !busy.contains(&(h.host_id, p.name.clone())) {
                     free.push((h.host_id, p.name.clone()));
                 }
@@ -74,7 +74,7 @@ async fn place(state: &Admin) -> anyhow::Result<()> {
         return Ok(());
     }
     let strategy = store::get_setting(&state.db, "routing_strategy").await?.unwrap_or_else(|| "round_robin".into());
-    let mut free = free_pods(state).await?;
+    let mut free = free_slots(state).await?;
 
     for execution_id in runs {
         if free.is_empty() {
@@ -84,10 +84,10 @@ async fn place(state: &Admin) -> anyhow::Result<()> {
             "pinned" => {
                 let host: Option<i64> =
                     store::get_setting(&state.db, "pinned_host_id").await?.and_then(|v| v.parse().ok());
-                let pod = store::get_setting(&state.db, "pinned_pod").await?.unwrap_or_default();
+                let slot = store::get_setting(&state.db, "pinned_slot").await?.unwrap_or_default();
                 match host {
                     // Only the one target counts; if it's busy the run waits.
-                    Some(h) if free.iter().any(|(fh, fp)| *fh == h && *fp == pod) => Some((h, pod)),
+                    Some(h) if free.iter().any(|(fh, fp)| *fh == h && *fp == slot) => Some((h, slot)),
                     _ => None,
                 }
             }
@@ -103,7 +103,7 @@ async fn place(state: &Admin) -> anyhow::Result<()> {
                     Some(free[n % free.len()].clone())
                 }
             }
-            // round_robin (default): the free pod after the stored cursor.
+            // round_robin (default): the free slot after the stored cursor.
             _ => {
                 let cursor = store::get_setting(&state.db, "rr_cursor").await?.unwrap_or_default();
                 let start = free
@@ -114,20 +114,20 @@ async fn place(state: &Admin) -> anyhow::Result<()> {
                 Some(free[start].clone())
             }
         };
-        let Some((host_id, pod)) = pick else {
+        let Some((host_id, slot)) = pick else {
             if strategy == "pinned" {
                 break; // pinned target busy/gone: everything waits for it
             }
             break;
         };
-        if store::assign_execution(&state.db, execution_id, host_id, &pod).await? {
-            let _ = store::append_execution_log(&state.db, execution_id, "stdout", &format!("routed to {pod} on host {host_id} ({strategy})"))
+        if store::assign_execution(&state.db, execution_id, host_id, &slot).await? {
+            let _ = store::append_execution_log(&state.db, execution_id, "stdout", &format!("routed to {slot} on host {host_id} ({strategy})"))
                 .await;
-            let _ = store::append_route_log(&state.db, execution_id, "routed", Some(host_id), Some(&pod), &strategy).await;
-            let _ = store::set_setting(&state.db, "rr_cursor", &format!("{host_id}:{pod}")).await;
-            tracing::info!(execution_id, host_id, pod, strategy, "run placed");
+            let _ = store::append_route_log(&state.db, execution_id, "routed", Some(host_id), Some(&slot), &strategy).await;
+            let _ = store::set_setting(&state.db, "rr_cursor", &format!("{host_id}:{slot}")).await;
+            tracing::info!(execution_id, host_id, slot, strategy, "run placed");
         }
-        free.retain(|(h, p)| !(*h == host_id && *p == pod));
+        free.retain(|(h, p)| !(*h == host_id && *p == slot));
     }
     Ok(())
 }
@@ -139,13 +139,13 @@ async fn reap(state: &Admin) -> anyhow::Result<()> {
             &state.db,
             execution_id,
             "stderr",
-            "worker heartbeat lost — the pod likely died; run marked failed",
+            "worker heartbeat lost — the slot likely died; run marked failed",
         )
         .await;
         let _ = store::append_route_log(&state.db, execution_id, "reaped", None, None, "heartbeat lost — marked failed").await;
         tracing::warn!(execution_id, "reaped stale pool run");
     }
-    // Queued runs on vanished pods are re-queued by hosts::reconcile_host
+    // Queued runs on vanished slots are re-queued by hosts::reconcile_host
     // (unassign_lost_executions), so the reaper only handles claimed-and-silent.
     Ok(())
 }

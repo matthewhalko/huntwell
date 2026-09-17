@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-do
 import { useAuth } from './auth'
 import Layout from './components/Layout'
 import Landing from './pages/Landing'
-import { Login, Signup } from './pages/Auth'
+import { CheckEmail, Login, Signup } from './pages/Auth'
 import Dashboard from './pages/Dashboard'
 import Plans from './pages/Plans'
 import PlanNew from './pages/PlanNew'
@@ -23,6 +23,8 @@ function RequireAuth({ children }: { children: React.ReactElement }) {
   const loc = useLocation()
   if (loading) return <div style={{ padding: '3rem', textAlign: 'center' }}>Loading…</div>
   if (!me) return <Navigate to="/login" state={{ from: loc.pathname }} replace />
+  // Signed in, but the address is not proven yet: nothing else will answer.
+  if (!me.email_verified) return <Navigate to="/verify" replace />
   return children
 }
 
@@ -46,6 +48,7 @@ export default function App() {
       <Route path="/" element={<Landing />} />
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
+      <Route path="/verify" element={<CheckEmail />} />
       {/* An invite link: readable signed out, acceptable only as the invitee. */}
       <Route path="/join/:token" element={<Join />} />
       <Route path="/terms" element={<Terms />} />

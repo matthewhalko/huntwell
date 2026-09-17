@@ -100,16 +100,7 @@ fn presented_token(headers: &HeaderMap, q: &HashMap<String, String>) -> Option<S
 }
 
 fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
-    // Only honoured when the operator says a proxy is in front; otherwise
-    // callers could forge it and each look like a different client.
-    if crate::config::get("HUNTWELL_TRUST_PROXY").as_deref() == Some("1") {
-        if let Some(ff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(ip) = ff.split(',').next().and_then(|s| s.trim().parse().ok()) {
-                return ip;
-            }
-        }
-    }
-    peer.ip()
+    super::client_ip(headers, peer)
 }
 
 fn unauthorized() -> Response {

@@ -38,12 +38,11 @@ INSTANCE=pra ./dev.sh
 
 ```
 local-infra/      the isolated infrastructure: start/stop, config, schema (db/public/*.sql), data-<instance>/
-cmd/              the Rust binary: serve | run | mcp-prospects | account | doctor | config
+cmd/              the Rust binaries: website, admin, planning, worker, scheduling, notification, huntwell
 UI/web/           React + Vite app (Mailchimp-flavoured theme, light + dark), embedded into the binary
-dev.sh            dev stack;  build.sh   release binary (Docker → bin/ubuntu, or host)
-                  build.sh --images  package it as the huntwell-* pod images
-deploy/           Dockerfile, systemd unit, Caddyfile example, images/ (pod image packaging)
-docs/             ARCHITECTURE.md, OPERATIONS.md, K3D.md, FLEET.md (admin + many hosts)
+dev.sh            dev stack;  build.sh   release binaries (zig cross-compile → bin/ubuntu, or host)
+deploy/           systemd units, Caddyfile example
+docs/             ARCHITECTURE.md, OPERATIONS.md, PRODUCTION.md (Incus VMs), SECRETS.md
 ```
 
 ## What a plan is

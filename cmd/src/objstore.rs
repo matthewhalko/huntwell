@@ -1,19 +1,20 @@
 //! Where collected files live.
 //!
 //! Asset bytes cannot live on the machine that downloaded them: a pool run
-//! executes on an ephemeral pod, and the process that later serves the file is
-//! a different one. So they go to an S3-compatible object store (MinIO
+//! executes in a worker VM, and the process that later serves the file runs in
+//! the app VM. So they go to an S3-compatible object store (MinIO
 //! locally, S3/R2/whatever in production) and the database keeps only the key.
 //!
 //! The client is hand-rolled over `reqwest` rather than an SDK, matching the
-//! rest of this codebase (the CDP probe in `browser.rs`, the Kubernetes REST
-//! calls in `web/dispatch.rs`): we need exactly three verbs against one
-//! bucket, and an SDK would be thirty crates to get them.
+//! rest of this codebase (the CDP probe in `browser.rs`, the SigV4 calls
+//! in `aws.rs`): we need exactly three verbs against one bucket, and an
+//! SDK would be thirty crates to get them.
 //!
 //! With no endpoint configured it falls back to a directory under the data
 //! dir. That keeps `./dev.sh` working on one machine before MinIO exists —
-//! but it is single-machine only, and a pool/k3d deployment must configure a
-//! real endpoint or its workers will write files nothing else can read.
+//! but it is single-machine only, and a deployment with worker VMs must
+//! configure a real endpoint or its workers will write files nothing else can
+//! read.
 
 use std::path::PathBuf;
 

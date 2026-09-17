@@ -4,9 +4,13 @@
 #   journalctl -u huntwell-admin -f
 #
 # Install to /etc/systemd/system/huntwell-admin.service with @APP_DIR@ and
-# @APP_USER@ substituted. Same binary as the web app, different subcommand:
-# this one registers k3d/k3s hosts, keeps a `hw-pool` StatefulSet warm on each,
-# and assigns queued executions to pods.
+# @APP_USER@ substituted. Runs the `admin` executable ./build.sh produces: it
+# registers bare-metal Incus hosts, provisions the application's VMs on them,
+# and assigns queued executions to worker slots. Its address is the
+# --addr parameter on ExecStart below.
+#
+# `global`, `genesis` and `build/` are looked for beside the executable, so
+# @APP_DIR@ holds all four.
 #
 # On the first start it reads `global` (beside the binary, or the file
 # HUNTWELL_GLOBAL names) and logs which file it used, then connects to
@@ -15,19 +19,20 @@
 #
 # It needs, beyond the web app's settings:
 #
-#   kubectl on PATH                  every host operation shells out to it
-#   HUNTWELL_ADMIN_EMAIL/_PASSWORD the operator seed (its own login, not an
-#                                    Account)
-#   HUNTWELL_POOL_DATABASE_URL     the core database URL AS THE PODS REACH
-#                                    IT. Pods claim work from the database, so
-#                                    a loopback URL here means every pod starts
-#                                    and then sits retrying the connection.
-#   HUNTWELL_REGISTRY_SERVER/_USERNAME/_PASSWORD
-#                                    if the pool image is in a private registry
+#   the incus client on PATH         every host operation shells out to it
+#   HUNTWELL_POOL_DATABASE_URL     the database URL AS THE VMs REACH IT.
+#                                    Worker slots claim runs from the database,
+#                                    so a loopback URL here means every slot
+#                                    starts and then sits retrying.
+#   HUNTWELL_BUILD_DIR             where Deploy takes executables from
+#                                    (default: build/ beside this binary)
+#   HUNTWELL_INCUS_CONF            the client certificate and trusted hosts
+#                                    (default: under the data directory). A
+#                                    credential: it can drive every host.
 #
 # Bind it to loopback and reach it over a tunnel, or put it behind a TLS proxy
 # with its own access control: an operator here can read every workspace's
-# execution routing and kill any pod in the fleet.
+# execution routing, kill any slot, and delete any VM.
 
 [Unit]
 Description=Huntwell admin control plane
@@ -39,7 +44,8 @@ Type=exec
 User=@APP_USER@
 WorkingDirectory=@APP_DIR@
 Environment=HUNTWELL_GLOBAL=@APP_DIR@/global
-ExecStart=@APP_DIR@/huntwell admin --addr 127.0.0.1:8710
+# Loopback by default. Set the address a tunnel or VPN reaches, never a public one.
+ExecStart=@APP_DIR@/admin serve --addr 127.0.0.1:8710
 Restart=always
 RestartSec=2
 
