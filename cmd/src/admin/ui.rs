@@ -61,7 +61,30 @@ pub const HTML: &str = r##"<!doctype html>
 
 *{box-sizing:border-box}
 body{margin:0;font-family:var(--font);font-size:14.5px;line-height:1.5;background:var(--chrome);
-  color:var(--text);min-height:100vh;display:flex;flex-direction:column;-webkit-font-smoothing:antialiased}
+  color:var(--text);-webkit-font-smoothing:antialiased}
+/* The app's shell: topbar across the top, a 68px rail down the left, the pane
+   beside it. Copied from UI/web/src/styles.css (.shell/.rail/.rail-item) so the
+   two consoles are one design; change them together. */
+.shell{display:grid;grid-template-columns:68px 1fr;grid-template-rows:auto 1fr;height:100vh;background:var(--chrome)}
+.shell.noauth{grid-template-columns:1fr}
+.shell.noauth .rail{display:none}
+.rail{grid-row:2;grid-column:1;display:flex;flex-direction:column;align-items:center;gap:.55rem;
+  padding:.4rem 0 1rem;min-height:0;overflow-y:auto;overflow-x:hidden;user-select:none}
+.rail-nav{display:flex;flex-direction:column;align-items:center;gap:.55rem;width:100%}
+.rail-item{display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:0;padding:0;cursor:pointer;
+  width:100%;color:rgba(255,255,255,.64);font:inherit;text-decoration:none;flex:none;box-shadow:none;border-radius:0}
+.rail-item:hover{text-decoration:none;color:rgba(255,255,255,.95);box-shadow:none;border:0}
+.rail-item:active{transform:none}
+.rail-item .tile{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;
+  transition:background .12s ease,transform .16s var(--ease-spring)}
+.rail-item .tile svg{display:block}
+.rail-item:hover .tile{background:rgba(255,255,255,.1);transform:translateY(-1px)}
+.rail-item.active{color:rgba(255,255,255,.95)}
+.rail-item.active .tile{background:rgba(255,255,255,.22)}
+.rail-item .rlbl{font-size:10px;font-weight:500;line-height:1.1;text-align:center}
+.rail-item.active .rlbl{font-weight:700}
+.rail .spacer{flex:1}
+.page.hide{display:none}
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 h1,h2,h3{font-weight:900;letter-spacing:-.02em;margin:0}
@@ -69,9 +92,10 @@ h1{font-size:1.65rem}
 h2{font-size:1.05rem;letter-spacing:-.01em}
 
 /* ---------- chrome ---------- */
-.topbar{background:var(--chrome);color:#fff;display:flex;align-items:center;justify-content:space-between;
-  gap:1rem;padding:.55rem 1.2rem;min-height:48px}
-.brand{display:flex;align-items:center;gap:.3rem;color:#fff;font-weight:900;font-size:1.32rem;letter-spacing:-.02em;user-select:none}
+.topbar{grid-row:1;grid-column:1/-1;background:var(--chrome);color:#fff;display:flex;align-items:center;justify-content:space-between;
+  gap:1rem;padding:.55rem 1.2rem .55rem 0;min-height:48px}
+/* the whole logo lockup over the rail column, as in the app */
+.brand{display:flex;align-items:center;gap:.3rem;padding-left:18px;color:#fff;font-weight:900;font-size:1.32rem;letter-spacing:-.02em;user-select:none}
 .brand .spark{font-size:1.2em;line-height:1;display:inline-block;transition:transform .25s var(--ease-spring)}
 .brand:hover .spark{transform:rotate(20deg) scale(1.1)}
 .grad-text{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -86,7 +110,8 @@ h2{font-size:1.05rem;letter-spacing:-.01em}
 .iconbtn:hover{background:rgba(255,255,255,.12)}
 
 /* the workspace pane floating inside the chrome, exactly as in the app */
-.pane{flex:1;background:var(--bg);border-radius:8px;margin:0 6px 6px 6px;overflow-y:auto;min-height:0}
+.pane{grid-row:2;grid-column:2;background:var(--bg);border-radius:8px;margin:0 6px 6px 6px;overflow-y:auto;min-height:0;min-width:0}
+.shell.noauth .pane{grid-column:1}
 :root[data-theme='dark'] .pane{border:1px solid var(--border)}
 .content{padding:1.6rem 2rem 3rem;max-width:1150px;margin:0 auto;display:flex;flex-direction:column;gap:1.1rem}
 @keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
@@ -200,6 +225,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 </style>
 </head>
 <body>
+<div class="shell noauth" id="shell">
 <div class="topbar">
   <span class="brand"><span class="grad-text spark" aria-hidden>&#10022;</span><span>huntwell</span><span class="tag">admin</span></span>
   <span class="who">
@@ -207,6 +233,18 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     <span id="who"></span>
   </span>
 </div>
+<!-- The rail: one tile per page, the same tiles the app draws. -->
+<aside class="rail" id="rail">
+  <nav class="rail-nav">
+    <a class="rail-item" href="#/home" data-page="home" title="Home"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10.5 9-7.5 9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg></span><span class="rlbl">Home</span></a>
+    <a class="rail-item" href="#/users" data-page="users" title="Users"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="rlbl">Users</span></a>
+    <a class="rail-item" href="#/models" data-page="models" title="Models"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg></span><span class="rlbl">Models</span></a>
+    <a class="rail-item" href="#/routing" data-page="routing" title="Routing"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg></span><span class="rlbl">Routing</span></a>
+    <a class="rail-item" href="#/logs" data-page="logs" title="Logs"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h12a2 2 0 0 0 2-2v-2H10v2a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v3h4"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M15 8h-5M15 12h-5"/></svg></span><span class="rlbl">Logs</span></a>
+  </nav>
+  <div class="spacer"></div>
+  <button class="rail-item" onclick="logout()" title="Sign out"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg></span><span class="rlbl">Sign out</span></button>
+</aside>
 <div class="pane">
 
 <div id="login" class="card">
@@ -237,6 +275,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 </div>
 
 <main id="app" class="content hide">
+<section class="page" data-page="home">
   <div class="page-head">
     <div>
       <h1>Fleet</h1>
@@ -277,7 +316,10 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     <table><thead><tr><th>VM</th><th>Role</th><th>Host</th><th>Size</th><th>Build</th><th>Status</th><th></th></tr></thead>
     <tbody id="vms"></tbody></table>
   </div>
+</section>
 
+<section class="page hide" data-page="users">
+  <div class="page-head"><div><h1>Users</h1><div class="sub">Every account, what each may build, and connected logins.</div></div></div>
   <div class="card">
     <div class="card-head">
       <div><h2>What people can build</h2>
@@ -288,10 +330,13 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <button class="primary sm" onclick="saveFeatures()">Save default</button>
       <span id="features-note" class="muted"></span>
     </div>
-    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th></th></tr></thead>
+    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th></th></tr></thead>
     <tbody id="accounts"></tbody></table>
   </div>
+</section>
 
+<section class="page hide" data-page="models">
+  <div class="page-head"><div><h1>Models</h1><div class="sub">Which model each stage of a run uses.</div></div></div>
   <div class="card">
     <div class="card-head">
       <div><h2>Models</h2>
@@ -304,10 +349,13 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span id="models-note" class="muted"></span>
     </div>
   </div>
+</section>
 
+<section class="page hide" data-page="routing">
+  <div class="page-head"><div><h1>Routing</h1><div class="sub">How queued executions are placed, and every decision made.</div></div></div>
   <div class="card">
     <div class="card-head">
-      <div><h2>Routing</h2><div class="sub">How a queued execution picks its slot.</div></div>
+      <div><h2>Strategy</h2><div class="sub">How a queued execution picks its slot.</div></div>
     </div>
     <div class="row">
       <label class="row" style="margin:0"><input type="radio" name="strat" value="round_robin"> Round-robin</label>
@@ -326,14 +374,19 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     </div>
     <div id="route-grid" class="ag-theme-quartz"></div>
   </div>
+</section>
 
+<section class="page hide" data-page="logs">
+  <div class="page-head"><div><h1>Logs</h1><div class="sub">Recent executions across every workspace.</div></div></div>
   <div class="card">
     <div class="card-head">
       <div><h2>Recent executions</h2><div class="sub">The last 25, newest first.</div></div>
     </div>
-    <table><thead><tr><th>Execution</th><th>Plan</th><th>Acct</th><th>Status</th><th>Host</th><th>Slot</th><th>Started</th></tr></thead>
-    <tbody id="executions"></tbody></table>
+    <table><thead><tr><th>Execution</th><th>Plan</th><th>Acct</th><th>Status</th><th>Model</th><th style="text-align:right">Charged</th><th style="text-align:right">Our cost</th><th style="text-align:right">Profit</th><th>Host</th><th>Slot</th><th>Started</th></tr></thead>
+    <tbody id="executions"></tbody>
+    <tfoot id="executions-total"></tfoot></table>
   </div>
+</section>
 </main>
 </div>
 
@@ -475,9 +528,24 @@ async function claim(){hideNotice('fr-err');
     boot();
   }catch(e){showNotice('fr-err',e.status===401?{title:'That setup key is not right.',text:'Copy it from the box the admin printed when it started; a restart mints a new one.'}:explain(e,'Could not create the operator.'))}}
 
+// ---- pages: one per rail tile, picked by the hash so a reload stays put ----
+const PAGES=['home','users','models','routing','logs'];
+function currentPage(){const p=(location.hash||'').replace(/^#\/?/,'');return PAGES.includes(p)?p:'home'}
+let lastLog=[];
+function showPage(name){
+  document.querySelectorAll('.page').forEach(el=>el.classList.toggle('hide',el.dataset.page!==name));
+  document.querySelectorAll('.rail-item[data-page]').forEach(el=>el.classList.toggle('active',el.dataset.page===name));
+  // The grid measures itself when it is made, so it is made the first time
+  // its page is on screen, not while hidden at zero width.
+  if(name==='routing'&&!routeApi&&window.agGrid){initGrid();routeApi.setGridOption('rowData',lastLog)}
+  $('app').parentElement.scrollTop=0;
+}
+window.addEventListener('hashchange',()=>{if(!$('app').classList.contains('hide'))showPage(currentPage())});
+
 async function boot(){
   const s=await api('GET','/admin/api/session');
   if(!s.email){
+    $('shell').classList.add('noauth');
     // An unclaimed control plane has nothing to sign in to, so offer the one
     // thing that can be done instead of a form that cannot succeed.
     const first=!!s.setupRequired;
@@ -489,8 +557,9 @@ async function boot(){
   }
   $('firstrun').classList.add('hide');
   $('login').classList.add('hide');$('app').classList.remove('hide');
-  $('who').innerHTML=`<span>${esc(s.email)}</span> <button class="sm" onclick="logout()">Sign out</button>`;
-  if(!routeApi)initGrid();
+  $('shell').classList.remove('noauth');
+  $('who').innerHTML=`<span>${esc(s.email)}</span>`;
+  showPage(currentPage());
   loadModels();
   loadFeatures();
   refresh();clearInterval(window._t);window._t=setInterval(refresh,5000);
@@ -583,13 +652,24 @@ async function refresh(){try{
   $('pin').innerHTML=rt.free_slots.map(p=>`<option value="${esc(p.host_id)}:${esc(p.slot)}" ${cur===`${p.host_id}:${p.slot}`?'selected':''}>host ${esc(p.host_id)} · ${esc(p.slot)}</option>`).join('')
     ||`<option value="">${cur?esc(cur)+' (busy/offline)':'no free slots'}</option>`;
   const lg=await api('GET','/admin/api/route-log?limit=300');
-  if(routeApi)routeApi.setGridOption('rowData',lg.log);
+  lastLog=lg.log;if(routeApi)routeApi.setGridOption('rowData',lg.log);
+  const usd=m=>(m<0?'−':'')+'$'+(Math.abs(m)/1e6).toFixed(Math.abs(m)<1e6?3:2);
+  const profitCell=m=>m==null?'<span class="muted">—</span>':`<span class="badge ${m>=0?'ok':'bad'}">${usd(m)}</span>`;
   const rs=await api('GET','/admin/api/executions?limit=25');
   $('executions').innerHTML=rs.executions.map(r=>`<tr><td>#${esc(r.execution_id)}</td><td>${esc(r.source)}</td><td>${esc(r.account_id)}</td>
     <td><span class="badge ${r.status==='succeeded'?'ok':r.status==='failed'?'bad':'warn'}">${esc(r.status)}</span></td>
+    <td class="mono">${esc(r.model_scrape||'auto')}</td>
+    <td style="text-align:right">${usd(r.charged_usd_micros)}</td>
+    <td style="text-align:right" title="${r.cost_basis==='reported'?'What Cursor reported for this run':r.cost_basis==='estimated'?'Estimated from the tokens and the model’s Cursor rates — Cursor reported no cost':'No rate known for this model'}">${r.cost_usd_micros==null?'—':(r.cost_basis==='estimated'?'~':'')+usd(r.cost_usd_micros)}</td>
+    <td style="text-align:right">${profitCell(r.profit_usd_micros)}</td>
     <td>${esc(r.host_id??'—')}</td><td class="mono">${esc(r.slot_name??'—')}</td>
     <td class="muted">${new Date(r.started_at).toLocaleString()}</td></tr>`).join('')
-    ||'<tr><td colspan="7" class="muted">No runs yet.</td></tr>';
+    ||'<tr><td colspan="11" class="muted">No runs yet.</td></tr>';
+  const known=rs.executions.filter(r=>r.profit_usd_micros!=null);
+  const sum=k=>known.reduce((a,r)=>a+r[k],0);
+  $('executions-total').innerHTML=known.length?`<tr><td colspan="5" class="muted">Total of the ${known.length} run${known.length===1?'':'s'} with a known cost</td>
+    <td style="text-align:right"><b>${usd(sum('charged_usd_micros'))}</b></td><td style="text-align:right"><b>${usd(sum('cost_usd_micros'))}</b></td>
+    <td style="text-align:right">${profitCell(sum('profit_usd_micros'))}</td><td colspan="3"></td></tr>`:'';
 }catch(e){console.warn(e)}}
 
 let HOSTS=[];
@@ -707,9 +787,10 @@ async function loadFeatures(){
       <td>${esc(a.plans)}</td>
       <td>${boxes}<br><span class="muted" style="font-size:.78rem">${own.length?'set for this account':'following the default'}</span></td>
       <td class="row">${cl}</td>
+      <td>${a.mfa_enabled?`<span class="badge ok">on</span> <button class="sm" onclick="resetMfa(${a.account_id})" title="For someone who lost their device">Reset</button>`:'<span class="muted">off</span>'}</td>
       <td class="row"><button class="sm" onclick="saveAccount(${a.account_id})">Save</button>
       <button class="sm" onclick="resetAccount(${a.account_id})" title="Follow the installation default again">Reset</button></td></tr>`}).join('')
-    ||'<tr><td colspan="5" class="muted">No accounts yet.</td></tr>';
+    ||'<tr><td colspan="6" class="muted">No accounts yet.</td></tr>';
 }
 
 async function saveFeatures(){
@@ -723,6 +804,8 @@ async function saveAccount(id){
   const kinds=[...document.querySelectorAll(`#accounts input[data-acct="${id}"]`)].filter(b=>b.checked).map(b=>b.dataset.kind);
   try{await api('PUT',`/admin/api/accounts/${id}/kinds`,{kinds});loadFeatures()}catch(e){alert(e.message)}}
 
+async function resetMfa(id){if(!confirm('Turn two-factor authentication off for this account? They sign in with their password alone until they set up a device again.'))return;
+  try{await api('DELETE',`/admin/api/accounts/${id}/mfa`);loadFeatures()}catch(e){alert(errText(e))}}
 async function setConnectedLogins(id,on){
   // Confirmed on the way in, not out: this is the switch that lets a workspace
   // put real credentials into a remote browser.

@@ -394,7 +394,11 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
       const r = await api.post<{ execution_id: number }>('/api/executions', { plan_id: plan.PlanId, target: target || undefined })
       nav(`/app/executions/${r.execution_id}`)
     } catch (e: any) {
-      toast(e.message, true)
+      const msg = e.message || 'Could not start that run'
+      toast(msg, true)
+      if (/payment method|card/i.test(msg) || /credits remaining|buy credits/i.test(msg)) {
+        nav('/app/usage', { state: { needCard: /card|payment method/i.test(msg), needCredits: /credits/i.test(msg) } })
+      }
       setBusy(false)
     }
   }

@@ -62,6 +62,12 @@ pub fn auth_routes() -> Router<App> {
         .route("/auth/me", get(auth::me).put(auth::update_me))
         .route("/auth/password", post(auth::change_password))
         .route("/auth/verify", post(auth::verify))
+        .route("/auth/mfa", post(auth::mfa))
+        .route("/auth/mfa/setup", post(auth::mfa_setup))
+        .route("/auth/mfa/confirm", post(auth::mfa_confirm))
+        .route("/auth/mfa/disable", post(auth::mfa_disable))
+        .route("/auth/forgot", post(auth::forgot))
+        .route("/auth/reset", post(auth::reset))
         .route("/auth/resend", post(auth::resend))
 }
 
@@ -215,17 +221,13 @@ async fn usage(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json
 #[derive(Deserialize)]
 struct TopupBody {
     usd: f64,
+    purchase_id: String,
 }
 
-/// Adds dollars to the account's budget for this period. The hook a payment flow
-/// calls; until then it lets an operator grant headroom.
+/// Buys prepaid credits. Production charges the card on file via Stripe;
+/// this is never a free grant.
 async fn usage_topup(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<TopupBody>) -> Result<Json<Value>, ApiError> {
-    if !(body.usd > 0.0) {
-        return Err(bad_request("usd must be positive"));
-    }
-    let micros = (body.usd * 1_000_000.0).round() as i64;
-    let u = store::add_topup(&state.db, acc.tenant(), micros).await?;
-    Ok(Json(serde_json::to_value(u).unwrap_or_else(|_| json!({}))))
+    super::billing::purchase_credits(&state, &acc, body.usd, &body.purchase_id).await
 }
 
 /// What this server can do: whether the agent and Chrome are reachable.

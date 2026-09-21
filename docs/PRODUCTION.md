@@ -48,7 +48,7 @@ real rather than nominal:
 
 - **A VM carries only its role's credentials.** A worker gets the database, the
   Cursor key and the Browserbase key. It never receives the Cognito admin key,
-  the SES key, Stripe, or the session secret — only the app VM holds those. A
+  the Resend key, Stripe, or the session secret — only the app VM holds those. A
   rooted worker costs you run capacity, not your users.
 - **A VM reaches only what it needs.** VMs are port-isolated from each other on
   the bridge. The host's egress table lets them reach the internet and the
@@ -289,10 +289,25 @@ ask for another, or sign out until it does — so an invitation sent to an
 address goes only to whoever proves they own it, and an address registered by
 a squatter is taken over by the first person to verify it. A code is good for
 15 minutes and five guesses; "Send a new code" is limited to five an hour.
-This needs mail (SES in the secret); nothing else.
+This needs mail (`RESEND_API_KEY` in the secret and `HUNTWELL_MAIL_FROM` on a
+domain verified in Resend); nothing else.
 
 Accounts that existed before this was added are treated as verified. A server
 with no mail provider (`./dev.sh`) verifies on the spot and says so in the log.
+
+**Two-factor** is optional and offered right after the email code (and in
+Settings). The TOTP secret lives in the Cognito pool, never in this database.
+For it to work the pool needs **MFA set to Optional with Authenticator apps
+enabled** (User pool → Sign-in → Multi-factor authentication), and the IAM user
+needs two more actions on the pool: `cognito-idp:AdminSetUserMFAPreference`
+and `cognito-idp:AdminGetUser`. An operator turns two-factor off for someone
+who lost their device from the admin's Users page.
+
+**Forgot password** works the same way: the sign-in page's "Forgot your
+password?" emails a six-digit code (five requests an hour per address, and
+the form answers the same whether or not the address has an account); entering
+it with a new password changes the password in Cognito and signs out every
+session. It needs mail, so it is unavailable on a server with none.
 
 
 Sign-up and sign-in ask for a Cloudflare Turnstile token when
@@ -363,7 +378,22 @@ website listens beyond loopback.
 
 - **More than one app VM.** One per installation, enforced in the database.
 
+## Billing
+
+Production refuses to start a plan without a Stripe card on file **and** a
+prepaid credit balance. Users buy credits against that card; each run spends
+them as tokens are booked and is stopped the moment the wallet would go
+negative. `STRIPE_SECRET_KEY` and `STRIPE_PUBLISHABLE_KEY` must be in the
+app VM secret — a production process will not invent a mock card.
+
+Configure a Stripe webhook at
+`https://<public-domain>/api/billing/webhook` for `charge.refunded` and
+`charge.dispute.created`, and put its signing secret in
+`STRIPE_WEBHOOK_SECRET`. Refunds remove unspent credits; refunds of credits
+already consumed become account debt that future purchases repay first.
+
 ## Local development
 
 `./dev.sh` needs none of this: the admin runs worker slots as its own child
-processes.
+processes. Without Stripe keys it attaches a test card and a starter credit
+grant so the same gates can be exercised.

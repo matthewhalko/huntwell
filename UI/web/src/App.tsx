@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-do
 import { useAuth } from './auth'
 import Layout from './components/Layout'
 import Landing from './pages/Landing'
-import { CheckEmail, Login, Signup } from './pages/Auth'
+import { CheckEmail, Forgot, Login, Signup } from './pages/Auth'
 import Dashboard from './pages/Dashboard'
 import Plans from './pages/Plans'
 import PlanNew from './pages/PlanNew'
@@ -49,6 +49,7 @@ export default function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
       <Route path="/verify" element={<CheckEmail />} />
+      <Route path="/forgot" element={<Forgot />} />
       {/* An invite link: readable signed out, acceptable only as the invitee. */}
       <Route path="/join/:token" element={<Join />} />
       <Route path="/terms" element={<Terms />} />

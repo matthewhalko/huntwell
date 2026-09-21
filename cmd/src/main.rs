@@ -345,14 +345,9 @@ async fn dispatch(cmd: Cmd) -> Result<i32> {
             match cmd {
                 AccountCmd::Create { email, password, name } => {
                     web::auth::validate_signup(&email, &password)?;
-                    let id = huntwell::identity::create_user(&email, &password).await?;
-                    let acc = store::create_account(&db, &email, &name, &id).await?;
-                    println!(
-                        "created account #{} {} ({} identity)",
-                        acc.account_id,
-                        acc.email,
-                        huntwell::identity::provider_name()
-                    );
+                    let sub = huntwell::identity::create_user(&email, &password).await?;
+                    let acc = store::create_account(&db, &email, &name, &sub).await?;
+                    println!("created account #{} {} (cognito)", acc.account_id, acc.email);
                 }
                 AccountCmd::List => {
                     let rows: Vec<(i64, String, String)> =

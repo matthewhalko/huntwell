@@ -37,7 +37,10 @@ CREATE TABLE IF NOT EXISTS public.plan (
 	learn                boolean NOT NULL DEFAULT false,
 	iterations           integer NOT NULL DEFAULT 1,
 	max_no_progress        integer NOT NULL DEFAULT 2,
-	known_limit           integer NOT NULL DEFAULT 200,
+	-- The exclusion list a scrape prompt replays as {{.known_companies_csv}}. 60
+	-- names: the agent has prospect_known(), which answers the same question
+	-- for a whole results page in one call against the full record.
+	known_limit           integer NOT NULL DEFAULT 60,
 	target_prospects      integer NOT NULL DEFAULT 0,
 	free_agent            boolean NOT NULL DEFAULT false,
 	favorite             boolean NOT NULL DEFAULT false,
@@ -56,84 +59,52 @@ CREATE TABLE IF NOT EXISTS public.plan (
 	last_scheduled_at      timestamptz,
 	created_at            timestamptz NOT NULL DEFAULT now(),
 	updated_at            timestamptz NOT NULL DEFAULT now(),
+	-- What a plan collects. 'prospects' (default) uses the fixed people/company
+	-- columns and the *Tmpl mapping; 'artifacts' collects arbitrary rows whose
+	-- columns are defined by fields_schema_json (a JSON array of {key,label,
+	-- type,role}); 'report' writes one narrative document about subject (the
+	-- report table); 'assets' collects the actual files found about it.
+	kind                  varchar(16) NOT NULL DEFAULT 'prospects',
+	fields_schema_json    text NOT NULL DEFAULT '',
+	-- For 'report' and 'assets': the one company, person or topic the run is
+	-- about. It is also the dedupe key, so re-running refreshes in place.
+	subject               varchar(300) NOT NULL DEFAULT '',
+	-- The plan in the user's own words: the brief they typed, kept as the one
+	-- human-readable thing the UI shows about a plan. Everything that makes
+	-- the plan work — the prompts, the mapping, the dedupe key — is machinery
+	-- the drafting agent writes and the app never puts on screen.
+	description           varchar(600) NOT NULL DEFAULT '',
+	-- How hard a run should try, as one choice instead of two machine knobs.
+	-- 'quick' | 'normal' | 'thorough' | 'exhaustive'. The server derives
+	-- iterations, max_no_progress and learn from it (web::api::apply_effort).
+	effort                varchar(12) NOT NULL DEFAULT 'normal',
+	-- Where the plan is in being built: 'queued' for the planning service,
+	-- 'drafting' while the agent authors its prompts (the row exists at once
+	-- so the plan shows up, spinning), 'ready' once written, 'failed' if the
+	-- agent could not — a failed plan stays visible so it can be retried.
+	draft_status          varchar(12) NOT NULL DEFAULT 'ready',
+	-- Websites this plan should search first, comma-separated hosts. A
+	-- preference, not a fence: allow_hosts is the containment allowlist.
+	sites                 text NOT NULL DEFAULT '',
+	-- Email the account when a run stores rows it had not seen before.
+	alert_email           boolean NOT NULL DEFAULT false,
+	-- Per-stage Cursor model ids the owner picked. Empty means "not chosen
+	-- here": the run falls back to the all-stages `model`, then the install
+	-- default, then Cursor's own pick. Search, research and find-files share
+	-- scrape; enrichment and the next-search planner are their own jobs.
+	model_scrape          varchar(160) NOT NULL DEFAULT '',
+	model_enrich          varchar(160) NOT NULL DEFAULT '',
+	model_planner         varchar(160) NOT NULL DEFAULT '',
+	-- Drafting is a queue: the website marks a plan 'queued' and the planning
+	-- service claims it with an atomic 'queued' -> 'drafting' UPDATE. This is
+	-- the brief as the website received it, parked for the planning service;
+	-- NOT re-derivable from the row (a plan of kind 'auto' has not been
+	-- classified yet). Empty means "rebuild the request from this row".
+	draft_request_json    text NOT NULL DEFAULT '',
 	PRIMARY KEY (plan_id),
 	UNIQUE (account_id, source)
 );
 CREATE INDEX IF NOT EXISTS plan_schedule_idx ON public.plan (next_run_at) WHERE schedule_enabled;
--- No foreign key to account: ownership is enforced in application code, where
--- every store function filters by account_id. Dropped idempotently for a
--- database created while the constraint still existed.
-ALTER TABLE public.plan DROP CONSTRAINT IF EXISTS plan_account_id_fkey;
-
--- What a plan collects. 'prospects' (default) uses the fixed people/company
--- columns and the *Tmpl mapping; 'artifacts' collects arbitrary rows whose
--- columns are defined by fields_schema_json (a JSON array of {key,label,type,
--- role}). See artifact.rs / the artifact table.
--- Two further kinds produce something other than rows: 'report' writes one
--- narrative document about subject (see the report table), and 'assets'
--- collects the actual files found about it (see the asset table).
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS kind varchar(16) NOT NULL DEFAULT 'prospects';
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS fields_schema_json text NOT NULL DEFAULT '';
--- For 'report' and 'assets': the one company, person or topic the run is
--- about. It is also the dedupe key, so re-running refreshes in place.
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS subject varchar(300) NOT NULL DEFAULT '';
-
--- The exclusion list a scrape prompt replays as {{.known_companies_csv}}. 200
--- names is ~1.5k tokens on every scrape and planner call, and the agent now has
--- prospect_known() — which answers the same question for a whole results page
--- in one call, against the full record rather than a truncated sample. New
--- plans get a short sample instead of a second copy of the list; existing plans
--- keep whatever they were set to.
-ALTER TABLE public.plan ALTER COLUMN known_limit SET DEFAULT 60;
-
--- The plan in the user's own words: the brief they typed, kept as the one
--- human-readable thing the UI shows about a plan. Everything that makes the
--- plan work — the prompts, the field mapping, the dedupe key — is machinery the
--- drafting agent writes and the app never puts on screen.
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS description varchar(600) NOT NULL DEFAULT '';
-
--- How hard a run should try, as one choice instead of two machine knobs.
--- 'quick' | 'normal' | 'thorough' | 'exhaustive'. The server derives
--- iterations, max_no_progress and learn from it (web::api::apply_effort),
--- so the pipeline keeps reading the same fields it always has.
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS effort varchar(12) NOT NULL DEFAULT 'normal';
-
--- Where the plan is in being built. 'drafting' while the agent is authoring its
--- prompts (the row exists immediately so the plan shows up, spinning, the
--- moment it is asked for), 'ready' once they are written, 'failed' if the agent
--- could not do it — a failed plan stays visible so it can be retried rather
--- than vanishing.
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS draft_status varchar(12) NOT NULL DEFAULT 'ready';
-
--- Websites this plan should search first, comma-separated hosts. A preference,
--- not a fence: allow_hosts is the containment allowlist and leaving a host off
--- it kills a run, which is the wrong answer for "look at cars.com first".
-ALTER TABLE plan ADD COLUMN IF NOT EXISTS sites text NOT NULL DEFAULT '';
-
--- Email the account when a run of this plan stores rows it had not seen before.
-ALTER TABLE plan ADD COLUMN IF NOT EXISTS alert_email boolean NOT NULL DEFAULT false;
-
--- Per-stage Cursor model ids the owner picked. Empty means "not chosen here":
--- the run then falls back to the legacy all-stages `model` column, then the
--- install default, then Cursor's own pick. Search, research and find-files
--- share scrape; enrichment and the next-search planner are their own jobs.
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS model_scrape varchar(160) NOT NULL DEFAULT '';
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS model_enrich varchar(160) NOT NULL DEFAULT '';
-ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS model_planner varchar(160) NOT NULL DEFAULT '';
-
--- Drafting is a queue, not a request: the website marks a plan 'queued' and the
--- planning service claims it. The claim is an atomic 'queued' -> 'drafting'
--- UPDATE, so two planning replicas can never draft the same plan.
---
--- draft_request_json is the brief as the website received it, parked here for
--- the planning service to pick up. It is NOT re-derivable from the rest of the
--- row: a plan created with kind 'auto' has not been classified yet, its columns
--- are not a schema yet, and the set of kinds the account may be given is not a
--- property of the plan at all. Dropping it would quietly change what a plan
--- drafts into. Empty means "rebuild the request from this row", which is what a
--- redraft of an already-drafted plan wants.
-ALTER TABLE plan ADD COLUMN IF NOT EXISTS draft_request_json text NOT NULL DEFAULT '';
-
 -- Claim probe: the planning service asks "is anything queued?" every couple of
 -- seconds and the answer is almost always no. Partial, so it stays small.
 CREATE INDEX IF NOT EXISTS plan_draft_queue_idx ON public.plan (plan_id)

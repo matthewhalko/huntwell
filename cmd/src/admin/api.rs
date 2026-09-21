@@ -1,7 +1,8 @@
 //! The admin JSON API + embedded dashboard.
 //!
-//! Auth is deliberately simple (single-operator control plane): argon2 hashes
-//! in `AdminUser`, a random bearer token in an in-memory map, delivered as an
+//! Auth: operators are users of their own Cognito pool (`ADMIN_COGNITO_*`),
+//! separate from the product's; the `admin_user` row keys to it by subject.
+//! A sign-in yields a random bearer token in an in-memory map, delivered as an
 //! HttpOnly cookie. Bind it to localhost or put TLS in front for anything
 //! reachable.
 
@@ -68,6 +69,7 @@ pub fn router(state: Admin) -> Router {
         .route("/admin/api/vms/{id}/stop", post(stop_vm))
         .route("/admin/api/vms/{id}/start", post(start_vm))
         .route("/admin/api/accounts/{id}/connected-logins", axum::routing::put(put_account_connected_logins))
+        .route("/admin/api/accounts/{id}/mfa", axum::routing::delete(reset_account_mfa))
         .route("/admin/api/routing", get(get_routing).put(put_routing))
         .route("/admin/api/models", get(get_models).put(put_models))
         .route("/admin/api/models/available", get(available_models))
@@ -137,19 +139,33 @@ async fn login(
     crate::throttle::ADMIN_LOGIN_FAILURES.check(&ip).map_err(|wait| {
         ApiError(StatusCode::TOO_MANY_REQUESTS, format!("too many attempts — try again in {} minutes", wait.div_ceil(60).max(1)))
     })?;
-    let hash = store::get_admin_password_hash(&state.db, &req.email).await.map_err(internal)?;
-    // A hash is always checked, so an unknown email costs the same time as a
-    // wrong password and the reply does not say which it was.
-    let hash = hash.unwrap_or_else(|| crate::web::auth::hash_password("no such operator").unwrap_or_default());
-    let ok = tokio::task::spawn_blocking(move || crate::web::auth::verify_password(&req.password, &hash))
-        .await
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    if !ok || store::get_admin_password_hash(&state.db, &req.email).await.map_err(internal)?.is_none() {
-        crate::throttle::ADMIN_LOGIN_FAILURES.note(&ip);
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "email or password is incorrect".into()));
-    }
+    let email = req.email.trim().to_lowercase();
+    // The pool is asked whether or not the row exists, so an unknown email
+    // costs the same time as a wrong password and the reply does not say
+    // which it was. Then the row: being in the operators' pool is necessary,
+    // being recorded as an operator here is what makes it sufficient.
+    let signed_in = crate::cognito::sign_in_full_in(crate::cognito::PoolKind::Admins, &email, &req.password).await;
+    let known = store::admin_user_sub(&state.db, &email).await.map_err(internal)?;
+    let sub = match (signed_in, known) {
+        (Ok(crate::cognito::SignIn::Done { sub, .. }), Some(bound)) if bound.is_empty() || bound == sub => sub,
+        (Ok(crate::cognito::SignIn::MfaRequired { .. }), _) => {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "this operator has two-factor on in the pool, which the console cannot answer yet — turn it off in Cognito".into(),
+            ));
+        }
+        (Err(e), _) if e.to_string() == crate::cognito::UNAVAILABLE => {
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+        }
+        _ => {
+            crate::throttle::ADMIN_LOGIN_FAILURES.note(&ip);
+            return Err(ApiError(StatusCode::UNAUTHORIZED, "email or password is incorrect".into()));
+        }
+    };
+    // A row from before the pool binds on first sign-in, like an account's.
+    store::upsert_admin_user(&state.db, &email, &sub).await.map_err(internal)?;
     let tok = uuid_token();
-    state.sessions.lock().await.insert(tok.clone(), req.email.to_lowercase());
+    state.sessions.lock().await.insert(tok.clone(), email);
     let cookie = format!("{COOKIE}={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))))
 }
@@ -204,8 +220,13 @@ async fn claim(State(state): State<Admin>, Json(req): Json<Claim>) -> Result<imp
         crate::setup::disarm();
         return Err(ApiError(StatusCode::CONFLICT, "this control plane already has an operator".into()));
     }
-    let hash = crate::web::auth::hash_password(&req.password).map_err(internal)?;
-    store::upsert_admin_user(&state.db, &email, &hash).await.map_err(internal)?;
+    crate::identity::check_password_strength(&req.password).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // The operator is made in the operators' pool first; only then is there a
+    // row, so a failure cannot leave an operator who can never sign in.
+    let sub = crate::cognito::create_user_in(crate::cognito::PoolKind::Admins, &email, &req.password)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    store::upsert_admin_user(&state.db, &email, &sub).await.map_err(internal)?;
     // The key's whole life is this moment. Burn it before replying, so a
     // retried request cannot make a second account.
     crate::setup::disarm();
@@ -841,6 +862,17 @@ struct ConnectedLoginsReq {
 /// Operator-only and per workspace, because the feature hands a real browser a
 /// customer's real credentials. It is off for everyone until someone decides
 /// otherwise — there is deliberately no "on for all" switch here.
+/// Turn two-factor off for an account whose owner lost their device. The
+/// operator's own session is the authority here; the person then signs in
+/// with their password and can set a new device up.
+async fn reset_account_mfa(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let acc = store::get_account(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
+    crate::identity::disable_mfa(&acc.email, acc.account_id, &state.db).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    tracing::info!("two-factor reset for account {} by operator {who}", acc.account_id);
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn put_account_connected_logins(
     State(state): State<Admin>,
     headers: HeaderMap,
@@ -895,7 +927,34 @@ fn default_limit() -> i64 {
 async fn recent_executions(State(state): State<Admin>, headers: HeaderMap, Query(q): Query<RunsQuery>) -> Result<Json<Value>, ApiError> {
     require(&state, &headers).await?;
     let rows = store::recent_executions_admin(&state.db, q.host_id, q.slot.as_deref(), q.limit).await.map_err(internal)?;
+    let rows: Vec<Value> = rows.iter().map(execution_money).collect();
     Ok(Json(json!({ "executions": rows })))
+}
+
+/// A run with what it earned: what the customer was charged, what it cost us,
+/// and the difference. The charge is the same sum the customer sees — billed
+/// tokens at the sell rate. Our cost is Cursor's own figure when it gave one,
+/// and otherwise an estimate from the scrape model's rates, marked as such.
+fn execution_money(r: &store::AdminExecutionRow) -> Value {
+    let charged = store::tokens_to_usd_micros(r.input_tokens + r.output_tokens);
+    let (cost, basis) = if r.cost_usd_micros > 0 {
+        (Some(r.cost_usd_micros), "reported")
+    } else {
+        let est = crate::model_catalog::estimate_cost_micros(
+            &r.model_scrape,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens,
+        );
+        (est, if est.is_some() { "estimated" } else { "unknown" })
+    };
+    let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
+    v["charged_usd_micros"] = json!(charged);
+    v["cost_usd_micros"] = json!(cost);
+    v["cost_basis"] = json!(basis);
+    v["profit_usd_micros"] = json!(cost.map(|c| charged - c));
+    v
 }
 
 #[derive(Deserialize)]
@@ -949,5 +1008,51 @@ mod tests {
         assert!(!valid_domain("a b.com"));
         assert!(!valid_domain("-a.com"));
         assert!(!valid_domain("a..com"));
+    }
+}
+
+#[cfg(test)]
+mod money_tests {
+    use super::*;
+
+    fn run(input: i64, output: i64, cache_read: i64, reported: i64, model: &str) -> store::AdminExecutionRow {
+        store::AdminExecutionRow {
+            execution_id: 1,
+            plan_id: 1,
+            account_id: 1,
+            source: "p".into(),
+            status: "succeeded".into(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            host_id: None,
+            slot_name: None,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: 0,
+            cost_usd_micros: reported,
+            model_scrape: model.into(),
+        }
+    }
+
+    #[test]
+    fn profit_is_the_charge_minus_what_cursor_said_or_our_estimate() {
+        // 1M billed tokens at the default $5/M = $5.00; Cursor reported $1.20.
+        let v = execution_money(&run(900_000, 100_000, 0, 1_200_000, "composer-2.5"));
+        assert_eq!(v["charged_usd_micros"], 5_000_000);
+        assert_eq!(v["cost_basis"], "reported");
+        assert_eq!(v["profit_usd_micros"], 3_800_000);
+        // Nothing reported: estimated from the model, and said to be.
+        let v = execution_money(&run(900_000, 100_000, 0, 0, "composer-2.5"));
+        assert_eq!(v["cost_basis"], "estimated");
+        assert_eq!(v["cost_usd_micros"], 700_000);
+        assert_eq!(v["profit_usd_micros"], 4_300_000);
+        // A model with no known rate has no profit figure — not a made-up one.
+        let v = execution_money(&run(900_000, 100_000, 0, 0, "mystery-1"));
+        assert_eq!(v["cost_basis"], "unknown");
+        assert!(v["profit_usd_micros"].is_null());
+        // A run can lose money, and the number says so.
+        let v = execution_money(&run(100_000, 0, 0, 2_000_000, ""));
+        assert_eq!(v["profit_usd_micros"], -1_500_000);
     }
 }

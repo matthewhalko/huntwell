@@ -587,6 +587,7 @@ mod tests {
     fn a_workspace_is_created_with_both_policy_files() {
         let tmp = std::env::temp_dir().join(format!("huntwell-ws-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
+        let _guard = WORKSPACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HUNTWELL_AGENT_WORKSPACE", &tmp);
         let root = ensure().expect("workspace");
         std::env::remove_var("HUNTWELL_AGENT_WORKSPACE");
@@ -630,12 +631,18 @@ mod tests {
     }
 }
 
+/// Four tests write `HUNTWELL_AGENT_WORKSPACE`, which is process-wide; they
+/// take this so they run one at a time.
+#[cfg(test)]
+static WORKSPACE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod workspace_location_tests {
     use super::*;
 
     #[test]
     fn the_agent_never_works_inside_the_checkout() {
+        let _guard = WORKSPACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // The whole point: a file tool that somehow ran would land somewhere
         // with nothing in it, not next to the source and the credentials.
         std::env::remove_var("HUNTWELL_AGENT_WORKSPACE");
@@ -647,6 +654,7 @@ mod workspace_location_tests {
 
     #[test]
     fn an_operator_can_still_pin_it() {
+        let _guard = WORKSPACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HUNTWELL_AGENT_WORKSPACE", "/srv/agent");
         assert_eq!(root_dir(), std::path::PathBuf::from("/srv/agent"));
         std::env::remove_var("HUNTWELL_AGENT_WORKSPACE");

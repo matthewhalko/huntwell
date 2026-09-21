@@ -968,8 +968,52 @@ tr.run-barren td:first-child a { color: var(--bad); }
 @media (max-width: 560px) { .foot-cols { grid-template-columns: 1fr; } }
 
 /* ---------- auth ---------- */
-.auth { min-height: 100%; display: grid; place-items: center; padding: 2rem 1rem; background: radial-gradient(1200px 500px at 20% -10%, rgba(63, 14, 64, 0.1), transparent 60%), var(--bg); }
-.auth .card { width: 100%; max-width: 420px; padding: 2rem; box-shadow: var(--shadow); }
+.auth { position: relative; isolation: isolate; min-height: 100%; display: grid; place-items: center; padding: 2rem 1rem; background: var(--chrome); overflow: hidden; }
+/* The card floats on the painting. Nearly opaque rather than frosted: a
+   backdrop blur over a picture that never stops moving has to be recomputed
+   every frame, and that was half of what made the motion stutter. */
+.auth .card { position: relative; z-index: 1; width: 100%; max-width: 420px; padding: 2rem; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4), var(--shadow);
+  background: color-mix(in srgb, var(--surface) 95%, transparent); border-color: color-mix(in srgb, var(--border) 60%, transparent); }
+
+/* ---------- fine art behind the sign-in screens ----------
+   Two full-bleed layers that crossfade (ArtBackdrop.tsx); each painting drifts
+   and breathes slowly while it is up — the same idea as Multi-Dev's live
+   wallpaper, with a painting instead of a photo.
+
+   Everything that moves is `transform` or `opacity`, and nothing else: those
+   two are handled by the GPU compositor from a texture uploaded once. The
+   breathing used to animate `filter`, which repaints the whole image every
+   frame — that was the stutter. It is now a dark veil whose opacity rises and
+   falls over the painting, which looks the same and costs nothing. */
+.art-backdrop { position: absolute; inset: 0; z-index: 0; overflow: hidden; background: var(--chrome); contain: strict; }
+.art-layer { position: absolute; inset: -7%; background-size: cover; background-position: center; opacity: 0; visibility: hidden;
+  transform: translate3d(0, 0, 0) scale(1.04); backface-visibility: hidden; will-change: transform, opacity;
+  /* Hidden only once the fade-out has finished, so a layer nobody can see is
+     not still being composited full-screen sixty times a second. */
+  transition: opacity var(--art-fade, 2600ms) ease-in-out, visibility 0s linear var(--art-fade, 2600ms);
+  animation: art-live 44s ease-in-out infinite alternate; }
+.art-layer.on { opacity: 1; visibility: visible; transition: opacity var(--art-fade, 2600ms) ease-in-out, visibility 0s linear 0s; }
+.art-layer.still { animation: none; }
+@keyframes art-live {
+  from { transform: translate3d(-1.2%, 0.8%, 0) scale(1.04); }
+  to   { transform: translate3d(1.4%, -1%, 0) scale(1.1); }
+}
+/* The breath: a veil over the painting, opacity only. */
+.art-breath { position: absolute; inset: 0; background: #000; opacity: 0.16; will-change: opacity; pointer-events: none;
+  animation: art-breathe 8s ease-in-out infinite alternate; }
+.art-breath.still { animation: none; opacity: 0.08; }
+@keyframes art-breathe {
+  from { opacity: 0.18; }
+  to   { opacity: 0; }
+}
+/* Darkens the edges so the card reads and the painting's centre stays bright. */
+.art-vignette { position: absolute; inset: 0; background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0.05) 30%, rgba(0, 0, 0, 0.5) 100%); pointer-events: none; }
+.art-caption { position: absolute; left: 1.2rem; bottom: 1rem; display: flex; flex-direction: column; gap: 0.1rem; color: rgba(255, 255, 255, 0.86);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7); font-size: 0.8rem; opacity: 0; transition: opacity 1.2s ease 0.6s; max-width: min(60vw, 420px); }
+.art-caption.on { opacity: 1; }
+.art-caption .art-title { font-family: var(--display); font-weight: 700; font-size: 0.92rem; letter-spacing: -0.01em; }
+.art-caption .art-artist { opacity: 0.8; }
+:root[data-theme='dark'] .auth .card { background: color-mix(in srgb, var(--surface) 93%, transparent); }
 .auth h1 { font-size: 1.85rem; }
 
 /* ---------- misc ---------- */

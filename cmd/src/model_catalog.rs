@@ -184,6 +184,33 @@ pub fn cursor_rate(id: &str) -> Option<Rate> {
     None
 }
 
+/// Cursor's rate for "auto", where it picks the model itself and bills its own
+/// flat price instead of the chosen model's.
+const AUTO: Rate = Rate { input: 1.25, output: 6.0 };
+
+/// Our best guess at what Cursor charges for these tokens on `model` ('' or
+/// "auto" = auto), in µUSD — for runs where Cursor reported no cost itself.
+/// `None` for a model with no row in the table above.
+///
+/// Cached reads are the part customers are not billed for and we are: an agent
+/// re-reads its context every step, so they are usually most of the tokens.
+/// Priced at a tenth of the input rate (a fifth on auto), which is what the
+/// providers behind Cursor charge; cache writes at the input rate.
+pub fn estimate_cost_micros(model: &str, input: i64, output: i64, cache_read: i64, cache_write: i64) -> Option<i64> {
+    let m = model.trim();
+    let (rate, read_share) = if m.is_empty() || m.eq_ignore_ascii_case("auto") {
+        (AUTO, 0.2)
+    } else {
+        (cursor_rate(m)?, 0.1)
+    };
+    let usd_per_m = input.max(0) as f64 * rate.input
+        + output.max(0) as f64 * rate.output
+        + cache_read.max(0) as f64 * rate.input * read_share
+        + cache_write.max(0) as f64 * rate.input;
+    // tokens × ($ per million tokens) = µUSD.
+    Some(usd_per_m.round() as i64)
+}
+
 fn has(id: &str, needle: &str) -> bool {
     let a = needle.replace('.', "-");
     let b = needle.replace('-', ".");
@@ -228,6 +255,20 @@ pub fn catalog() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_estimate_charges_us_for_the_cached_reads_customers_get_free() {
+        // 1M in, 100k out on composer: $0.50 + $0.25.
+        assert_eq!(estimate_cost_micros("composer-2.5", 1_000_000, 100_000, 0, 0), Some(750_000));
+        // Ten million cached re-reads at a tenth of the input rate: another $0.50.
+        assert_eq!(estimate_cost_micros("composer-2.5", 1_000_000, 100_000, 10_000_000, 0), Some(1_250_000));
+        // No model recorded means Cursor picked: auto's own rate, not nothing.
+        assert_eq!(estimate_cost_micros("", 1_000_000, 0, 0, 0), Some(1_250_000));
+        assert_eq!(estimate_cost_micros("auto", 1_000_000, 0, 0, 0), Some(1_250_000));
+        // A model with no row is "unknown", never a confident zero.
+        assert_eq!(estimate_cost_micros("some-new-model-9", 1_000_000, 0, 0, 0), None);
+    }
+
 
     #[test]
     fn grok_and_composer_have_cursor_pool_rates() {

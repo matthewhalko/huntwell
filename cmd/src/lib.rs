@@ -46,6 +46,7 @@ pub mod prospect;
 pub mod sandbox;
 pub mod setup;
 pub mod store;
+pub mod qr;
 pub mod svc;
 pub mod throttle;
 pub mod turnstile;

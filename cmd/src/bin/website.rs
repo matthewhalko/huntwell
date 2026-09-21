@@ -38,7 +38,7 @@ async fn main() {
         _ => {}
     }
     huntwell::boot_bus("website").await;
-    if let Err(e) = huntwell::identity::enforce_production_provider() {
+    if let Err(e) = huntwell::identity::enforce_configured() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -74,15 +74,10 @@ async fn create_account(email: &str, password: &str, name: &str) -> Result<()> {
     // Through the identity store, like a signup: on a Cognito installation the
     // operator's account has to exist in the pool too, or it is a row that can
     // never sign in.
-    let id = huntwell::identity::create_user(email, password).await?;
+    let sub = huntwell::identity::create_user(email, password).await?;
     let db = store::connect(&config::service_database_url()?, 2).await?;
-    let acc = store::create_account(&db, email, name, &id).await?;
-    println!(
-        "created account #{} {} ({} identity)",
-        acc.account_id,
-        acc.email,
-        huntwell::identity::provider_name()
-    );
+    let acc = store::create_account(&db, email, name, &sub).await?;
+    println!("created account #{} {} (cognito)", acc.account_id, acc.email);
     Ok(())
 }
 

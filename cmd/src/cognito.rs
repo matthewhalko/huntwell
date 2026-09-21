@@ -46,25 +46,57 @@ struct Pool {
     region: String,
 }
 
-/// Whether this installation has a pool to talk to.
+/// Which pool: the product's accounts, or the control plane's operators. Two
+/// pools, so a customer can never be an operator by accident and each can be
+/// locked down on its own terms. The operator pool's settings carry the
+/// `ADMIN_` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    Users,
+    Admins,
+}
+
+impl PoolKind {
+    fn setting(self, name: &str) -> String {
+        match self {
+            PoolKind::Users => format!("COGNITO_{name}"),
+            PoolKind::Admins => format!("ADMIN_COGNITO_{name}"),
+        }
+    }
+}
+
+fn set(name: &str) -> bool {
+    crate::config::get(name).map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+/// Whether this installation has the product's pool to talk to.
 pub fn configured() -> bool {
-    crate::config::get("COGNITO_USER_POOL_ID").map(|v| !v.trim().is_empty()).unwrap_or(false)
-        && crate::config::get("COGNITO_CLIENT_ID").map(|v| !v.trim().is_empty()).unwrap_or(false)
+    set("COGNITO_USER_POOL_ID") && set("COGNITO_CLIENT_ID")
+}
+
+/// Whether this installation has the operators' pool to talk to.
+pub fn admin_configured() -> bool {
+    set("ADMIN_COGNITO_USER_POOL_ID") && set("ADMIN_COGNITO_CLIENT_ID")
 }
 
 impl Pool {
     fn load() -> Result<Self> {
-        let need = |k: &str| -> Result<String> {
-            crate::config::get(k)
+        Self::load_kind(PoolKind::Users)
+    }
+
+    fn load_kind(kind: PoolKind) -> Result<Self> {
+        let need = |k: String| -> Result<String> {
+            crate::config::get(&k)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
-                .ok_or_else(|| anyhow!("{k} is not set — this installation uses Cognito for identity (see docs/SECRETS.md)"))
+                .ok_or_else(|| anyhow!("{k} is not set — every account signs in through Cognito (see docs/SECRETS.md)"))
         };
         Ok(Self {
-            user_pool_id: need("COGNITO_USER_POOL_ID")?,
-            client_id: need("COGNITO_CLIENT_ID")?,
-            client_secret: crate::config::get("COGNITO_CLIENT_SECRET").filter(|v| !v.trim().is_empty()),
-            region: crate::config::get("COGNITO_REGION")
+            user_pool_id: need(kind.setting("USER_POOL_ID"))?,
+            client_id: need(kind.setting("CLIENT_ID"))?,
+            client_secret: crate::config::get(&kind.setting("CLIENT_SECRET")).filter(|v| !v.trim().is_empty()),
+            region: crate::config::get(&kind.setting("REGION"))
+                .or_else(|| crate::config::get("COGNITO_REGION"))
                 .or_else(|| crate::config::get("AWS_REGION"))
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "us-east-1".into()),
@@ -182,6 +214,12 @@ impl Pool {
 /// `__type` names the failure precisely, and several of them mean "the user
 /// typed something wrong" rather than "the service is broken" — the difference
 /// between a message the sign-in page renders and one that reads as an outage.
+/// What a person is told when the pool itself failed — a permission the IAM
+/// user lacks, a pool that is gone, AWS having a bad minute. None of that is
+/// theirs to act on, and the AWS wording names account ids, ARNs and IAM
+/// users; the detail goes to the log, where the operator reads it.
+pub const UNAVAILABLE: &str = "sign-in is temporarily unavailable — please try again in a few minutes";
+
 fn translate(operation: &str, body: &str) -> anyhow::Error {
     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let kind = parsed["__type"].as_str().unwrap_or("");
@@ -191,15 +229,50 @@ fn translate(operation: &str, body: &str) -> anyhow::Error {
     match kind {
         // Both mean "these credentials are not good", and saying which would
         // tell an attacker whether the address has an account.
+        // AWS files a broken app client under the same error as a wrong
+        // password: a missing or wrong client secret, a client that is gone.
+        // Told to a person as "incorrect password" it sends them to reset a
+        // password that was never the problem, so those are an outage instead.
+        "NotAuthorizedException" if !is_credentials_fault(message) => {
+            tracing::error!("cognito {operation} refused the app client, not the password (NotAuthorizedException): {message}");
+            anyhow!(UNAVAILABLE)
+        }
+        "NotAuthorizedException" if message.contains("attempts exceeded") => {
+            anyhow!("too many attempts — wait a moment and try again")
+        }
         "NotAuthorizedException" | "UserNotFoundException" => anyhow!("invalid email or password"),
+        // "USER_PASSWORD_AUTH flow not enabled for this client" and its kin:
+        // on sign-in an invalid parameter is the app client's setup, never
+        // something the person typed.
+        "InvalidParameterException" if operation == "InitiateAuth" => {
+            tracing::error!("cognito InitiateAuth is misconfigured (InvalidParameterException): {message}");
+            anyhow!(UNAVAILABLE)
+        }
         "UsernameExistsException" => anyhow!("that email already has an account"),
+        "CodeMismatchException" | "EnableSoftwareTokenMFAException" => anyhow!("that code is not right — try the next one your app shows"),
+        "ExpiredCodeException" => anyhow!("that sign-in took too long — start again"),
         "InvalidPasswordException" | "InvalidParameterException" => anyhow!("{message}"),
         "TooManyRequestsException" | "LimitExceededException" => {
             anyhow!("too many attempts — wait a moment and try again")
         }
-        "" => anyhow!("cognito {operation} failed: {body}"),
-        other => anyhow!("cognito {operation} failed ({other}): {message}"),
+        _ => {
+            tracing::error!("cognito {operation} failed ({}): {message}", if kind.is_empty() { "no error type" } else { kind });
+            anyhow!(UNAVAILABLE)
+        }
     }
+}
+
+/// Whether a `NotAuthorizedException` is about the person's credentials. The
+/// pool's wordings for that are few and stable; anything else under this error
+/// type is about the app client.
+fn is_credentials_fault(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("incorrect username or password")
+        || m.contains("attempts exceeded")
+        || m.contains("user is disabled")
+        || m.contains("user does not exist")
+        || m.contains("invalid session")
+        || m.contains("access token")
 }
 
 /// `SECRET_HASH` = base64(HMAC-SHA256(client_secret, username + client_id)).
@@ -236,8 +309,52 @@ fn b64(input: &[u8]) -> String {
 /// Returns the account's Cognito subject — the stable id the `account` row is
 /// keyed to. An email can be changed; `sub` never is, which is why the row
 /// keys on it rather than on the address.
+/// Username and password against the pool, for callers that only need the
+/// subject and treat a pending second factor as "not signed in".
 pub async fn sign_in(email: &str, password: &str) -> Result<String> {
-    let pool = Pool::load()?;
+    match sign_in_full(email, password).await? {
+        SignIn::Done { sub, .. } => Ok(sub),
+        SignIn::MfaRequired { .. } => Err(anyhow!("this account needs its two-factor code to sign in")),
+    }
+}
+
+/// What a sign-in (or a challenge answer) produced.
+#[derive(Debug, Clone)]
+pub enum SignIn {
+    /// Tokens issued: the subject, and the access token the TOTP enrolment
+    /// calls act on (Cognito identifies a user for those by token, not name).
+    Done { sub: String, access_token: String },
+    /// The password was right and the pool wants a TOTP code. `session` is
+    /// opaque state to hand back with it; `username` is the name Cognito
+    /// echoed, which the answer has to use.
+    MfaRequired { session: String, username: String },
+}
+
+fn read_sign_in(parsed: Value, username: &str) -> Result<SignIn> {
+    if let Some(name) = parsed["ChallengeName"].as_str() {
+        if name == "SOFTWARE_TOKEN_MFA" {
+            return Ok(SignIn::MfaRequired {
+                session: parsed["Session"].as_str().unwrap_or_default().to_string(),
+                username: parsed["ChallengeParameters"]["USER_ID_FOR_SRP"].as_str().unwrap_or(username).to_string(),
+            });
+        }
+        // Any other challenge means a pool configured by hand: Huntwell makes
+        // users with permanent passwords, so nothing else should ever come up.
+        return Err(anyhow!("this account needs to finish {name} in Cognito before it can sign in"));
+    }
+    let id_token = parsed["AuthenticationResult"]["IdToken"].as_str().ok_or_else(|| anyhow!("cognito returned no id token"))?;
+    let sub = sub_from_id_token(id_token).ok_or_else(|| anyhow!("cognito's id token carried no sub"))?;
+    let access_token = parsed["AuthenticationResult"]["AccessToken"].as_str().unwrap_or_default().to_string();
+    Ok(SignIn::Done { sub, access_token })
+}
+
+/// Username and password against the pool — a sign-in, or a TOTP challenge.
+pub async fn sign_in_full(email: &str, password: &str) -> Result<SignIn> {
+    sign_in_full_in(PoolKind::Users, email, password).await
+}
+
+pub async fn sign_in_full_in(kind: PoolKind, email: &str, password: &str) -> Result<SignIn> {
+    let pool = Pool::load_kind(kind)?;
     let mut params = serde_json::Map::new();
     params.insert(String::from("USERNAME"), Value::String(email.to_string()));
     params.insert(String::from("PASSWORD"), Value::String(password.to_string()));
@@ -251,20 +368,71 @@ pub async fn sign_in(email: &str, password: &str) -> Result<String> {
             }),
         )
         .await?;
+    read_sign_in(parsed, email)
+}
 
-    // A challenge is not a sign-in. Huntwell creates users with a permanent
-    // password, so the only way to land here is a pool configured by hand —
-    // and treating a challenge as success would sign in someone who never
-    // finished authenticating.
-    if let Some(challenge) = parsed["ChallengeName"].as_str() {
-        return Err(anyhow!(
-            "this account needs to finish {challenge} in Cognito before it can sign in"
-        ));
+/// Answer the TOTP challenge `sign_in_full` raised.
+pub async fn respond_to_mfa(username: &str, code: &str, session: &str) -> Result<SignIn> {
+    let pool = Pool::load()?;
+    let mut responses = serde_json::Map::new();
+    responses.insert(String::from("USERNAME"), Value::String(username.to_string()));
+    responses.insert(String::from("SOFTWARE_TOKEN_MFA_CODE"), Value::String(code.to_string()));
+    let parsed = pool
+        .public_call(
+            "RespondToAuthChallenge",
+            json!({
+                "ClientId": pool.client_id,
+                "ChallengeName": "SOFTWARE_TOKEN_MFA",
+                "Session": session,
+                "ChallengeResponses": pool.auth_params(username, responses),
+            }),
+        )
+        .await?;
+    read_sign_in(parsed, username)
+}
+
+/// Start TOTP enrolment for the user this access token belongs to: the pool
+/// mints the secret, and it never touches this database. `public_call`, not
+/// `call`: the user's own token authenticates it, and signing it as well
+/// would make AWS want an IAM permission for something the platform
+/// credential is not doing.
+pub async fn associate_totp(access_token: &str) -> Result<String> {
+    let pool = Pool::load()?;
+    let v = pool.public_call("AssociateSoftwareToken", json!({ "AccessToken": access_token })).await?;
+    v["SecretCode"].as_str().map(String::from).ok_or_else(|| anyhow!("cognito returned no TOTP secret"))
+}
+
+/// Finish enrolment: prove the app is synchronised, then make TOTP the
+/// factor this account is challenged for. Both calls matter — the first
+/// alone leaves a factor that is never asked for.
+pub async fn confirm_totp(email: &str, access_token: &str, code: &str) -> Result<()> {
+    let pool = Pool::load()?;
+    let v = pool
+        .public_call(
+            "VerifySoftwareToken",
+            json!({ "AccessToken": access_token, "UserCode": code, "FriendlyDeviceName": "Huntwell" }),
+        )
+        .await?;
+    if v["Status"].as_str() != Some("SUCCESS") {
+        return Err(anyhow!("that code is not right — try the next one your app shows"));
     }
-    let id_token = parsed["AuthenticationResult"]["IdToken"]
-        .as_str()
-        .ok_or_else(|| anyhow!("cognito returned no id token"))?;
-    sub_from_id_token(id_token).ok_or_else(|| anyhow!("cognito's id token carried no sub"))
+    set_totp_enabled(email, true).await
+}
+
+/// Turn the software-token factor on or off for a user. Off is how an
+/// operator lets someone who lost their phone back in.
+pub async fn set_totp_enabled(email: &str, enabled: bool) -> Result<()> {
+    let pool = Pool::load()?;
+    pool.call(
+        "AdminSetUserMFAPreference",
+        json!({
+            "UserPoolId": pool.user_pool_id,
+            "Username": email,
+            "SoftwareTokenMfaSettings": { "Enabled": enabled, "PreferredMfa": enabled },
+        }),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// The `sub` claim, read without verifying the signature.
@@ -310,7 +478,11 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 /// NEW_PASSWORD_REQUIRED challenge the sign-in page has no screen for.
 /// `AdminSetUserPassword` with `Permanent` clears that.
 pub async fn create_user(email: &str, password: &str) -> Result<String> {
-    let pool = Pool::load()?;
+    create_user_in(PoolKind::Users, email, password).await
+}
+
+pub async fn create_user_in(kind: PoolKind, email: &str, password: &str) -> Result<String> {
+    let pool = Pool::load_kind(kind)?;
     let created = pool
         .call(
             "AdminCreateUser",
@@ -336,13 +508,29 @@ pub async fn create_user(email: &str, password: &str) -> Result<String> {
         .map(String::from)
         .ok_or_else(|| anyhow!("cognito did not return a sub for the new user"))?;
 
-    set_password(email, password).await?;
+    set_password_in(kind, email, password).await?;
     Ok(sub)
+}
+
+/// The subject of an existing user, by name.
+pub async fn subject_of(kind: PoolKind, email: &str) -> Result<String> {
+    let pool = Pool::load_kind(kind)?;
+    let user = pool.call("AdminGetUser", json!({ "UserPoolId": pool.user_pool_id, "Username": email })).await?;
+    user["UserAttributes"]
+        .as_array()
+        .and_then(|attrs| attrs.iter().find(|a| a["Name"] == "sub"))
+        .and_then(|a| a["Value"].as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("cognito returned no sub for {email}"))
 }
 
 /// Set (or reset) a password, permanently — no challenge on next sign-in.
 pub async fn set_password(email: &str, password: &str) -> Result<()> {
-    let pool = Pool::load()?;
+    set_password_in(PoolKind::Users, email, password).await
+}
+
+pub async fn set_password_in(kind: PoolKind, email: &str, password: &str) -> Result<()> {
+    let pool = Pool::load_kind(kind)?;
     pool.call(
         "AdminSetUserPassword",
         json!({
@@ -407,10 +595,28 @@ mod tests {
         assert_eq!(bad.to_string(), "invalid email or password");
         let missing = translate("InitiateAuth", r#"{"__type":"com.amazonaws.cognitoidp#UserNotFoundException","message":"x"}"#);
         assert_eq!(missing.to_string(), "invalid email or password");
+        // A broken app client arrives under the wrong-password error type. It
+        // must not read as a wrong password: the person would reset it forever.
+        for m in [
+            "Unable to verify secret hash for client 4abc",
+            "Client 4abc is configured with secret but SECRET_HASH was not received",
+        ] {
+            let e = translate("InitiateAuth", &format!(r#"{{"__type":"NotAuthorizedException","message":"{m}"}}"#));
+            assert_eq!(e.to_string(), UNAVAILABLE, "{m}");
+        }
+        let flow = translate("InitiateAuth", r#"{"__type":"InvalidParameterException","message":"USER_PASSWORD_AUTH flow not enabled for this client"}"#);
+        assert_eq!(flow.to_string(), UNAVAILABLE);
+        let locked = translate("InitiateAuth", r#"{"__type":"NotAuthorizedException","message":"Password attempts exceeded"}"#);
+        assert!(locked.to_string().starts_with("too many attempts"));
         let taken = translate("AdminCreateUser", r#"{"__type":"UsernameExistsException","message":"x"}"#);
         assert_eq!(taken.to_string(), "that email already has an account");
         // A policy rejection is the pool's own wording, which says what is wrong.
         let weak = translate("AdminSetUserPassword", r#"{"__type":"InvalidPasswordException","message":"Password does not conform to policy"}"#);
+        // AWS's own words name the account, the IAM user and the pool; none of
+        // that reaches a person at a sign-up form.
+        let denied = translate("AdminCreateUser", r#"{"__type":"AccessDeniedException","Message":"User: arn:aws:iam::123:user/x is not authorized to perform: cognito-idp:AdminCreateUser on resource: arn:aws:cognito-idp:us-east-1:123:userpool/us-east-1_abc"}"#);
+        assert_eq!(denied.to_string(), UNAVAILABLE);
+        assert!(!denied.to_string().contains("arn:"));
         assert_eq!(weak.to_string(), "Password does not conform to policy");
     }
 

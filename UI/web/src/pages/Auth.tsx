@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { api, AuthConfig } from '../api'
 import { useAuth } from '../auth'
 import { Field } from '../components/ui'
+import { ArtBackdrop } from '../components/ArtBackdrop'
 
 declare global {
   interface Window {
@@ -98,13 +99,14 @@ function Turnstile({ siteKey, onToken, resetKey }: { siteKey: string; onToken: (
 function Shell({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="auth">
+      <ArtBackdrop />
       <div className="card raised">
-        <div className="brand" style={{ color: 'var(--text)', padding: '0 0 1rem' }}>
+        <Link to="/" className="brand" aria-label="Huntwell home" style={{ color: 'var(--text)', padding: '0 0 1rem', textDecoration: 'none', width: 'fit-content' }}>
           <span className="grad-text" aria-hidden>
             ✦
           </span>
           <span className="word">huntwell</span>
-        </div>
+        </Link>
         <h1>{title}</h1>
         {children}
       </div>
@@ -124,12 +126,19 @@ export function Login() {
   const [token, setToken] = useState('')
   const [resetKey, setResetKey] = useState(0)
   const needsChallenge = !!cfg?.turnstile_site_key
+  // Set when the password was right and the account wants its second factor.
+  const [mfa, setMfa] = useState<{ challenge: string; email: string } | null>(null)
+  const [code, setCode] = useState('')
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
     setErr('')
     try {
-      await api.post('/api/auth/login', { email, password, turnstile_token: token })
+      const r = await api.post<{ mfa_required?: boolean; challenge?: string; email?: string }>('/api/auth/login', { email, password, turnstile_token: token })
+      if (r.mfa_required && r.challenge) {
+        setMfa({ challenge: r.challenge, email: r.email || email })
+        return
+      }
       await refresh()
       nav(loc.state?.from || '/app', { replace: true })
     } catch (e: any) {
@@ -139,6 +148,56 @@ export function Login() {
     } finally {
       setBusy(false)
     }
+  }
+  const submitCode = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!mfa) return
+    setBusy(true)
+    setErr('')
+    try {
+      await api.post('/api/auth/mfa', { email: mfa.email, challenge: mfa.challenge, code })
+      await refresh()
+      nav(loc.state?.from || '/app', { replace: true })
+    } catch (e: any) {
+      setErr(e.message)
+      // A challenge is single-use: a wrong code means the password again.
+      setMfa(null)
+      setCode('')
+      setPassword('')
+    } finally {
+      setBusy(false)
+    }
+  }
+  if (mfa) {
+    return (
+      <Shell title="Two-factor code">
+        <p>
+          Enter the six-digit code from your authenticator app for <b>{mfa.email}</b>.
+        </p>
+        <form onSubmit={submitCode}>
+          {err && <div className="error">{err}</div>}
+          <Field label="Code">
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              pattern="[0-9 ]*"
+              maxLength={7}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              autoFocus
+              style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: '1.4rem', letterSpacing: '0.25em' }}
+            />
+          </Field>
+          <button className="btn primary" disabled={busy || code.replace(/\D/g, '').length !== 6} style={{ width: '100%' }}>
+            {busy ? 'Checking…' : 'Sign in'}
+          </button>
+        </form>
+        <p className="muted" style={{ marginTop: '1rem' }}>
+          Lost your device? Ask an operator to reset two-factor for your account.
+        </p>
+      </Shell>
+    )
   }
   return (
     <Shell title="Welcome back">
@@ -156,7 +215,7 @@ export function Login() {
         </button>
       </form>
       <p className="muted" style={{ marginTop: '1rem' }}>
-        New here? <Link to="/signup">Create an account</Link>
+        New here? <Link to="/signup">Create an account</Link> · <Link to="/forgot">Forgot your password?</Link>
       </p>
     </Shell>
   )
@@ -199,8 +258,8 @@ export function Signup() {
         <Field label="Email">
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
         </Field>
-        <Field label="Password" hint="At least 10 characters.">
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={10} />
+        <Field label="Password" hint="At least 12 characters, with upper and lower case and a digit.">
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={12} />
         </Field>
         {cfg?.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
         <button className="btn primary" disabled={busy || !cfg || (needsChallenge && !token)} style={{ width: '100%' }}>
@@ -229,10 +288,12 @@ export function CheckEmail() {
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
+  // Once the address is confirmed, one more optional step: an authenticator.
+  const [offerMfa, setOfferMfa] = useState(false)
   useEffect(() => {
     if (!loading && !me) nav('/login', { replace: true })
-    if (me?.email_verified) nav('/app', { replace: true })
-  }, [me, loading, nav])
+    if (me?.email_verified && !offerMfa) nav('/app', { replace: true })
+  }, [me, loading, nav, offerMfa])
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
@@ -240,8 +301,8 @@ export function CheckEmail() {
     setNote('')
     try {
       await api.post('/api/auth/verify', { code })
+      setOfferMfa(true)
       await refresh()
-      nav('/app', { replace: true })
     } catch (e: any) {
       setErr(e.message)
       setCode('')
@@ -269,6 +330,17 @@ export function CheckEmail() {
     nav('/login', { replace: true })
   }
   const digits = code.replace(/\D/g, '')
+  if (offerMfa) {
+    return (
+      <Shell title="Email confirmed">
+        <MfaSetup
+          intro="Optional, but a good idea: an authenticator app makes your account safe even if your password leaks."
+          onDone={() => nav('/app', { replace: true })}
+          skipLabel="Skip for now"
+        />
+      </Shell>
+    )
+  }
   return (
     <Shell title="Check your email">
       <p>
@@ -306,5 +378,225 @@ export function CheckEmail() {
         and sign up again.
       </p>
     </Shell>
+  )
+}
+
+/// Forgot password, in two steps on one page: the address, then the code
+/// from the email plus a new password. The first step answers the same
+/// whether the address has an account, so the page cannot be used to find out.
+export function Forgot() {
+  const nav = useNavigate()
+  const cfg = useAuthConfig()
+  const [step, setStep] = useState<'email' | 'code' | 'done'>('email')
+  const [email, setEmail] = useState('')
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [token, setToken] = useState('')
+  const [resetKey, setResetKey] = useState(0)
+  const needsChallenge = !!cfg?.turnstile_site_key
+  const send = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    setErr('')
+    try {
+      await api.post('/api/auth/forgot', { email, turnstile_token: token })
+      setStep('code')
+    } catch (e: any) {
+      setErr(e.message)
+      if (needsChallenge) setResetKey((k) => k + 1)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const finish = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    setErr('')
+    try {
+      await api.post('/api/auth/reset', { email, code, password })
+      setStep('done')
+    } catch (e: any) {
+      setErr(e.message)
+      if (e.status === 410) setStep('email')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const digits = code.replace(/\D/g, '')
+  if (step === 'done') {
+    return (
+      <Shell title="Password changed">
+        <p>Your password is updated and every other session was signed out.</p>
+        <button className="btn primary" onClick={() => nav('/login', { replace: true })} style={{ width: '100%' }}>
+          Sign in
+        </button>
+      </Shell>
+    )
+  }
+  if (step === 'code') {
+    return (
+      <Shell title="Check your email">
+        <p>
+          If <b>{email}</b> has an account, a six-digit code is on its way. Enter it with your new password.
+        </p>
+        <form onSubmit={finish}>
+          {err && <div className="error">{err}</div>}
+          <Field label="Code" hint="It expires in 15 minutes.">
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              pattern="[0-9 ]*"
+              maxLength={7}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              autoFocus
+              style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: '1.4rem', letterSpacing: '0.25em' }}
+            />
+          </Field>
+          <Field label="New password" hint="At least 12 characters, with upper and lower case and a digit.">
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={12} />
+          </Field>
+          <button className="btn primary" disabled={busy || digits.length !== 6 || password.length < 12} style={{ width: '100%' }}>
+            {busy ? 'Saving…' : 'Set new password'}
+          </button>
+        </form>
+        <p className="muted" style={{ marginTop: '1rem' }}>
+          Didn't get it?{' '}
+          <a href="#" onClick={(e) => { e.preventDefault(); setStep('email'); setCode('') }}>
+            Send another code
+          </a>
+        </p>
+      </Shell>
+    )
+  }
+  return (
+    <Shell title="Reset your password">
+      <p>Enter the address you signed up with and we'll email you a code.</p>
+      <form onSubmit={send}>
+        {err && <div className="error">{err}</div>}
+        <Field label="Email">
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus autoComplete="email" required />
+        </Field>
+        {cfg?.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
+        <button className="btn primary" disabled={busy || !cfg || (needsChallenge && !token)} style={{ width: '100%' }}>
+          {busy ? 'Sending…' : 'Send code'}
+        </button>
+      </form>
+      <p className="muted" style={{ marginTop: '1rem' }}>
+        Remembered it? <Link to="/login">Sign in</Link>
+      </p>
+    </Shell>
+  )
+}
+
+/// Two-factor setup: the QR (and the secret as text), then a code from the
+/// app to prove it took. Used on sign-up and from Settings; `askPassword`
+/// is for Settings, where the sign-in may be an hour old.
+export function MfaSetup({ intro, onDone, skipLabel, askPassword }: { intro: string; onDone: () => void; skipLabel?: string; askPassword?: boolean }) {
+  const { refresh } = useAuth()
+  const [enrol, setEnrol] = useState<{ secret: string; uri: string; qr_svg: string } | null>(null)
+  const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  // Setup acts on a recent sign-in. When the server has none at hand it says
+  // so (428) and this becomes a password prompt — never a dead end.
+  const [needPw, setNeedPw] = useState(!!askPassword)
+  const start = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      setEnrol(await api.post('/api/auth/mfa/setup', { password }))
+    } catch (e: any) {
+      if (e.status === 428) {
+        setNeedPw(true)
+        setErr('')
+      } else {
+        setErr(e.message)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+  const confirm = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    setErr('')
+    try {
+      await api.post('/api/auth/mfa/confirm', { code })
+      await refresh()
+      onDone()
+    } catch (e: any) {
+      setErr(e.message)
+      setCode('')
+    } finally {
+      setBusy(false)
+    }
+  }
+  if (!enrol) {
+    return (
+      <div>
+        <p>{intro}</p>
+        {err && <div className="error">{err}</div>}
+        {needPw && (
+          <Field label="Your password" hint="To confirm it's you before adding a second factor.">
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && password) start() }}
+              autoComplete="current-password"
+              autoFocus
+            />
+          </Field>
+        )}
+        <div className="row" style={{ gap: '0.6rem' }}>
+          <button className="btn primary" onClick={start} disabled={busy || (needPw && !password)}>
+            {busy ? 'Starting…' : 'Set up an authenticator'}
+          </button>
+          {skipLabel && (
+            <button className="btn" onClick={onDone} disabled={busy}>
+              {skipLabel}
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <form onSubmit={confirm}>
+      <p>Scan this with Google Authenticator, 1Password, Authy or any TOTP app, then enter the code it shows.</p>
+      <div style={{ width: 200, margin: '0.6rem 0' }} dangerouslySetInnerHTML={{ __html: enrol.qr_svg }} />
+      <p className="muted sm" style={{ wordBreak: 'break-all' }}>
+        Can't scan? Enter this key by hand: <code>{enrol.secret}</code>
+      </p>
+      {err && <div className="error">{err}</div>}
+      <Field label="Code from the app">
+        <input
+          type="text"
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          pattern="[0-9 ]*"
+          maxLength={7}
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          autoFocus
+          style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: '1.4rem', letterSpacing: '0.25em' }}
+        />
+      </Field>
+      <div className="row" style={{ gap: '0.6rem' }}>
+        <button className="btn primary" disabled={busy || code.replace(/\D/g, '').length !== 6}>
+          {busy ? 'Checking…' : 'Turn on two-factor'}
+        </button>
+        {skipLabel && (
+          <button type="button" className="btn" onClick={onDone} disabled={busy}>
+            {skipLabel}
+          </button>
+        )}
+      </div>
+    </form>
   )
 }

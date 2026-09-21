@@ -118,12 +118,12 @@ pub fn credentials(get: impl Fn(&str) -> Option<String>) -> Option<Credentials> 
     })
 }
 
-/// Credentials for acting on one service: `AWS_SES_KEY` / `AWS_SES_SECRET`,
+/// Credentials for acting on one service: `AWS_COGNITO_KEY` / `AWS_COGNITO_SECRET`,
 /// `AWS_S3_KEY` / `AWS_S3_SECRET`, and so on.
 ///
 /// **The bootstrap credential is deliberately not accepted here.** That one
 /// exists to read Secrets Manager and should be able to do nothing else; if it
-/// were a silent fallback, an install with no SES key would quietly send mail
+/// were a silent fallback, an install with no Cognito key would quietly manage users
 /// with a credential scoped to secrets — and the day someone narrows that
 /// credential correctly, mail would break somewhere unrelated.
 ///
@@ -276,127 +276,6 @@ pub fn parse_settings(raw: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// SES
-// ---------------------------------------------------------------------------
-
-/// Is SES configured well enough to try?
-///
-/// Both halves: a From address SES has verified, and a credential scoped to
-/// sending. Either alone is a misconfiguration that would fail per message.
-pub fn ses_configured() -> bool {
-    crate::config::get("HUNTWELL_MAIL_FROM").map(|v| !v.trim().is_empty()).unwrap_or(false)
-        && has_service_credentials("SES")
-}
-
-fn ses_region() -> String {
-    crate::config::get("HUNTWELL_SES_REGION")
-        .or_else(|| crate::config::get("AWS_REGION"))
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "us-east-1".into())
-}
-
-/// Send one message through SES v2. Returns the SES message id.
-pub async fn ses_send(to: &str, from: &str, subject: &str, html: &str, text: &str) -> Result<String> {
-    let region = ses_region();
-    let creds = service_credentials("SES", &region)?;
-    let path = "/v2/email/outbound-emails";
-    // An endpoint override for a VPC endpoint, or a stand-in under test.
-    let (host, url) = match crate::config::get("HUNTWELL_SES_ENDPOINT") {
-        Some(e) if !e.trim().is_empty() => {
-            let e = e.trim().trim_end_matches('/').to_string();
-            let h = e.split("://").nth(1).unwrap_or(&e).split('/').next().unwrap_or("").to_string();
-            (h, format!("{e}{path}"))
-        }
-        _ => {
-            let h = format!("email.{region}.amazonaws.com");
-            let u = format!("https://{h}{path}");
-            (h, u)
-        }
-    };
-
-    // SES v2 is a REST-JSON API: the operation is the path, the body is the
-    // message. Text and HTML both, so a client that refuses HTML still reads it.
-    let mut content = serde_json::json!({
-        "Simple": {
-            "Subject": { "Data": subject, "Charset": "UTF-8" },
-            "Body": {
-                "Html": { "Data": html, "Charset": "UTF-8" },
-                "Text": { "Data": text, "Charset": "UTF-8" }
-            }
-        }
-    });
-    if text.trim().is_empty() {
-        content["Simple"]["Body"].as_object_mut().map(|b| b.remove("Text"));
-    }
-    let mut payload = serde_json::json!({
-        "FromEmailAddress": from,
-        "Destination": { "ToAddresses": [to] },
-        "Content": content,
-    });
-    if let Some(set) = crate::config::get("HUNTWELL_SES_CONFIGURATION_SET").filter(|v| !v.trim().is_empty()) {
-        payload["ConfigurationSetName"] = serde_json::Value::String(set);
-    }
-    let body = payload.to_string();
-    let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
-
-    let now = Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_stamp = now.format("%Y%m%d").to_string();
-
-    let mut headers: Vec<(&str, String)> = vec![
-        ("content-type", "application/json".to_string()),
-        ("host", host.clone()),
-        ("x-amz-date", amz_date.clone()),
-    ];
-    if let Some(t) = &creds.session_token {
-        headers.push(("x-amz-security-token", t.clone()));
-    }
-    headers.sort_by(|a, b| a.0.cmp(b.0));
-    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-    let signed_headers = headers.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
-
-    let auth = authorization(Signed {
-        method: "POST",
-        canonical_uri: path,
-        canonical_query: "",
-        host: &host,
-        canonical_headers: &canonical_headers,
-        signed_headers: &signed_headers,
-        amz_date: &amz_date,
-        date_stamp: &date_stamp,
-        region: &region,
-        service: "ses",
-        payload_hash: &payload_hash,
-        access_key: &creds.access_key,
-        secret_key: &creds.secret_key,
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .context("build the SES client")?;
-    let mut req = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("x-amz-date", &amz_date)
-        .header("authorization", auth)
-        .body(body);
-    if let Some(t) = &creds.session_token {
-        req = req.header("x-amz-security-token", t);
-    }
-
-    let res = req.send().await.context("call SES")?;
-    let status = res.status();
-    let text_body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        // The body names the cause — an unverified From address and a throttle
-        // look identical as a bare status.
-        return Err(anyhow!("SES returned {status}: {}", text_body.trim()));
-    }
-    let v: serde_json::Value = serde_json::from_str(&text_body).unwrap_or_default();
-    Ok(v.get("MessageId").and_then(|m| m.as_str()).unwrap_or("").to_string())
-}
 
 // ---------------------------------------------------------------------------
 // Connection strings, assembled from parts
@@ -620,7 +499,7 @@ mod tests {
     #[test]
     fn a_service_credential_never_falls_back_to_the_bootstrap_one() {
         // The property that makes scoping real: with only the bootstrap keys
-        // present, asking for SES must fail — not quietly send mail with the
+        // present, asking for a service must fail — not quietly act with the
         // credential that reads secrets.
         let src = |pairs: Vec<(&str, &str)>| {
             let m: std::collections::HashMap<String, String> =
@@ -632,19 +511,19 @@ mod tests {
             ("AWS_ACCESS_KEY_ID", "BOOTSTRAP"),
             ("AWS_SECRET_ACCESS_KEY", "BOOTSTRAP"),
         ]);
-        assert!(!has_service_credentials_in("SES", &bootstrap_only));
+        assert!(!has_service_credentials_in("COGNITO", &bootstrap_only));
         // Matched rather than `unwrap_err`, which would need Debug on
         // Credentials — and a derived Debug on a struct holding a secret key is
         // how the key reaches a log line.
-        let e = match service_credentials_from("SES", "us-east-1", &bootstrap_only) {
-            Ok(_) => panic!("SES must not borrow the bootstrap credential"),
+        let e = match service_credentials_from("COGNITO", "us-east-1", &bootstrap_only) {
+            Ok(_) => panic!("COGNITO must not borrow the bootstrap credential"),
             Err(e) => e.to_string(),
         };
-        assert!(e.contains("AWS_SES_KEY"), "the error should name what is missing: {e}");
+        assert!(e.contains("AWS_COGNITO_KEY"), "the error should name what is missing: {e}");
 
-        let scoped = src(vec![("AWS_SES_KEY", "SESKEY"), ("AWS_SES_SECRET", "SESSECRET")]);
-        assert!(has_service_credentials_in("SES", &scoped));
-        let c = service_credentials_from("SES", "eu-west-1", &scoped).unwrap();
+        let scoped = src(vec![("AWS_COGNITO_KEY", "SESKEY"), ("AWS_COGNITO_SECRET", "SESSECRET")]);
+        assert!(has_service_credentials_in("COGNITO", &scoped));
+        let c = service_credentials_from("COGNITO", "eu-west-1", &scoped).unwrap();
         assert_eq!(c.access_key, "SESKEY");
         assert_eq!(c.region, "eu-west-1");
     }

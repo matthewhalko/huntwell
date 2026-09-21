@@ -53,11 +53,12 @@ pub const VM_CHECK_FRESH_SECS: i64 = 60;
 
 /// One sighting of a service instance, and how long it stands for.
 ///
-/// Two sources report at different rhythms. A process on the bus heartbeats
+/// Three sources report at different rhythms. A process on the bus heartbeats
 /// every few seconds; a service inside a VM is seen only when the reconcile
-/// asks systemd, every 20. Judging both by one window would either call VM
-/// services stale between checks or let a dead bus process look alive for a
-/// minute — so each sighting carries its own.
+/// asks systemd, every 20; this control plane writes its own ping because it
+/// is not on the app VM's loopback bus. Judging those by one window would
+/// either call VM services stale between checks or let a dead bus process
+/// look alive for a minute — so each sighting carries its own.
 #[derive(Debug, Clone, Copy)]
 pub struct Ping {
     pub at: chrono::DateTime<chrono::Utc>,
@@ -150,13 +151,37 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
         Err(e) => tracing::warn!("could not read the database: {e:#}"),
     }
 
-    // Seeding from settings is still honoured, because a deployment that
-    // already sets these should not break. It is no longer the only way in.
+    // Operators sign in through their own Cognito pool. Without one there is
+    // nothing to sign in to, so say so now rather than at the login form.
+    if !crate::cognito::admin_configured() {
+        anyhow::bail!(
+            "no operators' Cognito pool is configured — add ADMIN_COGNITO_USER_POOL_ID, ADMIN_COGNITO_CLIENT_ID \
+             (and ADMIN_COGNITO_CLIENT_SECRET, ADMIN_COGNITO_REGION) beside the AWS_COGNITO_* credential (docs/SECRETS.md)"
+        );
+    }
+
+    // Seeding from settings is still honoured (dev.sh writes these), so a
+    // checkout has an operator without claiming. The operator is made in the
+    // pool — or, if already there, has this password set — and recorded.
     match (crate::config::get("HUNTWELL_ADMIN_EMAIL"), crate::config::get("HUNTWELL_ADMIN_PASSWORD")) {
         (Some(email), Some(pass)) if !email.trim().is_empty() && !pass.trim().is_empty() => {
-            let hash = crate::web::auth::hash_password(&pass)?;
-            crate::store::upsert_admin_user(&db, &email, &hash).await?;
-            tracing::info!("admin operator seeded from settings: {email}");
+            use crate::cognito::{self, PoolKind};
+            let email = email.trim().to_lowercase();
+            let sub = match cognito::create_user_in(PoolKind::Admins, &email, &pass).await {
+                Ok(sub) => Ok(sub),
+                Err(e) if e.to_string().contains("already has an account") => {
+                    cognito::set_password_in(PoolKind::Admins, &email, &pass).await?;
+                    cognito::subject_of(PoolKind::Admins, &email).await
+                }
+                Err(e) => Err(e),
+            };
+            match sub {
+                Ok(sub) => {
+                    crate::store::upsert_admin_user(&db, &email, &sub).await?;
+                    tracing::info!("admin operator seeded from settings: {email}");
+                }
+                Err(e) => tracing::error!("could not seed the operator {email} in the operators' pool: {e:#}"),
+            }
         }
         _ => {}
     }
@@ -222,6 +247,7 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
 
     hosts::spawn_reconcile(state.clone());
     placement::spawn(state.clone());
+    spawn_self_ping(state.clone());
     spawn_heartbeat_listener(state.clone());
 
     let app = api::router(state);
@@ -229,6 +255,22 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     tracing::info!("admin control plane on http://{addr}");
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+/// This process is the admin service. Mark it present here rather than
+/// waiting for a bus beat it will never hear — NATS is loopback inside the
+/// app VM, and the dashboard itself is the proof the control plane is up.
+fn spawn_self_ping(state: Admin) {
+    tokio::spawn(async move {
+        let instance = crate::bus::instance_id();
+        loop {
+            state.pings.lock().await.insert(
+                ("admin".into(), instance.clone()),
+                Ping { at: chrono::Utc::now(), fresh_for: STALE_AFTER_SECS },
+            );
+            tokio::time::sleep(crate::bus::HEARTBEAT_EVERY).await;
+        }
+    });
 }
 
 /// Keep last-ping in memory. Heartbeats are ephemeral: a restart of this

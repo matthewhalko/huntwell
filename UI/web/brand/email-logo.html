@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- The logo lockup for email, as a page: the topbar's own markup (the ✦ in
+     the brand gradient + the "huntwell" wordmark in Lato 900, white, exactly
+     as .topbar-brand draws it), on a transparent ground so it sits on the
+     email's plum header. Email clients cannot do gradient text and Gmail
+     drops web fonts, so the lockup ships as an image rendered by the browser:
+
+       chrome --headless=new --hide-scrollbars --window-size=640,160 \
+         --force-device-scale-factor=1 --default-background-color=00000000 \
+         --virtual-time-budget=4000 --screenshot=email-logo.png file://$PWD/email-logo.html
+       cp email-logo.png ../public/email/logo.png ; cp email-logo.png ../../../cmd/assets/email-logo.png
+
+     Drawn at 4x (the email shows it 160x40), so it is sharp on any display. -->
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--brand-sky:#36c5f0;--brand-green:#2eb67d;--brand-yellow:#ecb22e;--brand-pink:#e01e5a;
+  --grad:linear-gradient(120deg,var(--brand-sky),var(--brand-green) 38%,var(--brand-yellow) 66%,var(--brand-pink));
+  --display:'Lato',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+html,body{margin:0;width:640px;height:160px;overflow:hidden;background:transparent}
+/* .topbar-brand at 4x: font-size 1.32rem (21.12px) -> 84.48px, gap .3rem -> 19.2px */
+.brand{height:160px;display:flex;align-items:center;gap:19.2px;color:#fff;font-family:var(--display);font-weight:900;
+  font-size:84.48px;letter-spacing:-0.02em;line-height:1}
+.spark{font-size:1.2em;line-height:1;display:inline-block;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+</style></head><body><div class="brand"><span class="spark">✦</span><span>huntwell</span></div></body></html>

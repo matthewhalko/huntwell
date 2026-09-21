@@ -206,6 +206,10 @@ export default function Dashboard() {
         setNeedCard(true)
         return
       }
+      if (b.has_credits === false) {
+        nav('/app/usage', { state: { needCredits: true, icp } })
+        return
+      }
     } catch {
       // Billing unreachable is not a reason to block the attempt; the server
       // gate is the one that counts.

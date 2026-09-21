@@ -11,12 +11,13 @@ export default function Usage() {
   const [cardBusy, setCardBusy] = useState(false)
   const [adding, setAdding] = useState(false)
   const [params, setParams] = useSearchParams()
-  const loc = useLocation() as { state?: { needCard?: boolean; icp?: string } }
+  const loc = useLocation() as { state?: { needCard?: boolean; needCredits?: boolean; icp?: string } }
   const nav = useNavigate()
   const toast = useToast()
   // Sent here by "Go now" with nothing to bill: say so, and keep the prompt so
   // the trip back to Home is one click and no retyping.
   const needCard = !!loc.state?.needCard
+  const needCredits = !!loc.state?.needCredits
   const parkedIcp = loc.state?.icp || ''
 
   const load = async () => {
@@ -43,9 +44,33 @@ export default function Usage() {
       setCardBusy(false)
     }
   }
-  const topup = async () => {
-    await api.post('/api/usage/topup', { usd: 25 })
-    load()
+  const PACKS = [10, 25, 50, 100]
+  const [buying, setBuying] = useState<number | null>(null)
+  const buy = async (usd: number) => {
+    if (!billing?.has_card) {
+      setAdding(true)
+      return
+    }
+    setBuying(usd)
+    try {
+      const purchase_id =
+        globalThis.crypto?.randomUUID?.() ||
+        `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
+      const r = await api.post<{ requires_action?: boolean; credits_usd?: number }>('/api/billing/credits', {
+        usd,
+        purchase_id,
+      })
+      if (r.requires_action) {
+        toast('That card needs another check — remove it and add it again, then retry.', true)
+        return
+      }
+      await load()
+      toast(`Added $${usd} in credits`)
+    } catch (e: any) {
+      toast(e.message || 'Could not buy credits', true)
+    } finally {
+      setBuying(null)
+    }
   }
   useEffect(() => {
     load()
@@ -81,16 +106,18 @@ export default function Usage() {
       <div className="page-head">
         <div>
           <h1>Usage &amp; activity</h1>
-          <div className="sub">Your token spend this month and what your search plans have found.</div>
+          <div className="sub">Prepaid credits, live token spend, and what your search plans have found.</div>
         </div>
       </div>
 
-      {needCard && !billing?.has_card && (
+      {(needCard || needCredits) && (
         <div className="card" style={{ marginBottom: '1.4rem', borderColor: 'var(--warn)' }}>
-          <h3 style={{ margin: 0 }}>Add a card to start hunting</h3>
+          <h3 style={{ margin: 0 }}>{needCard && !billing?.has_card ? 'Add a card to start hunting' : 'Buy credits to start hunting'}</h3>
           <p className="muted" style={{ margin: '0.35rem 0 0' }}>
-            Executions cost money, so we need a payment method before the first one.
-            {parkedIcp && ' Your search is saved — add a card and we will take you back to it.'}
+            {needCard && !billing?.has_card
+              ? 'Executions cost money, so we need a payment method and prepaid credits before the first one.'
+              : 'A card is on file, but there are no prepaid credits left. Buy some below — a run cannot spend past what you have purchased.'}
+            {parkedIcp && ' Your search is saved — we will take you back to it.'}
           </p>
         </div>
       )}
@@ -117,10 +144,14 @@ export default function Usage() {
         ) : (
           <p className="muted" style={{ margin: '0.35rem 0 0' }}>
             No card on file — runs are paused until one is added.
-            {billing && !billing.stripe && ' Stripe is not configured here, so this will attach a test card.'}
+            {billing?.production && !billing.stripe
+              ? ' Stripe is not configured on this server, so a card cannot be added yet.'
+              : billing && !billing.stripe
+                ? ' Stripe is not configured here, so this will attach a test card.'
+                : ''}
           </p>
         )}
-        {billing?.has_card && parkedIcp && (
+        {billing?.has_card && (billing.has_credits || (usage && usage.credits_usd > 0)) && parkedIcp && (
           <button className="btn primary" style={{ marginTop: '0.9rem' }} onClick={() => nav('/app', { state: { icp: parkedIcp } })}>
             Back to your search →
           </button>
@@ -139,27 +170,27 @@ export default function Usage() {
       )}
 
       {usage && (() => {
-        const pct = usage.available_usd > 0 ? Math.min(100, (usage.used_usd / usage.available_usd) * 100) : 0
-        const over = usage.remaining_usd <= 0
-        const color = over ? 'var(--bad)' : pct >= 80 ? 'var(--warn)' : 'var(--accent)'
+        const credits = usage.credits_usd ?? usage.remaining_usd
+        const empty = credits <= 0
         return (
           <div className="card" style={{ marginBottom: '1.4rem' }}>
             <div className="row between" style={{ marginBottom: '0.5rem' }}>
-              <h3 style={{ margin: 0 }}>Usage this month</h3>
-              <span className="muted">
-                {usd(usage.used_usd)} / {usd(usage.available_usd)} · {fmtTokens(usage.tokens_used)} tokens
+              <h3 style={{ margin: 0 }}>Prepaid credits</h3>
+              <span className={empty ? 'danger' : 'muted'}>
+                {usd(credits)} available · {fmtTokens(usage.tokens_used)} tokens this period
               </span>
             </div>
-            <div className="meter">
-              <div className="meter-fill" style={{ width: `${pct}%`, background: color }} />
-            </div>
-            <div className="row between" style={{ marginTop: '0.5rem' }}>
-              <span className={over ? 'danger' : 'muted'}>
-                {over ? 'Limit reached — runs are paused until you add credit.' : `${usd(usage.remaining_usd)} left this month`}
-              </span>
-              <button className="btn" onClick={topup}>
-                Add $25
-              </button>
+            <p className="muted" style={{ margin: '0 0 0.7rem' }}>
+              {empty
+                ? 'No credits left — runs are paused until you buy more. A running job stops the moment this hits zero.'
+                : `${usd(usage.used_usd)} spent this period. Credits are purchased in advance and cannot go below zero.`}
+            </p>
+            <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
+              {PACKS.map((n) => (
+                <button key={n} className="btn" disabled={buying !== null} onClick={() => buy(n)}>
+                  {buying === n ? 'Buying…' : `Buy $${n}`}
+                </button>
+              ))}
             </div>
           </div>
         )

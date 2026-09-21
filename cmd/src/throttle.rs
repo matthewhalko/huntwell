@@ -91,12 +91,19 @@ impl Limiter {
 /// and argon2 already makes each guess cost.
 pub static LOGIN_FAILURES: Limiter = Limiter::new(10, 15 * 60, 15 * 60);
 
-/// Accounts created from one address: five an hour.
-pub static SIGNUPS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
+/// Accounts actually created from one address: ten an hour, then a ten-minute
+/// pause. Counted on success only — a typo'd password or a refused Turnstile
+/// token is not an account, and Turnstile is what keeps a script from making
+/// ten. An office or a household shares one address, hence ten, not three.
+pub static SIGNUPS: Limiter = Limiter::new(10, 60 * 60, 10 * 60);
 
 /// Invitations sent by one account: thirty a day. Each is an email from this
 /// domain with the sender's own words in it.
 pub static INVITES: Limiter = Limiter::new(30, 24 * 60 * 60, 24 * 60 * 60);
+
+/// Password-reset codes asked for from one address: five an hour. Each is an
+/// email to whatever address was typed, so it is bounded like invitations.
+pub static RESET_REQUESTS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
 
 /// Verification emails re-sent by one account: five an hour.
 pub static VERIFY_RESENDS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);

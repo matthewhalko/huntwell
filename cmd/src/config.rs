@@ -75,6 +75,8 @@ fn settable(key: &str) -> bool {
     (key.starts_with("HUNTWELL_")
         && key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
         || key == "CURSOR_API_KEY"
+        // Outbound mail (mail.rs).
+        || key == "RESEND_API_KEY"
         // The bootstrap credentials: the sealed `global` holds these and
         // nothing else, and they are what opens Secrets Manager. Named
         // individually rather than allowing all of AWS_* — the point of this
@@ -105,6 +107,7 @@ fn settable(key: &str) -> bool {
         // touches — this is so a dev box can point at a pool by editing one
         // file, and so a missing entry is not silently ignored.
         || key.starts_with("COGNITO_")
+        || key.starts_with("ADMIN_COGNITO_")
         // A host's Cloudflare tunnel edge (cloudflare.rs).
         || key.starts_with("CLOUDFLARE_")
         // The bot check on sign-up and sign-in (turnstile.rs).
@@ -455,6 +458,25 @@ pub fn is_dev() -> bool {
     matches!(std::env::var("HUNTWELL_DEV").as_deref(), Ok("1") | Ok("true"))
 }
 
+/// True when this process is serving real customers. Mock cards and free
+/// credit grants are refused here — Stripe has to be the source of both.
+pub fn is_production() -> bool {
+    production_from(get("HUNTWELL_ENV").as_deref(), crate::genesis::embedded_variant() == "prod", is_dev())
+}
+
+/// Split out so the production decision can be tested without touching the
+/// process environment.
+pub fn production_from(env: Option<&str>, release: bool, dev: bool) -> bool {
+    if dev {
+        return false;
+    }
+    match env.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "production" | "prod" => true,
+        "local" | "dev" | "development" => false,
+        _ => release,
+    }
+}
+
 /// What we charge the customer per million billable (input + output) tokens, in
 /// US dollars. Set above Cursor's own per-token cost to make margin; the run's
 /// recorded Cursor COGS shows the spread. Defaults to $5.00 per Mtoken.
@@ -526,8 +548,18 @@ mod tests {
     }
 
     #[test]
+    fn production_is_said_out_loud_or_is_the_release_build() {
+        assert!(production_from(Some("production"), false, false));
+        assert!(production_from(Some("prod"), false, false));
+        assert!(!production_from(Some("local"), true, false));
+        assert!(!production_from(None, true, true), "--dev never counts as production");
+        assert!(production_from(None, true, false), "a silent release build is production");
+        assert!(!production_from(None, false, false), "a silent debug build is local");
+    }
+
+    #[test]
     fn credentials_are_recognised_so_the_setting_table_refuses_them() {
-        for cred in ["KEY", "SECRET", "AWS_COGNITO_SECRET", "AWS_SES_KEY", "CURSOR_API_KEY", "BROWSERBASE_API_KEY",
+        for cred in ["KEY", "SECRET", "AWS_COGNITO_SECRET", "RESEND_API_KEY", "CURSOR_API_KEY", "BROWSERBASE_API_KEY",
                      "HUNTWELL_SESSION_SECRET", "HUNTWELL_DATABASE_URL", "HUNTWELL_POOL_DATABASE_URL",
                      "HUNTWELL_PG_PASSWORD", "HUNTWELL_PG_HOST", "POOL_PG_HOST", "STRIPE_WEBHOOK_SECRET", "SOME_TOKEN"] {
             assert!(is_credential_name(cred), "{cred} should be refused");

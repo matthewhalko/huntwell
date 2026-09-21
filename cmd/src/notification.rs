@@ -90,7 +90,9 @@ pub async fn serve(db: Db) -> Result<()> {
                     break;
                 }
             };
-            match crate::mail::send(&mail.to, &mail.email).await {
+            // Keyed by the row, so a send that succeeded but could not be recorded
+            // is not a second email when its lease expires and it is sent again.
+            match crate::mail::send_keyed(&mail.to, &mail.email, Some(&format!("huntwell-mail-{}", mail.mail_id))).await {
                 Ok(()) => {
                     if let Err(e) = store::mark_mail_sent(&db, mail.mail_id).await {
                         // Sent but not recorded: the lease will expire and it

@@ -129,6 +129,7 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
     METER_EXECUTION.store(execution_id, std::sync::atomic::Ordering::Relaxed);
     METER_ACCOUNT.store(run.account_id, std::sync::atomic::Ordering::Relaxed);
     METER_PLAN.store(run.plan_id, std::sync::atomic::Ordering::Relaxed);
+    crate::agent::reset_credits_trip();
     // Write each turn to the row as the agent reports it, so the watching
     // page ticks instead of sitting at $0 until the (minutes-long) call ends.
     let meter_db = db.clone();
@@ -180,6 +181,11 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
                 alert_new_records(db, &sc, new).await;
             }
             0
+        }
+        Err(e) if e.downcast_ref::<crate::agent::CreditsExhausted>().is_some() => {
+            eprintln!("[stop] {e}");
+            let _ = store::finish_execution(db, execution_id, "failed", Some(1)).await;
+            1
         }
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -269,6 +275,8 @@ async fn execute(db: &Db, run: &store::ExecutionRecord, sc: &SourceConfig, args:
 
     guard::set_nav_allowlist(guard::split_hosts(&sc.allow_hosts));
     crate::sandbox::set_run_scope(&sc.source, sc.plan_id);
+    let scrape_model = stage_opts(&opts.agent, "scrape", sc).model.unwrap_or_default();
+    let _ = store::set_execution_model(db, sc.account_id, run.execution_id, &scrape_model).await;
 
     print_run_header(db, run, sc, &seed, &opts).await;
 
@@ -402,6 +410,14 @@ pub fn human_money(v: i64) -> String {
 /// Runs the agent off the async runtime — each call is a blocking child
 /// process wait that can last minutes.
 async fn agent_call(db: &Db, label: &str, prompt: String, opts: AgentOpts) -> Result<Value> {
+    if crate::agent::credits_exhausted() {
+        return Err(crate::agent::CreditsExhausted.into());
+    }
+    let account_id = METER_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if account_id > 0 && store::account_over_budget(db, account_id).await? {
+        crate::agent::trip_credits();
+        return Err(crate::agent::CreditsExhausted.into());
+    }
     let label = label.to_string();
     let called = label.clone();
     let progress = opts.progress;
@@ -409,6 +425,9 @@ async fn agent_call(db: &Db, label: &str, prompt: String, opts: AgentOpts) -> Re
     // Meter the tokens this call spent — whether it succeeded or not — so the
     // account's usage ticks up live and the budget cap sees it on the next run.
     meter_run(db, &label, progress).await;
+    if crate::agent::credits_exhausted() {
+        return Err(crate::agent::CreditsExhausted.into());
+    }
     joined.map_err(|e| anyhow!("agent task panicked: {e}"))?
 }
 
@@ -495,10 +514,22 @@ async fn book_tokens(
     let total = add_real_booked(u);
     if let Err(e) = store::set_execution_token_totals(db, execution_id, total).await {
         tracing::warn!("meter run tokens: {e:#}");
+        // Billing state is unavailable. Fail closed: continuing would create
+        // untracked spend and defeat the prepaid guarantee.
+        crate::agent::trip_credits();
         return;
     }
-    if let Err(e) = store::add_account_usage(db, account_id, u, cost_micros).await {
-        tracing::warn!("meter account tokens: {e:#}");
+    match store::add_account_usage(db, account_id, u, cost_micros).await {
+        Ok(charge) if charge.exhausted() => {
+            crate::agent::trip_credits();
+            println!("[stop] credits exhausted — stopping this run so it cannot overspend");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("meter account tokens: {e:#}");
+            // Never keep an agent running when its debit could not be made.
+            crate::agent::trip_credits();
+        }
     }
     publish_meter(account_id, execution_id, plan_id, total.billable()).await;
 }
@@ -513,6 +544,23 @@ async fn show_live_tokens(
 ) {
     if est.is_zero() {
         return;
+    }
+    // Cursor may not emit exact usage until after a turn, so watch the
+    // conservative stream estimate too. Only the not-yet-booked part is
+    // compared with the wallet; already-reported usage was atomically debited.
+    let pending = est.saturating_sub(crate::agent::booked_usage());
+    if !pending.is_zero() {
+        match store::account_credit_micros(db, account_id).await {
+            Ok(remaining) if remaining <= store::tokens_to_usd_micros(pending.billable()) => {
+                crate::agent::trip_credits();
+                println!("[stop] token limit reached — stopping before more unreported spend");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("read account credits for live limit: {e:#}");
+                crate::agent::trip_credits();
+            }
+        }
     }
     let mut shown = real_booked_now();
     shown.add(est);
@@ -642,6 +690,10 @@ async fn run_pipeline(db: &Db, sc: &SourceConfig, initial_seed: &Ctx, opts: Runt
             }
             Err(e) if e.downcast_ref::<browser::Unavailable>().is_some() => {
                 return Err(e.context(format!("run halted at iteration {} — no browser to scrape with", iter + 1)));
+            }
+            Err(e) if e.downcast_ref::<crate::agent::CreditsExhausted>().is_some() => {
+                println!("[stop] credits exhausted at iteration {} — run halted", iter + 1);
+                return Err(e);
             }
             Err(e) => {
                 println!("[iter {}] error: {e:#}", iter + 1);

@@ -41,7 +41,6 @@ path = "src/bin/notification.rs"
 
 [dependencies]
 anyhow = "1"
-argon2 = { version = "0.5", features = ["std"] }
 axum = { version = "0.8", features = ["macros", "json", "query"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -58,6 +57,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 sha1 = "0.10"
+# The QR for the authenticator app is drawn here.
+qrcode = { version = "0.14", default-features = false }
 sha2 = "0.10"
 # The sealed `global` file: AES-256-GCM through ring, which rustls already
 # brings in, so these are direct names for crates the tree already builds.

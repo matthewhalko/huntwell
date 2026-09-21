@@ -40,21 +40,27 @@ HUNTWELL_DATA_DIR=/abs/path/local-infra/data/huntwell
 
 # ── Identity ─────────────────────────────────────────────────────────────────
 #
-# Where passwords live. Unset: a configured Cognito pool means `cognito`, no
-# pool means `local` (argon2 in the account row) — so a dev box needs no AWS.
-# Production is `cognito`, and those rows store no hash at all.
-#HUNTWELL_IDENTITY=local
-#
-# The pool. Production reads these from Secrets Manager; here is for pointing a
-# dev box at a real pool. The app client needs ALLOW_USER_PASSWORD_AUTH.
-#COGNITO_USER_POOL_ID=us-east-1_AbC123
-#COGNITO_CLIENT_ID=...
+# Every account — and every operator — signs in through an AWS Cognito pool.
+# No password, hash or authenticator secret is ever stored in Postgres, in any
+# environment, so a dev checkout needs a dev pool too (make two small pools in
+# the AWS console: one for users, one for the admin console).
+# The app clients need ALLOW_USER_PASSWORD_AUTH; MFA = Optional + authenticator
+# apps; self-registration off. Production reads all of this from Secrets Manager.
+COGNITO_USER_POOL_ID=us-east-1_AbC123
+COGNITO_CLIENT_ID=...
 #COGNITO_CLIENT_SECRET=...
-#COGNITO_REGION=us-east-1
-# An IAM user allowed AdminCreateUser / AdminSetUserPassword / AdminDeleteUser
-# on that pool and nothing else — never the bootstrap key.
-#AWS_COGNITO_KEY=AKIA...
-#AWS_COGNITO_SECRET=...
+COGNITO_REGION=us-east-1
+# The operators' pool, for the admin console. Separate from the users' pool so a
+# customer can never be an operator and each can be locked down on its own.
+ADMIN_COGNITO_USER_POOL_ID=us-east-1_XyZ789
+ADMIN_COGNITO_CLIENT_ID=...
+#ADMIN_COGNITO_CLIENT_SECRET=...
+#ADMIN_COGNITO_REGION=us-east-1
+# One IAM user allowed AdminCreateUser / AdminSetUserPassword / AdminDeleteUser /
+# AdminSetUserMFAPreference / AdminGetUser on BOTH pools and nothing else —
+# never the bootstrap key.
+AWS_COGNITO_KEY=AKIA...
+AWS_COGNITO_SECRET=...
 
 # Chrome display mode for runs: headed | xvfb | headless. Omit to detect.
 #HUNTWELL_CHROME_DISPLAY=headless
@@ -112,8 +118,11 @@ HUNTWELL_DATA_DIR=/abs/path/local-infra/data/huntwell
 # Where the app lives, for the links in verification email.
 #HUNTWELL_PUBLIC_URL=https://app.example.com
 #
-# Outbound mail. Without it, verification email is written to the log instead
-# of sent, and nobody can confirm an account.
+# Outbound mail, through Resend (resend.com). Without a key, mail is written
+# to the log instead of sent — fine on a dev box, where the confirmation code
+# can be read from the notification service's output. The From domain must be
+# verified in Resend. In production the key lives in Secrets Manager.
+#RESEND_API_KEY=re_...
 #HUNTWELL_MAIL_FROM=Huntwell <hello@example.com>
 #
 # Signups on the deployed app. Default 0: anyone who finds the URL would

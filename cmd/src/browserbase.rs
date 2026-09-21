@@ -89,6 +89,18 @@ fn client() -> Result<reqwest::Client> {
         .context("build http client")
 }
 
+async fn create_session(key: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
+    let resp = client()?
+        .post(format!("{API}/sessions"))
+        .header("X-BB-API-Key", key)
+        .json(body)
+        .send()
+        .await
+        .context("create Browserbase session")?;
+    let status = resp.status();
+    Ok((status, resp.text().await.unwrap_or_default()))
+}
+
 /// Creates a session and stores its `connectUrl` for the rest of the run.
 ///
 /// A persistent [Context](https://docs.browserbase.com/features/contexts) is
@@ -124,15 +136,28 @@ pub async fn start(account_id: i64, context_id: Option<String>) -> Result<()> {
         body["browserSettings"] = json!({ "context": { "id": ctx, "persist": true } });
     }
 
-    let resp = client()?
-        .post(format!("{API}/sessions"))
-        .header("X-BB-API-Key", &key)
-        .json(&body)
-        .send()
-        .await
-        .context("create Browserbase session")?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    // A run is several agent calls — the search, then one per row it fills in
+    // — and each is its own `@playwright/mcp`, so its own CDP connection. By
+    // default Browserbase ends a session when its client disconnects: the
+    // search worked, and every call after it found the browser closed.
+    // `keepAlive` holds the session until `stop` releases it (or `timeout`).
+    let keep_alive = !matches!(crate::config::get("BROWSERBASE_KEEP_ALIVE").as_deref().map(str::trim), Some("0" | "false" | "off"));
+    if keep_alive {
+        body["keepAlive"] = Value::Bool(true);
+    }
+
+    let (mut status, mut text) = create_session(&key, &body).await?;
+    if !status.is_success() && keep_alive {
+        // Plans without keep-alive refuse the field. A session that lasts one
+        // connection is worse than one that lasts the run, but better than no run.
+        eprintln!(
+            "  browser     Browserbase refused keepAlive ({status}: {}) — retrying without it; rows after the first \
+             agent call will find the browser closed. The Browserbase plan needs keep-alive.",
+            trim(&text)
+        );
+        body.as_object_mut().map(|o| o.remove("keepAlive"));
+        (status, text) = create_session(&key, &body).await?;
+    }
     if !status.is_success() {
         anyhow::bail!("Browserbase session create failed ({status}): {}", trim(&text));
     }

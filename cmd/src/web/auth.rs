@@ -1,13 +1,11 @@
-//! Cookie sessions and passwords.
+//! Cookie sessions. Passwords live in Cognito (`identity`), never here.
 //!
 //! The cookie holds a random 192-bit token; the database holds its SHA-256.
-//! Passwords are argon2id. Sign-in failures for a missing account and a wrong
-//! password take the same path (a hash is always computed) and return the
-//! same message, so the login form does not confirm which emails exist.
+//! Sign-in failures for a missing account and a wrong password take the same
+//! path (the pool is asked either way) and return the same message, so the
+//! login form does not confirm which emails exist.
 
 use anyhow::{bail, Result};
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -20,20 +18,6 @@ use crate::store::{self, Account};
 /// The session cookie's name. Written as `huntwell_session`.
 pub const COOKIE: &str = "huntwell_session";
 const SESSION_TTL_HOURS: i64 = 24 * 30;
-
-pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
-        .to_string())
-}
-
-pub fn verify_password(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash)
-        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
-        .unwrap_or(false)
-}
 
 /// Display names are shown to teammates, in emails and in the operator
 /// console, so they are bounded and single-line.
@@ -159,6 +143,18 @@ fn challenge_failed(e: anyhow::Error) -> ApiError {
     ApiError(StatusCode::FORBIDDEN, e.to_string())
 }
 
+/// An identity-store error as the caller sees it: a validation failure is a
+/// 400 with its reason; the store itself failing is a 503 with a sentence
+/// that says nothing about why (the log has that).
+fn identity_error(e: anyhow::Error) -> ApiError {
+    let msg = e.to_string();
+    if msg == crate::cognito::UNAVAILABLE {
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, msg)
+    } else {
+        bad_request(msg)
+    }
+}
+
 /// What the sign-in and sign-up pages need before anyone is signed in.
 pub async fn config(State(state): State<App>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -189,8 +185,14 @@ pub async fn signup(
         return Err(ApiError(StatusCode::FORBIDDEN, "sign-up is closed on this server".into()));
     }
     let ip = super::client_ip(&headers, peer);
-    crate::throttle::SIGNUPS.hit(&ip.to_string()).map_err(too_many)?;
+    crate::throttle::SIGNUPS.check(&ip.to_string()).map_err(too_many)?;
     crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
+    // One spelling of the address for everything that follows — the row, the
+    // pool user, the silent sign-in after it. The pool user used to be made
+    // with the address as typed while later calls used the stored lower-case
+    // one, so a capital letter at sign-up broke whatever came next.
+    let mut body = body;
+    body.email = body.email.trim().to_lowercase();
     validate_signup(&body.email, &body.password).map_err(|e| bad_request(e.to_string()))?;
     validate_display_name(&body.display_name).map_err(|e| bad_request(e.to_string()))?;
     let name = if body.display_name.trim().is_empty() {
@@ -209,20 +211,19 @@ pub async fn signup(
         if let Err(e) = crate::identity::delete_user(&body.email).await {
             tracing::warn!("could not replace the identity for {}: {e:#}", body.email);
         }
-        let id = crate::identity::create_user(&body.email, &body.password).await.map_err(|e| bad_request(e.to_string()))?;
-        let acc = store::reclaim_unverified_account(&state.db, existing.account_id, &name, &id).await?;
+        let sub = crate::identity::create_user(&body.email, &body.password).await.map_err(identity_error)?;
+        let acc = store::reclaim_unverified_account(&state.db, existing.account_id, &name, &sub).await?;
+        crate::throttle::SIGNUPS.note(&ip.to_string());
         begin_verification(&state, &acc).await?;
+        prime_enrolment(&acc, &body.password).await;
         let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
         return Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, &state))).into_response());
     }
-    // The identity store owns the password. Under `cognito` the pool creates
-    // the user and this row gets a subject and no hash; under `local` the
-    // reverse. Either way the account row is written only once the credential
-    // exists, so a failure there cannot leave an account nobody can sign in to.
-    let id = crate::identity::create_user(&body.email, &body.password)
-        .await
-        .map_err(|e| bad_request(e.to_string()))?;
-    let acc = match store::create_account(&state.db, &body.email, &name, &id).await {
+    // The pool owns the password: the user is created there first, and the
+    // account row is written only once that credential exists, so a failure
+    // cannot leave an account nobody can sign in to.
+    let sub = crate::identity::create_user(&body.email, &body.password).await.map_err(identity_error)?;
+    let acc = match store::create_account(&state.db, &body.email, &name, &sub).await {
         Ok(acc) => acc,
         Err(e) => {
             // The credential exists and the row does not: take the credential
@@ -233,7 +234,9 @@ pub async fn signup(
             return Err(e.into());
         }
     };
+    crate::throttle::SIGNUPS.note(&ip.to_string());
     begin_verification(&state, &acc).await?;
+    prime_enrolment(&acc, &body.password).await;
     let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
     let acc = store::get_account(&state.db, acc.account_id).await?.unwrap_or(acc);
     Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, &state))).into_response())
@@ -248,31 +251,33 @@ pub async fn login(
     let ip = super::client_ip(&headers, peer);
     crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
     crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
+    let mut body = body;
+    body.email = body.email.trim().to_lowercase();
     let found = store::find_account_by_email(&state.db, &body.email).await?;
-    // Checked even when no account exists, so a missing address costs the same
-    // time as a wrong password — under `local` that is a hash comparison, and
-    // under `cognito` the pool is asked either way.
-    let hash = found.as_ref().map(|a| a.password_hash.clone()).unwrap_or_default();
-    let email = body.email.clone();
-    let password = body.password.clone();
-    let outcome = if crate::identity::is_cognito() {
-        crate::identity::authenticate(&email, &password, &hash).await
-    } else {
-        // argon2 is deliberately slow; off the runtime thread so one sign-in
-        // does not stall every other request.
-        tokio::task::spawn_blocking(move || {
-            if crate::identity::verify_local_password(&password, &hash) {
-                Ok(String::new())
-            } else {
-                Err(anyhow::anyhow!("invalid email or password"))
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let (Some(acc), Ok(sub)) = (found, outcome) else {
+    // The pool is asked even when no row exists, so a missing address costs
+    // the same time as a wrong password.
+    let account_id = found.as_ref().map(|a| a.account_id).unwrap_or(0);
+    let outcome = crate::identity::sign_in(&body.email, &body.password, account_id).await;
+    // The pool being down or misconfigured is not a wrong password: it is not
+    // counted as a guess, and the page says to try later rather than sending
+    // the person off to reset a password that was fine.
+    if let Err(e) = &outcome {
+        if e.to_string() == crate::cognito::UNAVAILABLE {
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+        }
+        tracing::info!("sign-in refused for account {account_id}: {e:#}");
+    }
+    let (Some(acc), Ok(outcome)) = (found, outcome) else {
         crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
         return Err(ApiError(StatusCode::UNAUTHORIZED, "email or password is incorrect".into()));
+    };
+    // The password was right and a second factor is on: no session yet. The
+    // browser comes back to `mfa` with the code and this opaque challenge.
+    let sub = match outcome {
+        crate::identity::SignIn::Done { sub } => sub,
+        crate::identity::SignIn::MfaRequired { challenge } => {
+            return Ok(Json(serde_json::json!({ "mfa_required": true, "challenge": challenge, "email": acc.email })).into_response());
+        }
     };
     // First sign-in after a migration to Cognito: the pool knows this person,
     // the row does not know its subject yet. Recorded here rather than by a
@@ -309,6 +314,22 @@ async fn begin_verification(state: &App, acc: &Account) -> Result<(), ApiError> 
     let msg = crate::mail::verification(&acc.display_name, &code);
     store::queue_mail(&state.db, Some(acc.account_id), &acc.email, "verify", &msg).await?;
     Ok(())
+}
+
+/// Under Cognito, two-factor enrolment acts on an access token, and the
+/// sign-up page offers enrolment right after the email code — so a token is
+/// fetched now, while the password is in hand, and kept for an hour. Best
+/// effort: without it, setup asks for the password again.
+async fn prime_enrolment(acc: &Account, password: &str) {
+    match crate::cognito::sign_in_full(&acc.email, password).await {
+        Ok(crate::cognito::SignIn::Done { access_token, .. }) => {
+            crate::identity::remember_access_token(acc.account_id, &access_token);
+        }
+        Ok(crate::cognito::SignIn::MfaRequired { .. }) => {}
+        // Not fatal — two-factor setup will ask for the password instead —
+        // but said, because a silent failure here is a confusing screen later.
+        Err(e) => tracing::warn!("could not fetch an enrolment token for account {} after sign-up: {e:#}", acc.account_id),
+    }
 }
 
 /// Six digits from the OS's randomness, zero-padded — 000123 is a code too.
@@ -351,6 +372,171 @@ pub async fn verify(State(state): State<App>, AuthUser(acc): AuthUser, Json(body
     }
 }
 
+#[derive(Deserialize)]
+pub struct MfaBody {
+    pub email: String,
+    pub challenge: String,
+    pub code: String,
+}
+
+/// The second half of a sign-in: the code from the authenticator app.
+pub async fn mfa(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<MfaBody>,
+) -> Result<Response, ApiError> {
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
+    let acc = store::find_account_by_email(&state.db, &body.email)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "that sign-in took too long — start again".into()))?;
+    let sub = match crate::identity::answer_mfa(acc.account_id, &body.challenge, &body.code).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+            return Err(identity_error(e));
+        }
+    };
+    if !sub.is_empty() && acc.cognito_sub.is_empty() {
+        store::set_cognito_sub(&state.db, acc.account_id, &sub).await?;
+    }
+    let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
+    Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, &state))).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct MfaSetupBody {
+    /// Needed under Cognito when no recent sign-in is at hand (Settings, later).
+    #[serde(default)]
+    pub password: String,
+}
+
+/// Start two-factor setup: the secret as a QR and as text. Not on until
+/// `mfa_confirm` proves the app has it.
+pub async fn mfa_setup(State(_state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<MfaSetupBody>) -> Result<Json<serde_json::Value>, ApiError> {
+    if acc.mfa_enabled_at.is_some() {
+        return Err(bad_request("two-factor authentication is already on — turn it off first to set up a new device"));
+    }
+    let e = crate::identity::begin_mfa(&acc.email, acc.account_id, Some(&body.password)).await.map_err(|e| {
+        // No token at hand and no password given: not a failure, a question.
+        // 428 tells the page to show its password field and ask again.
+        if e.to_string() == crate::identity::NEEDS_PASSWORD {
+            ApiError(StatusCode::PRECONDITION_REQUIRED, e.to_string())
+        } else if e.to_string().contains("invalid email or password") {
+            ApiError(StatusCode::UNAUTHORIZED, "that password is not right".into())
+        } else {
+            identity_error(e)
+        }
+    })?;
+    Ok(Json(serde_json::json!({ "secret": e.secret, "uri": e.uri, "qr_svg": e.qr_svg })))
+}
+
+#[derive(Deserialize)]
+pub struct MfaCodeBody {
+    pub code: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+pub async fn mfa_confirm(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<MfaCodeBody>) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::identity::confirm_mfa(&acc.email, acc.account_id, &body.code, &state.db).await.map_err(identity_error)?;
+    Ok(Json(serde_json::json!({ "ok": true, "mfa_enabled": true })))
+}
+
+/// Turn two-factor off: the password and a current code, so a stolen session
+/// alone cannot strip the second factor from an account.
+pub async fn mfa_disable(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<MfaCodeBody>) -> Result<Json<serde_json::Value>, ApiError> {
+    if acc.mfa_enabled_at.is_none() {
+        return Ok(Json(serde_json::json!({ "ok": true, "mfa_enabled": false })));
+    }
+    crate::identity::check_mfa_code(&acc.email, &body.password, &body.code)
+        .await
+        .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "password or code is incorrect".into()))?;
+    crate::identity::disable_mfa(&acc.email, acc.account_id, &state.db).await.map_err(identity_error)?;
+    Ok(Json(serde_json::json!({ "ok": true, "mfa_enabled": false })))
+}
+
+#[derive(Deserialize)]
+pub struct ForgotBody {
+    pub email: String,
+    #[serde(default)]
+    pub turnstile_token: String,
+}
+
+/// "Forgot password": email a reset code. Answers the same whether or not the
+/// address has an account, so this form cannot be used to find out which
+/// addresses do. Bounded per address like every other thing that sends mail.
+pub async fn forgot(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ForgotBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::RESET_REQUESTS.hit(&ip.to_string()).map_err(too_many)?;
+    crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
+    let email = body.email.trim().to_lowercase();
+    if !email.contains('@') || email.len() > 320 {
+        return Err(bad_request("that does not look like an email address"));
+    }
+    if !crate::mail::configured() {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this server cannot send email, so passwords cannot be reset here".into()));
+    }
+    let code = new_code();
+    if let Some(acc) = store::set_reset_token(&state.db, &email, &store::sha256_hex(&code)).await? {
+        let msg = crate::mail::password_reset(&acc.display_name, &code);
+        store::queue_mail(&state.db, Some(acc.account_id), &acc.email, "reset", &msg).await?;
+    } else {
+        tracing::info!("password reset asked for {email}, which has no account — nothing sent");
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ResetBody {
+    pub email: String,
+    pub code: String,
+    pub password: String,
+}
+
+/// Finish a reset: the code proves the address, the new password replaces the
+/// old one in the identity store, and every existing session ends.
+pub async fn reset(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ResetBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Guesses at the code are sign-in guesses by another name.
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
+    let email = body.email.trim().to_lowercase();
+    let code: String = body.code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if code.len() != 6 {
+        return Err(bad_request("the code is six digits"));
+    }
+    validate_signup(&email, &body.password).map_err(|e| bad_request(e.to_string()))?;
+    let acc = match store::check_reset_code(&state.db, &email, &store::sha256_hex(&code)).await? {
+        store::CodeCheck::Verified(acc) => acc,
+        store::CodeCheck::Wrong { left } => {
+            crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+            return Err(bad_request(format!(
+                "that is not the code — {left} {} left before you need a new one",
+                if left == 1 { "try" } else { "tries" }
+            )));
+        }
+        store::CodeCheck::NeedNew => {
+            crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+            return Err(ApiError(StatusCode::GONE, "that code has expired or been used up — ask for a new one".into()));
+        }
+    };
+    crate::identity::set_password(&acc.email, &body.password).await.map_err(identity_error)?;
+    let ended = store::delete_all_sessions(&state.db, acc.account_id).await?;
+    tracing::info!("password reset for account {} — {ended} session(s) ended", acc.account_id);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// Send a new code. Bounded: each one is an email, and each one is six fresh
 /// digits with five guesses.
 pub async fn resend(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<serde_json::Value>, ApiError> {
@@ -379,6 +565,7 @@ pub fn me_json(acc: &Account, state: &App) -> serde_json::Value {
         "theme": acc.theme,
         "created_at": acc.created_at.to_rfc3339(),
         "email_verified": acc.email_verified_at.is_some(),
+        "mfa_enabled": acc.mfa_enabled_at.is_some(),
         "onboarded": acc.onboarded_at.is_some(),
         // Which workspace this session is working in — their own unless they
         // switched into one they were invited to.
@@ -492,17 +679,13 @@ pub async fn change_password(
     parts: Parts,
     Json(body): Json<PasswordBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Proving the current password is the identity store's job too: under
-    // Cognito the row holds no hash to check it against.
-    crate::identity::authenticate(&acc.email, &body.current, &acc.password_hash)
+    // Proving the current password is the pool's job: the row holds nothing
+    // to check it against.
+    crate::identity::authenticate(&acc.email, &body.current)
         .await
         .map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "current password is incorrect".into()))?;
     validate_signup(&acc.email, &body.new).map_err(|e| bad_request(e.to_string()))?;
-    let hash = crate::identity::set_password(&acc.email, &body.new)
-        .await
-        .map_err(|e| bad_request(e.to_string()))?;
-    // Empty under Cognito, which is the point: the row stops carrying one.
-    store::update_password(&state.db, acc.account_id, &hash).await?;
+    crate::identity::set_password(&acc.email, &body.new).await.map_err(identity_error)?;
     // Every other session ends. Changing the password is what someone does
     // when they think another device has it, and this is what makes that work.
     let keep = cookie_value(&parts).map(|t| store::sha256_hex(&t)).unwrap_or_default();
@@ -513,14 +696,6 @@ pub async fn change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn passwords_round_trip() {
-        let h = hash_password("correct horse battery").unwrap();
-        assert!(verify_password("correct horse battery", &h));
-        assert!(!verify_password("wrong", &h));
-        assert!(!verify_password("x", "not a hash"));
-    }
 
     #[test]
     fn an_unverified_account_can_only_leave_or_ask_again() {

@@ -100,7 +100,7 @@ export function CardDialog({ reason, onDone, onClose }: { reason?: string; onDon
   return (
     <Modal title="Add a payment method" onClose={onClose}>
       <p className="muted" style={{ marginTop: 0 }}>
-        {reason || 'Runs cost money to execute, so we need a card on file before the first one.'}
+        {reason || 'Runs cost money to execute. Add a card, then buy prepaid credits — a run spends only what you have purchased.'}
       </p>
       <form onSubmit={submit}>
         {mocked ? (

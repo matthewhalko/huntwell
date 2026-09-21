@@ -28,6 +28,14 @@ creates or alters a table.
 6. After the change: `./local-infra/start.sh` (applies it), `cd cmd && cargo build`
    (re-embeds it), then update `store.rs` and the TS types in `UI/web/src/api.ts`.
 
+## History
+
+The migration trail was consolidated on 2026-09-18 for the fresh production
+database: every file is now one `CREATE TABLE` in its final shape, with no
+`ALTER` history. Rule 2 applies from here — a column added *after* that date is
+appended as an `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, never edited into the
+body.
+
 ## Banned
 
 - `CREATE TABLE` / `ALTER TABLE` in Rust or TypeScript.

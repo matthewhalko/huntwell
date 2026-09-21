@@ -23,6 +23,8 @@ api_key.sql
 api_audit.sql
 account_browser.sql
 account_usage.sql
+credit_purchase.sql
+billing_event.sql
 host.sql
 vm.sql
 control_setting.sql

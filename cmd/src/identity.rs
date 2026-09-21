@@ -1,107 +1,30 @@
-//! Where a password actually lives.
+//! Where a password actually lives: an AWS Cognito user pool, always.
 //!
-//! Two providers, on the same axis as the secret Secrets Manager serves, so one
-//! process never straddles two identity stores:
+//! No password, hash or authenticator secret ever reaches this database — the
+//! `account` row carries the pool's subject and nothing else. That holds in
+//! every environment, so a dev checkout points at a dev pool (see
+//! `local-infra/global.example`) rather than keeping a local stand-in that
+//! could one day be what production runs on.
 //!
-//! | Provider  | Password              | Row carries      |
-//! |-----------|-----------------------|------------------|
-//! | `local`   | argon2 in `account`   | `password_hash`  |
-//! | `cognito` | an AWS Cognito pool   | `cognito_sub`    |
-//!
-//! `local` is for a dev box, which has no AWS credentials and should need none.
-//! Production is `cognito`, and a production row stores no hash at all.
-//!
-//! The port of `../../parkriver/cmd/src/shared/identity.rs`. Park River reaches
-//! the same shape through a trait because it also owns TOTP enrolment there;
-//! Huntwell has four operations and no second factor, so the same idea costs an
-//! enum and four functions.
-
+//! The port of `../../parkriver/cmd/src/shared/identity/cognito.rs`.
 use anyhow::{anyhow, Result};
 
-/// What to store on the `account` row once a provider has taken the password.
-/// Exactly one side is ever filled: `local` has a hash and no subject,
-/// `cognito` a subject and no hash.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct NewIdentity {
-    pub cognito_sub: String,
-    pub password_hash: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provider {
-    Local,
-    Cognito,
-}
-
-/// Which store this installation uses.
-///
-/// `HUNTWELL_IDENTITY` decides it outright — that is how a dev box is pointed
-/// at a real pool, or a deployed one held on local identity during a migration.
-/// Otherwise: a configured pool means Cognito.
-///
-/// The fallback is deliberately "whether a pool is configured" rather than a
-/// build profile. Huntwell ships one binary for both, and a release build that
-/// assumed Cognito would make `./dev.sh` need AWS credentials to sign anybody
-/// in.
-pub fn provider() -> Provider {
-    if let Some(v) = crate::config::get("HUNTWELL_IDENTITY") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "local" => return Provider::Local,
-            "cognito" => return Provider::Cognito,
-            // Anything unrecognised falls through rather than silently
-            // choosing one.
-            _ => {}
-        }
-    }
+/// What every service refuses to run without: the pool. Said at startup,
+/// naming the settings, rather than as a sign-up that fails later.
+pub fn enforce_configured() -> Result<()> {
     if crate::cognito::configured() {
-        Provider::Cognito
-    } else {
-        Provider::Local
-    }
-}
-
-/// Whether identity settings say `local` in so many words. Only that opts a
-/// production build out of Cognito; silence never does.
-fn explicitly_local() -> bool {
-    crate::config::get("HUNTWELL_IDENTITY").is_some_and(|v| v.trim().eq_ignore_ascii_case("local"))
-}
-
-/// What a production build refuses to run without: a pool. The fallback to
-/// local identity exists for a dev box, and on a production build silence
-/// about Cognito would otherwise mean password hashes quietly landing in the
-/// `account` table — which is the one thing the pool is there to prevent.
-/// `HUNTWELL_IDENTITY=local` still works, because it is said out loud.
-pub fn enforce_production_provider() -> Result<()> {
-    if crate::genesis::embedded_variant() != "prod" || explicitly_local() {
-        return Ok(());
-    }
-    if provider() == Provider::Cognito {
         return Ok(());
     }
     Err(anyhow!(
-        "this is a production build and no Cognito pool is configured, so sign-ups would store \
-         password hashes in the database. Add COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION \
-         (and COGNITO_CLIENT_SECRET, AWS_COGNITO_KEY, AWS_COGNITO_SECRET) to the Secrets Manager secret — \
-         see docs/SECRETS.md — or set HUNTWELL_IDENTITY=local to mean it"
+        "no Cognito pool is configured, and every account signs in through one. Add COGNITO_USER_POOL_ID, \
+         COGNITO_CLIENT_ID, COGNITO_REGION (and COGNITO_CLIENT_SECRET, AWS_COGNITO_KEY, AWS_COGNITO_SECRET) — \
+         to the Secrets Manager secret in production, to local-infra/global on a dev box (docs/SECRETS.md)"
     ))
 }
 
-pub fn is_cognito() -> bool {
-    provider() == Provider::Cognito
-}
-
-pub fn provider_name() -> &'static str {
-    match provider() {
-        Provider::Local => "local",
-        Provider::Cognito => "cognito",
-    }
-}
-
-/// Password rules applied before anything is stored, in either provider.
-///
-/// Cognito enforces its own policy too; this exists so a weak password is
-/// refused with a sentence rather than an AWS error code, and so the local
-/// provider holds the same line.
+/// Password rules applied before anything is sent to the pool. Cognito
+/// enforces its own policy too; this exists so a weak password is refused
+/// with a sentence rather than an AWS error code.
 pub fn check_password_strength(password: &str) -> Result<()> {
     if password.chars().count() < 12 {
         return Err(anyhow!("password must be at least 12 characters"));
@@ -110,118 +33,192 @@ pub fn check_password_strength(password: &str) -> Result<()> {
     let has_upper = password.chars().any(|c| c.is_uppercase());
     let has_digit = password.chars().any(|c| c.is_ascii_digit());
     if !(has_lower && has_upper && has_digit) {
-        return Err(anyhow!(
-            "password must contain an uppercase letter, a lowercase letter and a digit"
-        ));
+        return Err(anyhow!("password must contain an uppercase letter, a lowercase letter and a digit"));
     }
     Ok(())
 }
 
-/// Create the identity for a new account.
-pub async fn create_user(email: &str, password: &str) -> Result<NewIdentity> {
+/// Create the identity for a new account; returns the pool's subject.
+pub async fn create_user(email: &str, password: &str) -> Result<String> {
     check_password_strength(password)?;
-    match provider() {
-        Provider::Local => Ok(NewIdentity {
-            cognito_sub: String::new(),
-            password_hash: crate::web::auth::hash_password(password)?,
-        }),
-        Provider::Cognito => Ok(NewIdentity {
-            cognito_sub: crate::cognito::create_user(email, password).await?,
-            password_hash: String::new(),
-        }),
+    crate::cognito::create_user(email, password).await
+}
+
+/// Check a password. Returns the subject, so a caller can reconcile a row
+/// whose `cognito_sub` is not yet filled in. A pending second factor counts
+/// as not signed in here; `sign_in` is the call that handles it.
+pub async fn authenticate(email: &str, password: &str) -> Result<String> {
+    crate::cognito::sign_in(email, password).await
+}
+
+/// Set or reset a password in the pool.
+pub async fn set_password(email: &str, password: &str) -> Result<()> {
+    check_password_strength(password)?;
+    crate::cognito::set_password(email, password).await
+}
+
+/// Remove the identity — when an account is deleted, or a sign-up failed
+/// after the pool user was made.
+pub async fn delete_user(email: &str) -> Result<()> {
+    crate::cognito::delete_user(email).await
+}
+
+// ── two-factor (TOTP) ────────────────────────────────────────────────────────
+//
+// The secret lives in the pool and every step is a pool call; this database
+// keeps only `mfa_enabled_at`, a mirror for the UI.
+
+/// What a sign-in came to once the password was right.
+#[derive(Debug, Clone)]
+pub enum SignIn {
+    Done { sub: String },
+    /// Present a TOTP code next. `challenge` is opaque; it comes back with it.
+    MfaRequired { challenge: String },
+}
+
+/// A TOTP secret to show once: as a QR and as text for the person who can't scan.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Enrolment {
+    pub secret: String,
+    pub uri: String,
+    pub qr_svg: String,
+}
+
+/// Access tokens from recent Cognito sign-ins, by account, for enrolment —
+/// `AssociateSoftwareToken` and `VerifySoftwareToken` act on a token, not a
+/// name. Kept an hour (a token's life) and in memory: the website is one
+/// process, and losing them costs a person their password prompt, not access.
+static ENROL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i64, (String, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
+
+fn enrol_tokens() -> &'static std::sync::Mutex<std::collections::HashMap<i64, (String, std::time::Instant)>> {
+    ENROL.get_or_init(Default::default)
+}
+
+/// Remember a sign-in's access token so enrolment can follow without asking
+/// for the password again. No-op for an empty token (local identity).
+pub fn remember_access_token(account_id: i64, access_token: &str) {
+    if access_token.is_empty() {
+        return;
+    }
+    let mut map = enrol_tokens().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    map.retain(|_, (_, at)| now.duration_since(*at) < std::time::Duration::from_secs(3600));
+    map.insert(account_id, (access_token.to_string(), now));
+}
+
+fn access_token_for(account_id: i64) -> Option<String> {
+    let map = enrol_tokens().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&account_id)
+        .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(3600))
+        .map(|(t, _)| t.clone())
+}
+
+/// Sign in for real: password, then possibly a second factor.
+pub async fn sign_in(email: &str, password: &str, account_id: i64) -> Result<SignIn> {
+    match crate::cognito::sign_in_full(email, password).await? {
+        crate::cognito::SignIn::Done { sub, access_token } => {
+            remember_access_token(account_id, &access_token);
+            Ok(SignIn::Done { sub })
+        }
+        crate::cognito::SignIn::MfaRequired { session, username } => {
+            // Both halves travel together; the answer needs the echoed name.
+            Ok(SignIn::MfaRequired { challenge: format!("{username}\n{session}") })
+        }
     }
 }
 
-/// Check a password. `stored_hash` is the row's `password_hash`, which the
-/// Cognito provider ignores — under Cognito it is empty, and the answer comes
-/// from the pool.
-///
-/// Returns the Cognito subject when there is one, so a caller can reconcile a
-/// row whose `cognito_sub` is not yet filled in.
-pub async fn authenticate(email: &str, password: &str, stored_hash: &str) -> Result<String> {
-    match provider() {
-        Provider::Local => {
-            if verify_local_password(password, stored_hash) {
-                Ok(String::new())
-            } else {
-                Err(anyhow!("invalid email or password"))
+/// Answer the second factor. Returns the subject on success.
+pub async fn answer_mfa(account_id: i64, challenge: &str, code: &str) -> Result<String> {
+    let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if code.len() != 6 {
+        return Err(anyhow!("the code is six digits"));
+    }
+    let (username, session) = challenge.split_once('\n').ok_or_else(|| anyhow!("that sign-in took too long — start again"))?;
+    match crate::cognito::respond_to_mfa(username, &code, session).await? {
+        crate::cognito::SignIn::Done { sub, access_token } => {
+            remember_access_token(account_id, &access_token);
+            Ok(sub)
+        }
+        crate::cognito::SignIn::MfaRequired { .. } => Err(anyhow!("that code is not right — try the next one your app shows")),
+    }
+}
+
+/// What `begin_mfa` says when it has no token to act with and was given no
+/// password to get one. The caller turns it into a prompt, not an error.
+pub const NEEDS_PASSWORD: &str = "enter your password to set up two-factor authentication";
+
+/// Start enrolment. `password` is needed when no recent sign-in's token is at
+/// hand (the Settings page, an hour after signing in).
+pub async fn begin_mfa(email: &str, account_id: i64, password: Option<&str>) -> Result<Enrolment> {
+    let token = match access_token_for(account_id) {
+        Some(t) => t,
+        None => {
+            let pw = password.filter(|p| !p.is_empty()).ok_or_else(|| anyhow!(NEEDS_PASSWORD))?;
+            match crate::cognito::sign_in_full(email, pw).await? {
+                crate::cognito::SignIn::Done { access_token, .. } => {
+                    remember_access_token(account_id, &access_token);
+                    access_token
+                }
+                crate::cognito::SignIn::MfaRequired { .. } => return Err(anyhow!("two-factor authentication is already on for this account")),
             }
         }
-        Provider::Cognito => crate::cognito::sign_in(email, password).await,
+    };
+    let secret = crate::cognito::associate_totp(&token).await?;
+    let uri = totp_uri(&secret, email);
+    let qr_svg = crate::qr::svg(&uri).map_err(anyhow::Error::msg)?;
+    Ok(Enrolment { secret, uri, qr_svg })
+}
+
+/// Finish enrolment with a code from the app; two-factor is on from here.
+pub async fn confirm_mfa(email: &str, account_id: i64, code: &str, db: &crate::store::Db) -> Result<()> {
+    let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    let token = access_token_for(account_id).ok_or_else(|| anyhow!("that setup took too long — start it again"))?;
+    crate::cognito::confirm_totp(email, &token, &code).await?;
+    crate::store::set_mfa_enabled(db, account_id, true).await
+}
+
+/// Turn two-factor off for an account: the person, with their code, or an
+/// operator for someone who lost their phone.
+pub async fn disable_mfa(email: &str, account_id: i64, db: &crate::store::Db) -> Result<()> {
+    crate::cognito::set_totp_enabled(email, false).await?;
+    crate::store::set_mfa_enabled(db, account_id, false).await
+}
+
+/// Prove password and code together, by signing in — for "turn it off".
+pub async fn check_mfa_code(email: &str, password: &str, code: &str) -> Result<()> {
+    match crate::cognito::sign_in_full(email, password).await? {
+        crate::cognito::SignIn::MfaRequired { session, username } => {
+            let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+            crate::cognito::respond_to_mfa(&username, &code, &session).await.map(|_| ())
+        }
+        crate::cognito::SignIn::Done { .. } => Ok(()),
     }
 }
 
-/// Set or reset a password. The local provider returns the new hash to store;
-/// Cognito returns an empty string, because the row holds nothing.
-pub async fn set_password(email: &str, password: &str) -> Result<String> {
-    check_password_strength(password)?;
-    match provider() {
-        Provider::Local => crate::web::auth::hash_password(password),
-        Provider::Cognito => crate::cognito::set_password(email, password).await.map(|()| String::new()),
-    }
+/// The `otpauth://` URI an authenticator app scans.
+pub fn totp_uri(secret: &str, email: &str) -> String {
+    let issuer = crate::config::get("HUNTWELL_MFA_ISSUER").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "Huntwell".into());
+    let label = urlencode(&format!("{issuer}:{email}"));
+    format!("otpauth://totp/{label}?secret={secret}&issuer={}&algorithm=SHA1&digits=6&period=30", urlencode(&issuer))
 }
 
-/// Remove the identity behind a deleted account. A failure is the caller's to
-/// report, not to ignore: an orphaned pool user keeps an address unusable.
-pub async fn delete_user(email: &str) -> Result<()> {
-    match provider() {
-        Provider::Local => Ok(()),
-        Provider::Cognito => crate::cognito::delete_user(email).await,
-    }
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
-
-/// Verify a password against a stored argon2 hash.
-///
-/// Always runs a verification, even when the hash is absent, so the time taken
-/// does not reveal whether an account has a password set — which under Cognito
-/// is every local row.
-pub fn verify_local_password(password: &str, hash: &str) -> bool {
-    if hash.trim().is_empty() {
-        let _ = crate::web::auth::verify_password(password, DUMMY_HASH);
-        return false;
-    }
-    crate::web::auth::verify_password(password, hash)
-}
-
-/// An argon2 hash of nothing in particular, to spend the same time on an
-/// account with no password as on one with the wrong password.
-const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZQ$K7X1dLQ8H5HvVbDqQ2Xk3jZ8p1n5tOqR0wYyYyYyYyY";
 
 #[cfg(test)]
-mod tests {
+mod totp_tests {
     use super::*;
 
     #[test]
-    fn weak_passwords_are_refused() {
-        for bad in ["short", "alllowercase1", "ALLUPPERCASE1", "NoDigitsHere"] {
-            assert!(check_password_strength(bad).is_err(), "{bad} should fail");
-        }
-        assert!(check_password_strength("CorrectHorse1Battery").is_ok());
-    }
-
-    #[test]
-    fn an_empty_hash_never_verifies() {
-        // Under Cognito every row has one. If this returned true, an account
-        // with no local password would be signed in by any password at all.
-        assert!(!verify_local_password("anything", ""));
-        assert!(!verify_local_password("", "   "));
-    }
-
-    #[test]
-    fn a_real_hash_still_verifies() {
-        let hash = crate::web::auth::hash_password("CorrectHorse1Battery").unwrap();
-        assert!(verify_local_password("CorrectHorse1Battery", &hash));
-        assert!(!verify_local_password("CorrectHorse1Batterz", &hash));
-    }
-
-    #[test]
-    fn an_identity_carries_one_side_or_the_other() {
-        // The invariant the account row depends on: a hash and a subject are
-        // never both present, so nothing has to decide which one wins.
-        let local = NewIdentity { cognito_sub: String::new(), password_hash: "argon2…".into() };
-        let cognito = NewIdentity { cognito_sub: "9f1c-42".into(), password_hash: String::new() };
-        for id in [&local, &cognito] {
-            assert!(id.cognito_sub.is_empty() != id.password_hash.is_empty());
-        }
+    fn the_uri_names_the_account_and_issuer() {
+        let uri = totp_uri("ABC234", "a b+c@example.com");
+        assert!(uri.starts_with("otpauth://totp/Huntwell%3Aa%20b%2Bc%40example.com?secret=ABC234&issuer=Huntwell"), "{uri}");
     }
 }

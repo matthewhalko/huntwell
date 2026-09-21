@@ -206,16 +206,19 @@ async fn harden_headers(State(state): State<App>, req: Request<Body>, next: Next
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    // The UI is self-contained apart from Google Fonts and the Turnstile
-    // widget, which is a script and an iframe from challenges.cloudflare.com;
-    // the dev server proxies through, so the same policy holds there.
+    // The UI is self-contained apart from Google Fonts, the Turnstile widget
+    // (a script and an iframe from challenges.cloudflare.com) and the card
+    // form, which is Stripe.js: a script, iframes and API calls, from the
+    // origins Stripe documents for a CSP. The dev server proxies through, so
+    // the same policy holds there.
     h.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; \
+            "default-src 'self'; script-src 'self' https://challenges.cloudflare.com https://js.stripe.com https://*.js.stripe.com; \
              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; \
-             frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https://*.stripe.com; \
+             connect-src 'self' https://api.stripe.com; \
+             frame-src https://challenges.cloudflare.com https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     if state.dev {

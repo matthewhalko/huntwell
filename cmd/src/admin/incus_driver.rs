@@ -180,6 +180,7 @@ const SHARED_SETTINGS: &[&str] = &[
     "BROWSERBASE_PROJECT_ID",
     "BROWSERBASE_REGION",
     "BROWSERBASE_TIMEOUT_S",
+    "BROWSERBASE_KEEP_ALIVE",
     "HUNTWELL_S3_BUCKET",
     "HUNTWELL_S3_ACCESS_KEY",
     "HUNTWELL_S3_SECRET_KEY",
@@ -194,18 +195,15 @@ const APP_ONLY_SETTINGS: &[&str] = &[
     "HUNTWELL_SESSION_SECRET",
     "HUNTWELL_PUBLIC_URL",
     "HUNTWELL_OPEN_SIGNUP",
-    "HUNTWELL_IDENTITY",
     "COGNITO_USER_POOL_ID",
     "COGNITO_CLIENT_ID",
     "COGNITO_CLIENT_SECRET",
     "COGNITO_REGION",
     "AWS_COGNITO_KEY",
     "AWS_COGNITO_SECRET",
-    "AWS_SES_KEY",
-    "AWS_SES_SECRET",
-    "HUNTWELL_SES_REGION",
+    // Outbound mail goes through Resend; the notification service sends it.
+    "RESEND_API_KEY",
     "HUNTWELL_MAIL_FROM",
-    "HUNTWELL_MAIL_API_KEY",
     "STRIPE_SECRET_KEY",
     "STRIPE_WEBHOOK_SECRET",
     // Public, but the website needs it to mount the card field, and it is
@@ -284,11 +282,10 @@ pub fn env_file(
             // handed settings that would have it hash passwords into the
             // database instead. Caught here, at Deploy, where the operator is
             // looking — the website would refuse to start anyway.
-            let explicit_local = get("HUNTWELL_IDENTITY").is_some_and(|v| v.trim().eq_ignore_ascii_case("local"));
-            if !explicit_local && get("COGNITO_USER_POOL_ID").map_or(true, |v| v.trim().is_empty()) {
+            if get("COGNITO_USER_POOL_ID").map_or(true, |v| v.trim().is_empty()) {
                 bail!(
-                    "no Cognito pool is configured, so the app VM would store password hashes in the database. \
-                     Add COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION, COGNITO_CLIENT_SECRET, \
+                    "no Cognito pool is configured, and every account signs in through one — the website would refuse \
+                     to start. Add COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION, COGNITO_CLIENT_SECRET, \
                      AWS_COGNITO_KEY and AWS_COGNITO_SECRET to the Secrets Manager secret (docs/SECRETS.md)"
                 );
             }
@@ -660,6 +657,26 @@ pub fn endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
     host.parse().ok()
 }
 
+/// The part of a "bus: could not connect" log line worth showing, and what to
+/// check for it. The console shows only the start of an error, so the log's
+/// timestamp and module go; and "nothing answered" is a firewall, which the
+/// certificate advice that fits every other failure would only lead away from.
+pub fn bus_failure(line: &str) -> (String, &'static str) {
+    let reason = line.find("could not connect").map(|at| &line[at..]).unwrap_or(line);
+    let reason = reason.split(" — events will be dropped").next().unwrap_or(reason).to_string();
+    let lower = reason.to_ascii_lowercase();
+    let unreachable = ["timed out", "timeout", "refused", "unreachable", "no route"].iter().any(|w| lower.contains(w));
+    let hint = if unreachable {
+        "nothing answered there: on the app VM's host, `sys incus init` needs `--allow <host IP>:4222` (VMs reach only \
+         allowed private addresses), ufw must admit 4222 from the private network, and `incus config device show hw-edge` \
+         should list a `nats` proxy"
+    } else {
+        "check that HUNTWELL_NATS_TLS_CERT names the app host's IP and 127.0.0.1, that HUNTWELL_NATS_TLS_CA signed it, \
+         and the NATS user and password"
+    };
+    (reason, hint)
+}
+
 /// Prove the VM joined the bus — TLS verified, login accepted — from what its
 /// service logged since it last started. A certificate that does not name the
 /// address, or a CA that does not match, otherwise shows up only as live pages
@@ -680,12 +697,8 @@ async fn wait_bus(host: &Host, vm: &Vm, role: Role) -> Result<()> {
             return Ok(());
         }
         if line.contains("could not connect") {
-            bail!(
-                "{} could not join the event bus: {} — check that HUNTWELL_NATS_TLS_CERT names the app host's IP and \
-                 127.0.0.1, that HUNTWELL_NATS_TLS_CA signed it, and the NATS user and password",
-                vm.name,
-                redact_urls(line.trim())
-            );
+            let (reason, hint) = bus_failure(line.trim());
+            bail!("{} could not join the event bus: {} — {hint}", vm.name, redact_urls(&reason));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -1247,6 +1260,16 @@ pub async fn remove_edge(host: &Host) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bus_failure_says_why_first_and_what_to_check() {
+        let line = "2026-09-21T21:16:03.682316Z  WARN huntwell::bus: bus: could not connect to tls://10.0.0.2:4222 (timed out) — events will be dropped";
+        let (reason, hint) = bus_failure(line);
+        assert!(reason.starts_with("could not connect to tls://10.0.0.2:4222 (timed out)"), "{reason}");
+        assert!(hint.contains("--allow"), "a timeout is the firewall, not the certificate");
+        let (_, hint) = bus_failure("bus: could not connect to tls://10.0.0.2:4222 (invalid peer certificate: UnknownIssuer)");
+        assert!(hint.contains("HUNTWELL_NATS_TLS_CA"));
+    }
     use std::collections::HashMap;
 
     fn settings() -> HashMap<&'static str, String> {
@@ -1259,8 +1282,7 @@ mod tests {
             ("HUNTWELL_SESSION_SECRET", "sess-secret"),
             ("AWS_COGNITO_KEY", "AKIACOGNITO"),
             ("AWS_COGNITO_SECRET", "cognito-secret"),
-            ("AWS_SES_KEY", "AKIASES"),
-            ("AWS_SES_SECRET", "ses-secret"),
+            ("RESEND_API_KEY", "re_live_mailkey"),
             ("COGNITO_USER_POOL_ID", "us-east-1_x"),
             ("STRIPE_SECRET_KEY", "sk_live"),
         ] {
@@ -1275,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn an_app_vm_is_never_configured_to_hash_passwords() {
+    fn an_app_vm_is_never_deployed_without_a_pool() {
         let mut s = settings();
         s.remove("COGNITO_USER_POOL_ID");
         let e = env_file(Role::App, "postgres://u:p@10.0.0.2:5432/huntwell", 7, None, "https", |k| s.get(k).cloned())
@@ -1283,11 +1305,7 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(e.contains("Cognito"), "{e}");
-        // Said out loud, local identity is allowed.
-        s.insert("HUNTWELL_IDENTITY", "local".into());
-        assert!(env_file(Role::App, "postgres://u:p@10.0.0.2:5432/huntwell", 7, None, "https", |k| s.get(k).cloned()).is_ok());
-        // A worker never hashes anything either way.
-        s.remove("HUNTWELL_IDENTITY");
+        // A worker never signs anyone in.
         assert!(env_file(Role::Worker, "postgres://u:p@10.0.0.2:5432/huntwell", 7, None, "https", |k| s.get(k).cloned()).is_ok());
     }
 
@@ -1296,7 +1314,7 @@ mod tests {
         // The reason VMs are spread across servers is to contain a compromise.
         // That only works if a rooted worker finds nothing worth stealing.
         let w = env(Role::Worker);
-        for secret in ["sess-secret", "cognito-secret", "AKIACOGNITO", "ses-secret", "AKIASES", "us-east-1_x", "sk_live"] {
+        for secret in ["sess-secret", "cognito-secret", "AKIACOGNITO", "re_live_mailkey", "us-east-1_x", "sk_live"] {
             assert!(!w.contains(secret), "a worker VM was handed {secret}:\n{w}");
         }
         // And it has what it does need.

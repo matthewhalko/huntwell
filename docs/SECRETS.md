@@ -124,8 +124,7 @@ Plain names, exactly as the application reads them:
   "CURSOR_API_KEY":            "...",
   "BROWSERBASE_API_KEY":       "...",
   "BROWSERBASE_PROJECT_ID":    "...",
-  "AWS_SES_KEY":             "...",
-  "AWS_SES_SECRET":          "...",
+  "RESEND_API_KEY":          "re_...",
   "HUNTWELL_MAIL_FROM":      "Huntwell <hello@yourdomain.com>",
   "HUNTWELL_S3_ACCESS_KEY":  "...",
   "HUNTWELL_S3_SECRET_KEY":  "...",
@@ -136,6 +135,22 @@ Plain names, exactly as the application reads them:
   "HUNTWELL_NATS_TLS_KEY":   "-----BEGIN PRIVATE KEY-----\n..."
 }
 ```
+
+### Mail: Resend
+
+Every email — confirmation codes, password resets, invitations, run alerts —
+goes through [Resend](https://resend.com). Two settings:
+
+- `RESEND_API_KEY` — an API key with **Sending access** only, restricted to the
+  sending domain. It is a credential, so it lives in the secret.
+- `HUNTWELL_MAIL_FROM` — the From header, e.g. `Huntwell <hello@yourdomain.com>`.
+  The domain must be verified in Resend (SPF and DKIM records in DNS). An
+  operator setting: `./admin config set HUNTWELL_MAIL_FROM "…"`.
+
+Only the app VM is given the key. The notification service sends from the
+`mail_outbox` queue and passes the row's id as Resend's `Idempotency-Key`, so a
+retry after a crash is never a second email. With no key, mail is logged
+instead of sent — which is what `./dev.sh` does.
 
 The NATS certificates are made as in PRODUCTION.md ("The bus's TLS
 certificates"). They reach VMs as files, never in a settings file.
@@ -165,41 +180,46 @@ a wrong secret looks like every visitor failing.
 
 ## Identity
 
-Passwords live in an AWS Cognito user pool, not in the database. The `account`
-row keys to the pool by `cognito_sub` and stores no hash — the same arrangement
-as Park River's `identity` module, which this is a port of.
+Every password lives in an AWS Cognito user pool — for the product's accounts
+*and* for the admin console's operators, in every environment. The `account`
+row keys to the pool by `cognito_sub` and stores no hash; so does `admin_user`.
+There is no local fallback: a dev checkout points at a dev pool.
+
+Two pools, so a customer can never be an operator by accident and each can be
+locked down on its own terms:
 
 ```json
 {
-  "COGNITO_USER_POOL_ID":  "us-east-1_AbC123",
-  "COGNITO_CLIENT_ID":     "...",
-  "COGNITO_CLIENT_SECRET": "...",
-  "COGNITO_REGION":        "us-east-1",
-  "AWS_COGNITO_KEY":       "AKIA...",
-  "AWS_COGNITO_SECRET":    "..."
+  "COGNITO_USER_POOL_ID":        "us-east-1_AbC123",
+  "COGNITO_CLIENT_ID":           "...",
+  "COGNITO_CLIENT_SECRET":       "...",
+  "COGNITO_REGION":              "us-east-1",
+
+  "ADMIN_COGNITO_USER_POOL_ID":  "us-east-1_XyZ789",
+  "ADMIN_COGNITO_CLIENT_ID":     "...",
+  "ADMIN_COGNITO_CLIENT_SECRET": "...",
+
+  "AWS_COGNITO_KEY":             "AKIA...",
+  "AWS_COGNITO_SECRET":          "..."
 }
 ```
 
-- The app client needs **`ALLOW_USER_PASSWORD_AUTH`**. Sign-in is an unsigned
+- Both app clients need **`ALLOW_USER_PASSWORD_AUTH`**. Sign-in is an unsigned
   `InitiateAuth` — the call a person's own password authorises — so the login
   path needs no AWS credential at all.
-- `AWS_COGNITO_KEY`/`_SECRET` is an IAM user allowed `AdminCreateUser`,
-  `AdminSetUserPassword` and `AdminDeleteUser` on that pool, and nothing else.
-  Creating an account is something the platform does, so those calls are
-  SigV4-signed; the bootstrap credential is deliberately not accepted for them.
-- `COGNITO_CLIENT_SECRET` only if the app client has one. A client with a
-  secret used without one is refused outright, with an error that blames the
-  credentials.
+- Both pools: **self-registration off** (Huntwell creates the users), and
+  **MFA Optional with authenticator apps** if two-factor is wanted.
+- `AWS_COGNITO_KEY`/`_SECRET` is one IAM user allowed `AdminCreateUser`,
+  `AdminSetUserPassword`, `AdminDeleteUser`, `AdminSetUserMFAPreference` and
+  `AdminGetUser` on **both** pools, and nothing else.
+- `*_CLIENT_SECRET` only if the app client has one. A client with a secret used
+  without one is refused outright, with an error that blames the credentials.
+- `ADMIN_COGNITO_REGION` defaults to `COGNITO_REGION`.
 
-**`HUNTWELL_IDENTITY`** overrides the choice: `local` keeps argon2 hashes in
-the `account` row, `cognito` requires the pool. Unset, a configured pool means
-Cognito and no pool means local — so `./dev.sh` signs people in with no AWS
-credentials anywhere, and production does not.
-
-The operator console (`admin_user`) is deliberately outside this. It is
-bootstrapped by a setup key printed at first boot, not by the product's
-directory, so losing access to the pool never locks you out of the control
-plane.
+The website refuses to start without the users' pool, and the admin without the
+operators' pool; the admin's Deploy refuses an app VM without the users' pool.
+Claiming a fresh install (the setup key) creates the first operator in the
+operators' pool.
 
 ---
 

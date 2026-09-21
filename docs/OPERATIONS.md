@@ -57,6 +57,6 @@ so a deploy is: copy binary, restart.
 | "plan is already running" but nothing is | The previous server died mid-run; restart the server (it marks stale runs failed) or cancel from the UI |
 | Everyone signed out after a restart | `HUNTWELL_SESSION_SECRET` missing — sessions are stored server-side, but cookies are not `Secure` in `--dev`; in production make sure the file is readable by the service user |
 | API rate limits or sign-in lockouts hit everyone at once | `HUNTWELL_TRUST_PROXY` unset behind a proxy, so every caller is the proxy's address (the admin sets it on the app VM automatically) |
-| A new account never gets its confirmation code | Mail is not sending: check the `notification` service's log in the app VM and the SES keys in the secret. Codes sit in `mail_outbox` until it does |
+| A new account never gets its confirmation code | Mail is not sending: check the `notification` service's log in the app VM — Resend's own reason is in it ("domain is not verified", "API key is invalid"). Check `RESEND_API_KEY` in the secret and that `HUNTWELL_MAIL_FROM` is on a verified domain. Codes sit in `mail_outbox` until it does |
 | Sign-in says "verification failed" for everyone | `TURNSTILE_SECRET_KEY` does not match the widget's site key — the admin log has Cloudflare's error code |
 | UI 404 "UI bundle not built" | The binary was built without `UI/web/dist`; run `npm run build` in `UI/web` and rebuild |

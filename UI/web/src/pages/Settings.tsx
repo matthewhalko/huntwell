@@ -5,6 +5,7 @@ import { Field, useToast } from '../components/ui'
 import { Theme, useTheme } from '../theme'
 import { TeamSection } from '../components/TeamSection'
 import { Picker } from '../components/Picker'
+import { MfaSetup } from './Auth'
 
 /// Every zone this browser knows, for the picker. `supportedValuesOf` is the
 /// one-liner where it exists; the fallback is short on purpose, since the zone
@@ -127,6 +128,7 @@ export default function Settings() {
               Change password
             </button>
           </div>
+          <TwoFactor />
         </div>
         <div className="stack">
         <TeamSection />
@@ -324,6 +326,59 @@ function ConnectedLogins() {
               Another site…
             </button>
           )}
+        </>
+      )}
+    </div>
+  )
+}
+
+/// Two-factor authentication: on or off, and the way to change it. Turning it
+/// off asks for the password and a current code, so a stolen session cannot.
+function TwoFactor() {
+  const { me, refresh } = useAuth()
+  const toast = useToast()
+  const [setup, setSetup] = useState(false)
+  const [pw, setPw] = useState('')
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const off = async () => {
+    setBusy(true)
+    try {
+      await api.post('/api/auth/mfa/disable', { password: pw, code })
+      await refresh()
+      setPw('')
+      setCode('')
+      toast('Two-factor turned off')
+    } catch (e: any) {
+      toast(e.message, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="card">
+      <h3>Two-factor authentication</h3>
+      {me?.mfa_enabled ? (
+        <>
+          <p className="muted">On. Signing in asks for a code from your authenticator app.</p>
+          <Field label="Password">
+            <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="current-password" />
+          </Field>
+          <Field label="Current code">
+            <input type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={7} value={code} onChange={(e) => setCode(e.target.value)} />
+          </Field>
+          <button className="btn" disabled={busy || !pw || code.replace(/\D/g, '').length !== 6} onClick={off}>
+            Turn off two-factor
+          </button>
+        </>
+      ) : setup ? (
+        <MfaSetup intro="Scan a QR with your authenticator app; from then on signing in asks for its code." askPassword onDone={() => { setSetup(false); toast('Two-factor is on') }} skipLabel="Cancel" />
+      ) : (
+        <>
+          <p className="muted">Off. An authenticator app keeps your account safe even if your password leaks.</p>
+          <button className="btn primary" onClick={() => setSetup(true)}>
+            Set up two-factor
+          </button>
         </>
       )}
     </div>

@@ -34,11 +34,13 @@ pub fn router() -> Router<App> {
         .route("/plans/{id}/artifacts", get(plan_artifacts))
         .route("/plans/{id}/graph", get(plan_graph))
         .route("/artifacts", get(all_artifacts))
+        .route("/prospects", get(prospects))
         .route("/executions", get(list_executions))
         .route("/executions/{id}", get(get_execution))
         .route("/executions/{id}/log", get(execution_log))
         .route("/executions/{id}/cancel", post(cancel_execution))
         .route("/usage", get(usage))
+        .route("/operator/workspaces", post(operator_workspace))
 }
 
 /// The authenticated caller: which workspace, and whether the key is pinned to
@@ -503,6 +505,158 @@ async fn cancel_execution(
     Json(json!({ "id": id, "status": "cancelled" })).into_response()
 }
 
+// ---- operator ---------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct NewWorkspace {
+    /// The sign-in address for the workspace. One per customer of the caller.
+    email: String,
+    #[serde(default)]
+    name: String,
+    /// Addresses the returned key may be used from. Empty allows any.
+    #[serde(default)]
+    allow_cidr: String,
+}
+
+/// Creates (or finds) a workspace and returns a fresh key for it.
+///
+/// For a platform that gives each of its own customers a private workspace
+/// rather than sharing one: the caller holds `HUNTWELL_OPERATOR_KEY`, and each
+/// key this returns reaches exactly one workspace. Idempotent by email — a
+/// re-provision returns the same workspace with a new key, so a lost key is
+/// recovered by asking again rather than by a support ticket.
+///
+/// Deliberately not part of a workspace key's powers: `Authorization` here is
+/// the operator secret, and a workspace key calling this gets the same 401 as
+/// no key at all.
+async fn operator_workspace(
+    State(state): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<NewWorkspace>,
+) -> Response {
+    let Some(expected) = crate::config::get("HUNTWELL_OPERATOR_KEY").filter(|k| k.trim().len() >= 16) else {
+        return err(StatusCode::NOT_FOUND, "not found");
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Compared as digests rather than as strings: equal-length hashes give the
+    // comparison nothing to leak about where two secrets first differ.
+    if store::sha256_hex(&presented) != store::sha256_hex(expected.trim()) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let email = body.email.trim().to_lowercase();
+    if !email.contains('@') {
+        return err(StatusCode::BAD_REQUEST, "a workspace needs an email address");
+    }
+    let name = if body.name.trim().is_empty() { email.clone() } else { body.name.trim().to_string() };
+
+    let account = match store::find_account_by_email(&state.db, &email).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            // The pool holds the password, and nobody needs to know it: the
+            // workspace is driven by the key this returns. A person who later
+            // wants to sign in resets it by email like any other account.
+            let password = format!("Hw-{}-{}", store::new_api_token(), "A9!");
+            let sub = match crate::identity::create_user(&email, &password).await {
+                Ok(s) => s,
+                Err(e) => return err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+            };
+            match store::create_account(&state.db, &email, &name, &sub).await {
+                Ok(a) => a,
+                Err(e) => return err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+            }
+        }
+        Err(e) => return oops(e),
+    };
+    // One live key per workspace: a re-provision replaces the key rather than
+    // adding to a pile of equally powerful ones nobody can tell apart.
+    if let Ok(keys) = store::list_api_keys(&state.db, account.account_id).await {
+        for k in keys.iter().filter(|k| k.label == "park river" && !k.revoked) {
+            let _ = store::revoke_api_key(&state.db, account.account_id, k.key_id).await;
+        }
+    }
+    match store::create_api_key(&state.db, account.account_id, "park river", None, 0, &body.allow_cidr).await {
+        Ok(key) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "workspace_id": account.account_id,
+                "workspace": account.display_name,
+                "email": account.email,
+                "api_key": key.token,
+                "key_hint": key.token_hint,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
+}
+
+// ---- prospects --------------------------------------------------------------
+
+/// A prospect in full — every field a CRM needs to create a contact, which the
+/// artifact summary deliberately does not carry.
+fn prospect_json(p: &store::ProspectRow) -> Value {
+    json!({
+        "id": p.prospect_id,
+        "plan_id": p.plan_id,
+        "plan": p.source,
+        "name": p.name,
+        "title": p.title,
+        "company": p.company,
+        "industry": p.industry,
+        "email": p.email,
+        "email_status": p.email_status,
+        "phone": p.phone,
+        "website": p.website,
+        "linkedin": p.linkedin,
+        "location": p.location,
+        "notes": p.notes,
+        "estimated_value": p.estimated_value,
+        "source_key": p.source_key,
+        "first_seen_at": p.first_seen_utc.to_rfc3339(),
+        "last_seen_at": p.last_seen_utc.to_rfc3339(),
+    })
+}
+
+/// What a plan has found, for a client that keeps its own copy.
+///
+/// `after` is the last `id` the caller stored; the reply carries
+/// `next_cursor`, which is that id advanced, and `has_more` when the page was
+/// full. Polling with the cursor returns only what is new, so a sync that runs
+/// every few minutes costs one small query and usually an empty page.
+async fn prospects(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let c = match caller(&state, &headers, &q, peer, "/v1/prospects").await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    // A key pinned to a plan is answered for that plan whatever it asks for.
+    let plan = c.plan.or_else(|| q.get("plan_id").and_then(|v| v.trim().parse().ok()));
+    let after = num(&q, "after", 0);
+    let limit = num(&q, "limit", 100).clamp(1, 500);
+    match store::list_prospects_after(&state.db, c.workspace, plan, after, limit).await {
+        Ok(rows) => {
+            let next = rows.last().map(|r| r.prospect_id).unwrap_or(after);
+            Json(json!({
+                "data": rows.iter().map(prospect_json).collect::<Vec<_>>(),
+                "next_cursor": next,
+                "has_more": rows.len() as i64 == limit,
+            }))
+            .into_response()
+        }
+        Err(e) => oops(e),
+    }
+}
+
 // ---- artifacts --------------------------------------------------------------
 
 /// Everything a plan has found, whatever kind it collects: rows, documents and
@@ -589,9 +743,10 @@ async fn usage(
     match store::ensure_usage(&state.db, c.workspace).await {
         Ok(u) => Json(json!({
             "period_start": u.period_start,
-            "budget_usd": u.budget_usd + u.topups_usd,
+            "budget_usd": u.available_usd,
             "used_usd": u.used_usd,
             "remaining_usd": u.remaining_usd,
+            "credits_usd": u.credits_usd,
             "tokens_used": u.tokens_used,
         }))
         .into_response(),

@@ -67,6 +67,8 @@ export interface Me {
   /// False until the link in the verification email is followed; the app
   /// shows the check-your-email screen instead of anything else until then.
   email_verified: boolean
+  /// Whether a TOTP authenticator is on for this account.
+  mfa_enabled: boolean
   open_signup: boolean
   /// False until first-run setup is done; the app shows the setup dialog on it.
   onboarded: boolean
@@ -112,10 +114,14 @@ export interface Workspace {
   own: boolean
 }
 
-/// The card on file. `has_card` is what gates a run — no card, no work.
+/// The card on file and the prepaid wallet. Both gate a run.
 export interface Billing {
   stripe: boolean
+  in_app?: boolean
+  production?: boolean
   has_card: boolean
+  has_credits?: boolean
+  credits_usd?: number
   card: { brand: string; last4: string; added_at: string | null } | null
 }
 
@@ -331,13 +337,15 @@ export interface Overview {
   latest_prospects: Prospect[]
 }
 
-// The dollar budget for the current billing period (the usage meter + cap).
+// Prepaid credits plus this period's consumption. `remaining_usd` / `credits_usd`
+// is what a run can still spend.
 export interface Usage {
   budget_usd: number
   topups_usd: number
   available_usd: number
   used_usd: number
   remaining_usd: number
+  credits_usd: number
   tokens_used: number
   cogs_usd: number
   period_start: string

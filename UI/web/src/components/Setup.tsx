@@ -97,8 +97,8 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
               <div className="step-title">Add a payment method</div>
               <p className="step-hint">
                 {hasCard
-                  ? `${billing?.card?.brand} •••• ${billing?.card?.last4} on file. Nothing is charged until a search runs.`
-                  : 'Executions cost money, so a card comes first. Nothing is charged until one runs.'}
+                  ? `${billing?.card?.brand} •••• ${billing?.card?.last4} on file. Credits are purchased next — a run spends only what you have preallocated.`
+                  : 'Executions cost money, so a card comes first. You then buy credits and spend only those.'}
               </p>
               {!hasCard && (
                 <button className="btn primary sm" onClick={() => setAddingCard(true)}>

@@ -27,7 +27,8 @@ pub fn cdp_port_for(account_id: i64) -> u16 {
 }
 
 /// Creates the Run row and starts the child. Refuses a second concurrent run
-/// of the same plan.
+/// for the account so only one process can have unreported spend against the
+/// prepaid wallet.
 pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, args: RunArgs) -> Result<i64> {
     let _gate = state.start_gate.lock().await;
     let plan = store::get_plan(&state.db, account_id, plan_id)
@@ -39,17 +40,26 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     if let Some(active) = store::active_execution_for_plan(&state.db, plan_id).await? {
         anyhow::bail!("plan is already running (run #{})", active.execution_id);
     }
-    // A run costs money to execute, so it needs someone to bill. Checked in the
-    // same place as the budget cap — the single point every run passes through,
-    // so the manual "Go now", a scheduled run and an API-key run are all held to
-    // it, not just the button the UI happens to gate.
-    if !store::has_payment_method(&state.db, account_id).await? {
+    if let Some(active) = store::active_execution_for_account(&state.db, account_id).await? {
+        anyhow::bail!(
+            "another plan is already running against this account's credits (run #{})",
+            active.execution_id
+        );
+    }
+    // A run costs money to execute, so it needs someone to bill and prepaid
+    // credits to spend. Checked here — the single point every run passes
+    // through — so the manual "Go now", a scheduled run and an API-key run
+    // are all held to it, not just the button the UI happens to gate.
+    let has_card = if crate::config::is_production() {
+        store::has_real_payment_method(&state.db, account_id).await?
+    } else {
+        store::has_payment_method(&state.db, account_id).await?
+    };
+    if !has_card {
         anyhow::bail!("no payment method on file — add a card in Usage & billing to start a run");
     }
-    // The usage cap — the single point every run passes through, so manual and
-    // scheduled runs are both stopped once the account is out of budget.
     if store::account_over_budget(&state.db, account_id).await? {
-        anyhow::bail!("monthly usage limit reached — add tokens to keep running plans");
+        anyhow::bail!("no credits remaining — buy credits in Usage & billing to start a run");
     }
     let cdp = cdp_port_for(account_id);
     let args_json = serde_json::to_value(&args)?;

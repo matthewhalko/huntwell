@@ -110,6 +110,7 @@ BROWSERBASE_PROJECT_ID=...
 # optional
 BROWSERBASE_PROXIES=1
 BROWSERBASE_REGION=us-east-1
+BROWSERBASE_KEEP_ALIVE=1       # default on: the session outlives each agent call; released when the run ends
 BROWSERBASE_CONTEXT_ID=...     # a persistent Context = the cloud per-account profile; logins persist
 ```
 
@@ -138,7 +139,7 @@ no `CREATE TABLE` in Rust.
 
 ## Security notes
 
-- Sessions: random cookie token, SHA-256 stored, argon2id passwords, same
+- Sessions: random cookie token, SHA-256 stored; passwords live in Cognito (never here), same
   message for unknown email and wrong password.
 - Every store function takes the account id; a bare `PlanId` is never trusted.
 - The UI's CSP allows only self + Google Fonts; no CDN scripts.

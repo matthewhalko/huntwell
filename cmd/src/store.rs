@@ -242,10 +242,8 @@ pub struct Account {
     pub account_id: i64,
     pub email: String,
     pub display_name: String,
-    #[serde(skip)]
-    /// Empty under Cognito identity — the pool holds the password there.
-    pub password_hash: String,
-    /// The Cognito subject this account is, empty on a local-identity install.
+    /// The Cognito subject this account is. Empty only on a row from before
+    /// the pool, until its first sign-in binds it.
     pub cognito_sub: String,
     pub timezone: String,
     /// True while the timezone follows the browser. Set false the moment
@@ -262,6 +260,8 @@ pub struct Account {
     /// When the address was proven theirs. `None` gates everything but
     /// sign-out and resend (see `web::auth::AuthUser`).
     pub email_verified_at: Option<DateTime<Utc>>,
+    /// When two-factor was turned on; `None` means it is off.
+    pub mfa_enabled_at: Option<DateTime<Utc>>,
     /// What this account's workspace is called. Empty until somebody names it.
     pub workspace_name: String,
     /// Plan kinds this account may create, comma-separated. Empty defers to the
@@ -293,18 +293,17 @@ impl Account {
 }
 
 const ACCOUNT_COLS: &str =
-    r#"account_id,email,display_name,password_hash,cognito_sub,timezone,timezone_auto,theme,created_at,onboarded_at,active_workspace_id,email_verified_at,workspace_name,enabled_kinds,platform_ack_at,platform_ack_by,platform_ack_text,connected_logins"#;
+    r#"account_id,email,display_name,cognito_sub,timezone,timezone_auto,theme,created_at,onboarded_at,active_workspace_id,email_verified_at,mfa_enabled_at,workspace_name,enabled_kinds,platform_ack_at,platform_ack_by,platform_ack_text,connected_logins"#;
 
-pub async fn create_account(db: &Db, email: &str, display_name: &str, id: &crate::identity::NewIdentity) -> Result<Account> {
+pub async fn create_account(db: &Db, email: &str, display_name: &str, cognito_sub: &str) -> Result<Account> {
     let email = email.trim().to_lowercase();
     let row = sqlx::query(&format!(
-        r#"INSERT INTO account (email,display_name,password_hash,cognito_sub) VALUES ($1,$2,$3,$4)
+        r#"INSERT INTO account (email,display_name,cognito_sub) VALUES ($1,$2,$3)
            RETURNING {ACCOUNT_COLS}"#
     ))
     .bind(&email)
     .bind(display_name.trim())
-    .bind(&id.password_hash)
-    .bind(&id.cognito_sub)
+    .bind(cognito_sub)
     .fetch_one(db)
     .await
     .map_err(|e| match e {
@@ -335,22 +334,16 @@ pub async fn account_count(db: &Db) -> Result<i64> {
 /// A sign-up for an address held by an account that never verified it. The
 /// row is taken over — new credential, new name, nothing of the squatter's
 /// kept, every session ended — rather than left blocking the address forever.
-pub async fn reclaim_unverified_account(
-    db: &Db,
-    account_id: i64,
-    display_name: &str,
-    id: &crate::identity::NewIdentity,
-) -> Result<Account> {
+pub async fn reclaim_unverified_account(db: &Db, account_id: i64, display_name: &str, cognito_sub: &str) -> Result<Account> {
     let row = sqlx::query(&format!(
-        r#"UPDATE account SET display_name=$2, password_hash=$3, cognito_sub=$4, created_at=now(),
+        r#"UPDATE account SET display_name=$2, cognito_sub=$3, created_at=now(),
                   verify_token_hash='', verify_sent_at=NULL, verify_attempts=0, onboarded_at=NULL, active_workspace_id=NULL
            WHERE account_id=$1 AND email_verified_at IS NULL
            RETURNING {ACCOUNT_COLS}"#
     ))
     .bind(account_id)
     .bind(display_name.trim())
-    .bind(&id.password_hash)
-    .bind(&id.cognito_sub)
+    .bind(cognito_sub)
     .fetch_optional(db)
     .await?
     .ok_or_else(|| anyhow!("an account with that email already exists"))?;
@@ -431,6 +424,86 @@ pub async fn verify_email_code(db: &Db, account_id: i64, code_hash: &str) -> Res
         return Ok(CodeCheck::NeedNew);
     }
     Ok(CodeCheck::Wrong { left })
+}
+
+/// Record the password-reset code just sent for `email`. Nothing happens for
+/// an address with no account — and the caller says nothing either way.
+pub async fn set_reset_token(db: &Db, email: &str, code_hash: &str) -> Result<Option<Account>> {
+    let row = sqlx::query(&format!(
+        r#"UPDATE account SET reset_token_hash=$2, reset_sent_at=now(), reset_attempts=0
+           WHERE email=$1 RETURNING {ACCOUNT_COLS}"#
+    ))
+    .bind(email.trim().to_lowercase())
+    .bind(code_hash)
+    .fetch_optional(db)
+    .await?;
+    row.map(|r| Account::from_row(&r).map_err(Into::into)).transpose()
+}
+
+/// Check a reset code for `email`. Same discipline as the sign-up code: 15
+/// minutes, five guesses, constant-time on the hash, and a spent code is
+/// wiped so nothing is gained by trying on. On success the code is consumed;
+/// the caller then sets the password.
+pub async fn check_reset_code(db: &Db, email: &str, code_hash: &str) -> Result<CodeCheck> {
+    let email = email.trim().to_lowercase();
+    let row: Option<(i64, String, Option<DateTime<Utc>>, i32)> = sqlx::query_as(
+        r#"SELECT account_id, reset_token_hash, reset_sent_at, reset_attempts FROM account WHERE email=$1"#,
+    )
+    .bind(&email)
+    .fetch_optional(db)
+    .await?;
+    let Some((account_id, hash, sent_at, attempts)) = row else { return Ok(CodeCheck::NeedNew) };
+    let fresh = sent_at.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(VERIFY_CODE_MINUTES));
+    if hash.trim().is_empty() || !fresh || attempts >= VERIFY_MAX_ATTEMPTS {
+        return Ok(CodeCheck::NeedNew);
+    }
+    if constant_time_eq(hash.trim().as_bytes(), code_hash.as_bytes()) {
+        // Consumed — and the address is proven, which is what verification asks.
+        let row = sqlx::query(&format!(
+            r#"UPDATE account SET reset_token_hash='', reset_attempts=0,
+                      email_verified_at=COALESCE(email_verified_at, now())
+               WHERE account_id=$1 RETURNING {ACCOUNT_COLS}"#
+        ))
+        .bind(account_id)
+        .fetch_one(db)
+        .await?;
+        return Ok(CodeCheck::Verified(Account::from_row(&row)?));
+    }
+    let attempts: i32 =
+        sqlx::query_scalar(r#"UPDATE account SET reset_attempts=reset_attempts+1 WHERE account_id=$1 RETURNING reset_attempts"#)
+            .bind(account_id)
+            .fetch_one(db)
+            .await?;
+    let left = VERIFY_MAX_ATTEMPTS - attempts;
+    if left <= 0 {
+        sqlx::query(r#"UPDATE account SET reset_token_hash='' WHERE account_id=$1"#).bind(account_id).execute(db).await?;
+        return Ok(CodeCheck::NeedNew);
+    }
+    Ok(CodeCheck::Wrong { left })
+}
+
+/// End every session of an account — after a password reset, whoever held
+/// the old password holds nothing.
+pub async fn delete_all_sessions(db: &Db, account_id: i64) -> Result<u64> {
+    Ok(sqlx::query(r#"DELETE FROM session WHERE account_id = $1"#).bind(account_id).execute(db).await?.rows_affected())
+}
+
+// ── two-factor ──────────────────────────────────────────────────────────────
+
+pub async fn mfa_enabled(db: &Db, account_id: i64) -> Result<bool> {
+    let on: Option<Option<DateTime<Utc>>> =
+        sqlx::query_scalar(r#"SELECT mfa_enabled_at FROM account WHERE account_id=$1"#).bind(account_id).fetch_optional(db).await?;
+    Ok(on.flatten().is_some())
+}
+
+/// On: stamp the time. Off: clear it. The secret itself is the pool's.
+pub async fn set_mfa_enabled(db: &Db, account_id: i64, on: bool) -> Result<()> {
+    if on {
+        sqlx::query(r#"UPDATE account SET mfa_enabled_at=now() WHERE account_id=$1"#).bind(account_id).execute(db).await?;
+    } else {
+        sqlx::query(r#"UPDATE account SET mfa_enabled_at=NULL WHERE account_id=$1"#).bind(account_id).execute(db).await?;
+    }
+    Ok(())
 }
 
 /// Verified without a link — a server that cannot send email (a dev box).
@@ -884,15 +957,6 @@ pub async fn update_account_prefs(db: &Db, account_id: i64, display_name: &str, 
     Ok(())
 }
 
-pub async fn update_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
-    sqlx::query(r#"UPDATE account SET password_hash=$2 WHERE account_id=$1"#)
-        .bind(account_id)
-        .bind(password_hash)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
 pub async fn create_session(db: &Db, account_id: i64, token_hash: &str, ttl_hours: i64, user_agent: &str) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO session (token_hash,account_id,expires_at,user_agent)
@@ -917,7 +981,7 @@ pub async fn session_account(db: &Db, token_hash: &str) -> Result<Option<Account
         r#"UPDATE session s SET last_seen_at = now()
            FROM account a
            WHERE s.token_hash = $1 AND s.expires_at > now() AND a.account_id = s.account_id
-           RETURNING a.account_id, a.email, a.display_name, a.password_hash, a.cognito_sub, a.timezone, a.timezone_auto, a.theme, a.created_at, a.onboarded_at, a.active_workspace_id, a.email_verified_at, a.workspace_name, a.enabled_kinds, a.platform_ack_at, a.platform_ack_by, a.platform_ack_text, a.connected_logins"#
+           RETURNING a.account_id, a.email, a.display_name, a.cognito_sub, a.timezone, a.timezone_auto, a.theme, a.created_at, a.onboarded_at, a.active_workspace_id, a.email_verified_at, a.mfa_enabled_at, a.workspace_name, a.enabled_kinds, a.platform_ack_at, a.platform_ack_by, a.platform_ack_text, a.connected_logins"#
     ))
     .bind(token_hash)
     .fetch_optional(db)
@@ -1831,6 +1895,33 @@ pub async fn list_prospects(db: &Db, account_id: i64, f: &ProspectFilter) -> Res
     .await?;
     let out = rows.iter().map(ProspectRow::from_row).collect::<Result<Vec<_>, _>>()?;
     Ok((out, total))
+}
+
+/// Prospects a syncing client has not seen, oldest first.
+///
+/// The cursor is the identity, not the clock: `prospect_id` only ever moves
+/// forward, so a client that keeps the last id it stored asks one question —
+/// "what is new?" — and a row that is merely re-seen (its `last_seen_utc`
+/// moves when a later run finds it again) is not handed over a second time.
+pub async fn list_prospects_after(
+    db: &Db,
+    account_id: i64,
+    plan_id: Option<i64>,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<ProspectRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {PROSPECT_COLS} FROM prospect pr JOIN plan p ON p.plan_id = pr.plan_id
+           WHERE pr.account_id = $1 AND ($2::bigint IS NULL OR pr.plan_id = $2) AND pr.prospect_id > $3
+           ORDER BY pr.prospect_id LIMIT $4"#
+    ))
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(after.max(0))
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(ProspectRow::from_row).collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Every matching row, for exports.
@@ -2761,6 +2852,17 @@ pub async fn set_execution_running(db: &Db, execution_id: i64, pid: Option<u32>)
     Ok(())
 }
 
+/// Record the model the scrape stage runs on, for the admin's cost estimate.
+pub async fn set_execution_model(db: &Db, account_id: i64, execution_id: i64, model: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE execution SET model_scrape=$3 WHERE execution_id=$1 AND account_id=$2"#)
+        .bind(execution_id)
+        .bind(account_id)
+        .bind(model.chars().take(160).collect::<String>())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub async fn finish_execution(db: &Db, execution_id: i64, status: &str, exit_code: Option<i32>) -> Result<()> {
     let n = sqlx::query(
         r#"UPDATE execution SET status=$2, exit_code=$3, finished_at=now() WHERE execution_id=$1 AND status IN ('queued','running')"#,
@@ -2860,6 +2962,20 @@ pub async fn active_execution_for_plan(db: &Db, plan_id: i64) -> Result<Option<E
            WHERE r.plan_id=$1 AND r.status IN ('queued','running') ORDER BY r.execution_id DESC LIMIT 1"#
     ))
     .bind(plan_id)
+    .fetch_optional(db)
+    .await?;
+    row.map(|r| ExecutionRecord::from_row(&r).map_err(Into::into)).transpose()
+}
+
+/// Only one execution may spend a workspace's wallet at a time. This avoids
+/// two agent processes both having an in-flight, not-yet-reported token slice
+/// when the last credits are consumed.
+pub async fn active_execution_for_account(db: &Db, account_id: i64) -> Result<Option<ExecutionRecord>> {
+    let row = sqlx::query(&format!(
+        r#"SELECT {EXECUTION_COLS} FROM execution r JOIN plan p ON p.plan_id=r.plan_id
+           WHERE r.account_id=$1 AND r.status IN ('queued','running') ORDER BY r.execution_id DESC LIMIT 1"#
+    ))
+    .bind(account_id)
     .fetch_optional(db)
     .await?;
     row.map(|r| ExecutionRecord::from_row(&r).map_err(Into::into)).transpose()
@@ -3268,12 +3384,13 @@ pub async fn list_api_audit(db: &Db, account_id: i64, limit: i64) -> Result<Vec<
 }
 
 // ---------------------------------------------------------------------------
-// Usage metering and the budget cap
+// Usage metering and the prepaid credit wallet
 // ---------------------------------------------------------------------------
 
-/// A snapshot of an account's dollar budget for the current period. Amounts are
-/// US dollars; `tokens_used` is the raw meter and `cogs_usd` is our Cursor cost
-/// (so margin = used − cogs).
+/// A snapshot of an account's prepaid credits and this period's consumption.
+/// Amounts are US dollars; `tokens_used` is the raw meter and `cogs_usd` is our
+/// Cursor cost (so margin = used − cogs). `credits_usd` / `remaining_usd` is
+/// what a run can still spend — purchased in advance, never allowed negative.
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub budget_usd: f64,
@@ -3281,9 +3398,34 @@ pub struct Usage {
     pub available_usd: f64,
     pub used_usd: f64,
     pub remaining_usd: f64,
+    pub credits_usd: f64,
     pub tokens_used: i64,
     pub cogs_usd: f64,
     pub period_start: String,
+}
+
+/// What [`charge_account_usage`] did to the wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Charge {
+    /// Debited in full; the wallet still has credit (or nothing was owed).
+    Applied,
+    /// The wallet hit zero on this debit. The run must stop so the next call
+    /// cannot spend past what was purchased.
+    Exhausted,
+}
+
+impl Charge {
+    pub fn exhausted(self) -> bool {
+        matches!(self, Charge::Exhausted)
+    }
+}
+
+/// Billable tokens → micro-USD at the sell rate. The unit the wallet spends.
+pub fn tokens_to_usd_micros(tokens: i64) -> i64 {
+    if tokens <= 0 {
+        return 0;
+    }
+    (tokens as f64 * crate::config::sell_usd_per_mtoken()).round() as i64
 }
 
 /// Tokens reported by one agent call (Cursor's `usage` object).
@@ -3331,55 +3473,71 @@ pub async fn ensure_usage(db: &Db, account_id: i64) -> Result<Usage> {
         .bind(account_id)
         .execute(db)
         .await?;
-    // Roll the period monthly: zero consumption and top-ups, keep the budget.
+    // Roll the period monthly: zero consumption and the old top-up column.
+    // Prepaid credits are not a period allowance and must not vanish.
     sqlx::query(
         r#"UPDATE account_usage
-           SET tokens_used=0, cost_usd_micros=0, topup_usd_micros=0, period_start=now(), updated_at=now()
+           SET tokens_used=0, cost_usd_micros=0, billed_usd_micros=0,
+               topup_usd_micros=0, period_start=now(), updated_at=now()
            WHERE account_id=$1 AND period_start <= now() - interval '1 month'"#,
     )
     .bind(account_id)
     .execute(db)
     .await?;
     let row = sqlx::query(
-        r#"SELECT budget_usd_micros,topup_usd_micros,tokens_used,cost_usd_micros,period_start
+        r#"SELECT budget_usd_micros,topup_usd_micros,tokens_used,cost_usd_micros,
+                  period_start,credit_usd_micros,billed_usd_micros
            FROM account_usage WHERE account_id=$1"#,
     )
     .bind(account_id)
     .fetch_one(db)
     .await?;
-    let budget_usd = row.get::<i64, _>(0) as f64 / 1e6;
-    let topups_usd = row.get::<i64, _>(1) as f64 / 1e6;
+    let _budget_usd_micros: i64 = row.get(0);
+    let _topup_usd_micros: i64 = row.get(1);
     let tokens_used: i64 = row.get(2);
     let cogs_usd = row.get::<i64, _>(3) as f64 / 1e6;
     let period_start: DateTime<Utc> = row.get(4);
-    // The customer is billed for input+output tokens at the sell rate.
-    let used_usd = tokens_used as f64 * crate::config::sell_usd_per_mtoken() / 1e6;
-    let available_usd = budget_usd + topups_usd;
+    let credit_usd_micros: i64 = row.get(5);
+    let billed_usd_micros: i64 = row.get(6);
+    let used_usd = billed_usd_micros as f64 / 1e6;
+    let credits_usd = credit_usd_micros as f64 / 1e6;
     Ok(Usage {
-        budget_usd,
-        topups_usd,
-        available_usd,
+        budget_usd: 0.0,
+        topups_usd: 0.0,
+        available_usd: credits_usd,
         used_usd,
-        remaining_usd: (available_usd - used_usd).max(0.0),
+        remaining_usd: credits_usd,
+        credits_usd,
         tokens_used,
         cogs_usd,
         period_start: period_start.to_rfc3339(),
     })
 }
 
-/// True when the account has spent its dollar budget for the period — the check
-/// the run dispatcher makes before starting any run (manual or scheduled).
+/// True when the prepaid wallet is empty — the check the run dispatcher makes
+/// before starting any run (manual, scheduled, or API-key).
 pub async fn account_over_budget(db: &Db, account_id: i64) -> Result<bool> {
-    let u = ensure_usage(db, account_id).await?;
-    Ok(u.used_usd >= u.available_usd)
+    Ok(account_credit_micros(db, account_id).await? <= 0)
+}
+
+/// Exact wallet value for run gates and the live in-flight estimate. Keep
+/// enforcement in integer micro-dollars; floats are display-only.
+pub async fn account_credit_micros(db: &Db, account_id: i64) -> Result<i64> {
+    ensure_usage(db, account_id).await?;
+    Ok(sqlx::query_scalar(
+        r#"SELECT credit_usd_micros FROM account_usage WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await?)
 }
 
 /// Records one agent call's tokens and Cursor cost against a run and the
-/// account's period usage. Called live during a run, so the meter ticks up as
-/// work happens.
-pub async fn add_execution_tokens(db: &Db, execution_id: i64, account_id: i64, u: TokenUsage, cost_micros: i64) -> Result<()> {
+/// account's prepaid wallet. Called live during a run, so the meter ticks up as
+/// work happens and a run can be stopped the moment the wallet empties.
+pub async fn add_execution_tokens(db: &Db, execution_id: i64, account_id: i64, u: TokenUsage, cost_micros: i64) -> Result<Charge> {
     if u.is_zero() && cost_micros == 0 {
-        return Ok(());
+        return Ok(Charge::Applied);
     }
     sqlx::query(
         r#"UPDATE execution SET
@@ -3396,7 +3554,7 @@ pub async fn add_execution_tokens(db: &Db, execution_id: i64, account_id: i64, u
     .bind(cost_micros)
     .execute(db)
     .await?;
-    add_account_usage(db, account_id, u, cost_micros).await
+    charge_account_usage(db, account_id, u, cost_micros).await
 }
 
 /// The number the live page shows. Absolute — a climbing estimate is replaced
@@ -3421,21 +3579,43 @@ pub async fn set_execution_token_totals(db: &Db, execution_id: i64, u: TokenUsag
 
 /// Bills the account. Separate from the run row so a live estimate can move
 /// the meter without charging for tokens Cursor has not reported yet.
-pub async fn add_account_usage(db: &Db, account_id: i64, u: TokenUsage, cost_micros: i64) -> Result<()> {
+///
+/// The debit is atomic: `credit_usd_micros` is reduced only by what the wallet
+/// actually holds, and never goes below zero. Two concurrent runs cannot
+/// overspend — the second debit either takes the remainder or sees an empty
+/// wallet and reports [`Charge::Exhausted`].
+pub async fn add_account_usage(db: &Db, account_id: i64, u: TokenUsage, cost_micros: i64) -> Result<Charge> {
+    charge_account_usage(db, account_id, u, cost_micros).await
+}
+
+/// Debit the prepaid wallet for one slice of billed tokens.
+pub async fn charge_account_usage(db: &Db, account_id: i64, u: TokenUsage, cost_micros: i64) -> Result<Charge> {
     if u.is_zero() && cost_micros == 0 {
-        return Ok(());
+        return Ok(Charge::Applied);
     }
     ensure_usage(db, account_id).await?;
-    sqlx::query(
-        r#"UPDATE account_usage SET tokens_used=tokens_used+$2, cost_usd_micros=cost_usd_micros+$3, updated_at=now()
-           WHERE account_id=$1"#,
+    let debit = tokens_to_usd_micros(u.billable());
+    // One statement both caps the customer charge at the wallet and records
+    // every provider token. Postgres evaluates each right-hand expression
+    // from the row as locked, so a concurrent credit purchase is neither lost
+    // nor charged beyond this slice's debit.
+    let row = sqlx::query(
+        r#"UPDATE account_usage
+           SET tokens_used=tokens_used+$2, cost_usd_micros=cost_usd_micros+$3,
+               billed_usd_micros=billed_usd_micros+least(credit_usd_micros,$4),
+               credit_usd_micros=greatest(credit_usd_micros-$4,0),
+               updated_at=now()
+           WHERE account_id=$1
+           RETURNING credit_usd_micros"#,
     )
     .bind(account_id)
     .bind(u.billable())
     .bind(cost_micros)
-    .execute(db)
+    .bind(debit)
+    .fetch_one(db)
     .await?;
-    Ok(())
+    let remaining: i64 = row.get(0);
+    Ok(if remaining <= 0 { Charge::Exhausted } else { Charge::Applied })
 }
 
 /// The card on file, as much of it as is safe to keep. `None` when the account
@@ -3447,11 +3627,14 @@ pub struct PaymentMethod {
     pub brand: String,
     pub last4: String,
     pub added_at: Option<DateTime<Utc>>,
+    /// Stripe payment-method id (`pm_…`). Never sent to the browser.
+    #[serde(skip)]
+    pub card_pm: String,
 }
 
 pub async fn payment_method(db: &Db, account_id: i64) -> Result<Option<PaymentMethod>> {
     let row = sqlx::query(
-        r#"SELECT payment_ref,card_brand,card_last4,card_added_at FROM account_usage WHERE account_id=$1"#,
+        r#"SELECT payment_ref,card_brand,card_last4,card_added_at,card_pm FROM account_usage WHERE account_id=$1"#,
     )
     .bind(account_id)
     .fetch_optional(db)
@@ -3468,6 +3651,7 @@ pub async fn payment_method(db: &Db, account_id: i64) -> Result<Option<PaymentMe
             brand: r.get(1),
             last4,
             added_at: r.get(3),
+            card_pm: r.get(4),
         })
     }))
 }
@@ -3492,6 +3676,23 @@ pub async fn has_payment_method(db: &Db, account_id: i64) -> Result<bool> {
     Ok(row.map(|r| !r.get::<String, _>(0).trim().is_empty()).unwrap_or(false))
 }
 
+/// Production's stronger card gate. Display metadata alone is insufficient:
+/// an old local mock row must not become a billable card after deployment.
+pub async fn has_real_payment_method(db: &Db, account_id: i64) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT payment_ref,card_pm,card_last4 FROM account_usage WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some_and(|r| {
+        let customer: String = r.get(0);
+        let method: String = r.get(1);
+        let last4: String = r.get(2);
+        customer.starts_with("cus_") && method.starts_with("pm_") && !last4.trim().is_empty()
+    }))
+}
+
 /// Records the Stripe customer before the card exists, so the handle survives
 /// an abandoned checkout and the next attempt reuses it.
 pub async fn set_payment_ref(db: &Db, account_id: i64, payment_ref: &str) -> Result<()> {
@@ -3504,33 +3705,159 @@ pub async fn set_payment_ref(db: &Db, account_id: i64, payment_ref: &str) -> Res
     Ok(())
 }
 
-/// Records the card Stripe attached. Only the brand and last four ever arrive
-/// here — the number itself never touches this process.
-pub async fn set_payment_method(db: &Db, account_id: i64, payment_ref: &str, brand: &str, last4: &str) -> Result<()> {
+/// Records the card Stripe attached. Only the brand, last four, and payment
+/// method id ever arrive here — the number itself never touches this process.
+pub async fn set_payment_method(
+    db: &Db,
+    account_id: i64,
+    payment_ref: &str,
+    brand: &str,
+    last4: &str,
+    card_pm: &str,
+) -> Result<()> {
     ensure_usage(db, account_id).await?;
     sqlx::query(
         r#"UPDATE account_usage
-           SET payment_ref=$2, card_brand=$3, card_last4=$4, card_added_at=now(), updated_at=now()
+           SET payment_ref=$2, card_brand=$3, card_last4=$4, card_pm=$5, card_added_at=now(), updated_at=now()
            WHERE account_id=$1"#,
     )
     .bind(account_id)
     .bind(payment_ref)
     .bind(brand.chars().take(24).collect::<String>())
     .bind(last4.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
+    .bind(card_pm.chars().take(120).collect::<String>())
     .execute(db)
     .await?;
     Ok(())
 }
 
-/// Adds purchased budget (micro-USD) for the current period — the payment hook.
-pub async fn add_topup(db: &Db, account_id: i64, usd_micros: i64) -> Result<Usage> {
+/// Local-development grant: seed the wallet once so a box without Stripe can
+/// still run. Never called in production.
+pub async fn grant_dev_credits_if_empty(db: &Db, account_id: i64, usd_micros: i64) -> Result<Usage> {
+    if crate::config::is_production()
+        || !crate::config::is_dev()
+        || crate::genesis::embedded_variant() != "local"
+    {
+        bail!("development credit grants are disabled in production");
+    }
     ensure_usage(db, account_id).await?;
-    sqlx::query(r#"UPDATE account_usage SET topup_usd_micros=topup_usd_micros+$2, updated_at=now() WHERE account_id=$1"#)
-        .bind(account_id)
-        .bind(usd_micros.max(0))
-        .execute(db)
-        .await?;
+    sqlx::query(
+        r#"UPDATE account_usage SET credit_usd_micros=credit_usd_micros+$2, updated_at=now()
+           WHERE account_id=$1 AND credit_usd_micros=0"#,
+    )
+    .bind(account_id)
+    .bind(usd_micros.max(0))
+    .execute(db)
+    .await?;
     ensure_usage(db, account_id).await
+}
+
+/// Records a successful Stripe payment and credits its wallet in one
+/// transaction. A retry sees the unique payment_ref and cannot credit twice;
+/// a crash cannot leave a recorded purchase whose credits were never added.
+pub async fn apply_credit_purchase(db: &Db, account_id: i64, usd_micros: i64, payment_ref: &str) -> Result<bool> {
+    if usd_micros <= 0 {
+        bail!("credit purchase must be positive");
+    }
+    ensure_usage(db, account_id).await?;
+    let mut tx = db.begin().await?;
+    let inserted = sqlx::query(
+        r#"INSERT INTO credit_purchase (account_id, usd_micros, payment_ref, status)
+           VALUES ($1,$2,$3,'succeeded')
+           ON CONFLICT (payment_ref) DO NOTHING"#,
+    )
+    .bind(account_id)
+    .bind(usd_micros)
+    .bind(payment_ref)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if inserted {
+        sqlx::query(
+            r#"UPDATE account_usage
+               SET credit_usd_micros=credit_usd_micros+greatest($2-credit_debt_usd_micros,0),
+                   credit_debt_usd_micros=greatest(credit_debt_usd_micros-$2,0),
+                   updated_at=now()
+               WHERE account_id=$1"#,
+        )
+        .bind(account_id)
+        .bind(usd_micros)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Applies Stripe's cumulative refunded/disputed amount exactly once. Credits
+/// still in the wallet are removed first; an already-spent remainder becomes
+/// debt that future purchases repay before adding spendable credit.
+pub async fn apply_credit_reversal(
+    db: &Db,
+    account_id: i64,
+    event_id: &str,
+    event_type: &str,
+    payment_ref: &str,
+    reversed_usd_micros: i64,
+) -> Result<bool> {
+    let mut tx = db.begin().await?;
+    let Some(purchase) = sqlx::query(
+        r#"SELECT usd_micros,reversed_usd_micros FROM credit_purchase
+           WHERE account_id=$1 AND payment_ref=$2 FOR UPDATE"#,
+    )
+    .bind(account_id)
+    .bind(payment_ref)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        bail!("credit purchase not found for Stripe reversal");
+    };
+    let purchased: i64 = purchase.get(0);
+    let already_reversed: i64 = purchase.get(1);
+    let target = reversed_usd_micros.clamp(0, purchased);
+    let inserted = sqlx::query(
+        r#"INSERT INTO billing_event (event_id,account_id,event_type)
+           VALUES ($1,$2,$3) ON CONFLICT (event_id) DO NOTHING"#,
+    )
+    .bind(event_id)
+    .bind(account_id)
+    .bind(event_type)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !inserted {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let delta = (target - already_reversed).max(0);
+    if delta > 0 {
+        sqlx::query(
+            r#"UPDATE account_usage
+               SET credit_debt_usd_micros=credit_debt_usd_micros+greatest($2-credit_usd_micros,0),
+                   credit_usd_micros=greatest(credit_usd_micros-$2,0),
+                   updated_at=now()
+               WHERE account_id=$1"#,
+        )
+        .bind(account_id)
+        .bind(delta)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE credit_purchase
+               SET reversed_usd_micros=$3,
+                   status=CASE WHEN $3 >= usd_micros THEN 'reversed' ELSE 'partially_reversed' END
+               WHERE account_id=$1 AND payment_ref=$2"#,
+        )
+        .bind(account_id)
+        .bind(payment_ref)
+        .bind(target)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Sets the monthly budget in micro-USD (a plan-tier change). CLI/admin path.
@@ -4100,6 +4427,7 @@ pub async fn set_account_kinds(db: &Db, account_id: i64, kinds: &str) -> Result<
 pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"SELECT a.account_id, a.email, a.display_name, a.enabled_kinds, a.connected_logins, a.created_at,
+                  (a.mfa_enabled_at IS NOT NULL) AS mfa_enabled,
                   (SELECT count(*) FROM plan p WHERE p.account_id = a.account_id) AS plans
            FROM account a ORDER BY a.account_id DESC LIMIT $1"#,
     )
@@ -4115,6 +4443,7 @@ pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
                 "display_name": r.get::<String, _>("display_name"),
                 "kinds": r.get::<String, _>("enabled_kinds"),
                 "connected_logins": r.get::<bool, _>("connected_logins"),
+                "mfa_enabled": r.get::<bool, _>("mfa_enabled"),
                 "plans": r.get::<i64, _>("plans"),
                 "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
             })
@@ -4196,20 +4525,22 @@ pub async fn database_facts(db: &Db) -> Result<DatabaseFacts> {
     })
 }
 
-pub async fn upsert_admin_user(db: &Db, email: &str, password_hash: &str) -> Result<()> {
+/// Record an operator, keyed to the operators' Cognito pool by subject.
+pub async fn upsert_admin_user(db: &Db, email: &str, cognito_sub: &str) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO admin_user (email,password_hash) VALUES (lower($1),$2)
-           ON CONFLICT (email) DO UPDATE SET password_hash=excluded.password_hash"#,
+        r#"INSERT INTO admin_user (email,cognito_sub) VALUES (lower($1),$2)
+           ON CONFLICT (email) DO UPDATE SET cognito_sub=excluded.cognito_sub"#,
     )
     .bind(email)
-    .bind(password_hash)
+    .bind(cognito_sub)
     .execute(db)
     .await?;
     Ok(())
 }
 
-pub async fn get_admin_password_hash(db: &Db, email: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar(r#"SELECT password_hash FROM admin_user WHERE email=lower($1)"#)
+/// An operator's subject, if the address is an operator at all.
+pub async fn admin_user_sub(db: &Db, email: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(r#"SELECT cognito_sub FROM admin_user WHERE email=lower($1)"#)
         .bind(email)
         .fetch_optional(db)
         .await?)
@@ -4383,13 +4714,21 @@ pub struct AdminExecutionRow {
     pub finished_at: Option<DateTime<Utc>>,
     pub host_id: Option<i64>,
     pub slot_name: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// What Cursor said the run cost, µUSD. Zero when it reported nothing.
+    pub cost_usd_micros: i64,
+    pub model_scrape: String,
 }
 
 /// Unscoped, admin-only view of recent runs with their placement.
 pub async fn recent_executions_admin(db: &Db, host_id: Option<i64>, slot: Option<&str>, limit: i64) -> Result<Vec<AdminExecutionRow>> {
     let rows = sqlx::query(
         r#"SELECT r.execution_id, r.plan_id, r.account_id, p.source, r.status, r.started_at, r.finished_at,
-                  r.host_id, r.slot_name
+                  r.host_id, r.slot_name, r.input_tokens, r.output_tokens, r.cache_read_tokens,
+                  r.cache_write_tokens, r.cost_usd_micros, r.model_scrape
            FROM execution r JOIN plan p ON p.plan_id=r.plan_id
            WHERE ($1::bigint IS NULL OR r.host_id=$1) AND ($2::varchar IS NULL OR r.slot_name=$2)
            ORDER BY r.execution_id DESC LIMIT $3"#,
@@ -4414,7 +4753,7 @@ mod tests {
         let sql = include_str!("../../local-infra/db/public/account.sql");
         let line = sql
             .lines()
-            .find(|l| l.contains("connected_logins") && l.contains("ADD COLUMN"))
+            .find(|l| l.trim_start().starts_with("connected_logins"))
             .expect("account.sql must define connected_logins");
         assert!(line.contains("DEFAULT false"), "connected logins must default to off, got: {line}");
         assert!(line.contains("NOT NULL"), "a null would read as neither on nor off: {line}");
@@ -4445,6 +4784,45 @@ mod tests {
     fn urls_are_redacted() {
         assert_eq!(redact("postgres://u:pw@h:1/db"), "postgres://***@h:1/db");
         assert_eq!(redact("postgres://h/db"), "postgres://h/db");
+    }
+
+    #[test]
+    fn tokens_price_at_the_sell_rate() {
+        // Default $5 / million tokens → 5 µUSD each, $5 for a million.
+        assert_eq!(tokens_to_usd_micros(0), 0);
+        assert_eq!(tokens_to_usd_micros(-3), 0);
+        assert_eq!(tokens_to_usd_micros(1), 5);
+        assert_eq!(tokens_to_usd_micros(1_000_000), 5_000_000);
+    }
+
+    #[test]
+    fn new_accounts_start_with_no_complimentary_budget() {
+        let sql = include_str!("../../local-infra/db/public/account_usage.sql");
+        let line = sql
+            .lines()
+            .find(|l| l.trim_start().starts_with("budget_usd_micros"))
+            .expect("account_usage.sql must define budget_usd_micros");
+        assert!(
+            line.contains("DEFAULT 0"),
+            "new accounts must buy credits; a complimentary default would let them run for free: {line}"
+        );
+        assert!(
+            sql.contains("credit_usd_micros"),
+            "the prepaid wallet column must exist"
+        );
+        assert!(
+            sql.contains("account_usage_credit_nonnegative"),
+            "Postgres must reject a negative wallet independently of Rust"
+        );
+        assert!(
+            sql.contains("billed_usd_micros") && sql.contains("account_usage_billed_nonnegative"),
+            "customer-attributed spend must be tracked separately and stay nonnegative"
+        );
+        let execution_sql = include_str!("../../local-infra/db/public/execution.sql");
+        assert!(
+            execution_sql.contains("execution_one_active_per_account_idx"),
+            "two processes must not spend one account wallet concurrently"
+        );
     }
 }
 

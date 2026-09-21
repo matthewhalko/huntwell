@@ -1,8 +1,8 @@
-//! The card on file, and the Stripe flow that puts it there.
+//! The card on file, prepaid credits, and the Stripe flow that puts both there.
 //!
-//! A run is refused without a payment method (see [`super::runner::start`]), so
-//! this is the gate every account passes through once. It is deliberately the
-//! smallest Stripe integration that is real:
+//! A run is refused without a payment method *and* a prepaid credit balance
+//! (see [`super::runner::start`]), so this is the gate every account passes
+//! through. It is deliberately the smallest Stripe integration that is real:
 //!
 //!   1. `POST /billing/session` creates (or reuses) a Stripe **Customer** and a
 //!      **Checkout Session** in `setup` mode, and hands the browser its URL.
@@ -10,22 +10,29 @@
 //!      this database.
 //!   2. Stripe returns the browser to the app with `?setup={CHECKOUT_SESSION_ID}`
 //!      and `POST /billing/confirm` retrieves that session with the payment
-//!      method expanded, keeping only the brand and last four.
+//!      method expanded, keeping only the brand, last four, and `pm_…` id.
+//!   3. `POST /billing/credits` charges that saved card and credits the prepaid
+//!      wallet. A running job spends those credits as tokens are booked and
+//!      is stopped the moment the wallet would go negative.
 //!
-//! No webhook, no signature verification, no stored PAN — the redirect carries
-//! the session id and the confirm call reads the truth back from Stripe over
-//! the API, which is what makes this safe to skip a webhook for.
+//! Card setup and purchases read their result back from Stripe; a signed
+//! webhook reconciles later refunds and disputes so reversed money cannot
+//! remain spendable. No PAN ever reaches this process or database.
 //!
 //! **Local development** has no Stripe key, so `session` attaches a mock card
-//! instead of returning a URL and the client goes straight to the confirmed
-//! state. The gate, the UI, and the store path are then exercised exactly as
-//! they are in production; only Stripe itself is absent.
+//! and a starter credit grant instead of returning a URL. The gate, the UI,
+//! and the store path are then exercised exactly as they are in production;
+//! only Stripe itself is absent. A production process never takes that path.
 
+use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Sha256;
 
 use super::auth::AuthUser;
 use super::{bad_request, ApiError, App};
@@ -45,6 +52,14 @@ pub fn configured() -> bool {
     secret_key().is_some()
 }
 
+/// Mock cards and free credit grants are a local-dev stand-in. Production
+/// never invents a card — Stripe has to be configured and a real card added.
+fn mock_allowed() -> bool {
+    !configured()
+        && crate::config::is_dev()
+        && crate::genesis::embedded_variant() == "local"
+}
+
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/billing", get(billing))
@@ -52,6 +67,9 @@ pub fn routes() -> Router<App> {
         .route("/billing/attach", post(attach))
         .route("/billing/session", post(session))
         .route("/billing/confirm", post(confirm))
+        .route("/billing/credits", post(credits))
+        .route("/billing/credits/confirm", post(credits_confirm))
+        .route("/billing/webhook", post(webhook))
         .route("/billing/card", delete(remove_card))
 }
 
@@ -69,9 +87,7 @@ fn publishable_key() -> Option<String> {
 /// touches this server, exactly as with Checkout, but the user stays put.
 async fn intent(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
     let (Some(key), Some(pk)) = (secret_key(), publishable_key()) else {
-        // No keys here: attach the test card so the dialog can finish and the
-        // gate behaves the way it will in production.
-        store::set_payment_method(&state.db, acc.tenant(), &format!("cus_mock_{}", acc.tenant()), "Visa", "4242").await?;
+        attach_mock_card(&state, acc.tenant()).await?;
         let pm = store::payment_method(&state.db, acc.tenant()).await?;
         return Ok(Json(json!({"mocked": true, "has_card": true, "card": card_json(pm)})));
     };
@@ -115,7 +131,7 @@ async fn attach(
         .and_then(|c| c.as_str().map(str::to_string).or_else(|| c.get("id").and_then(Value::as_str).map(str::to_string)))
         .unwrap_or_default();
     let ours = customer_ref(&state, acc.tenant()).await?;
-    if customer.is_empty() || (!ours.is_empty() && customer != ours) {
+    if !ours.starts_with("cus_") || customer != ours {
         return Err(bad_request("that card setup belongs to another account"));
     }
     if si.get("status").and_then(Value::as_str) != Some("succeeded") {
@@ -127,7 +143,8 @@ async fn attach(
     if last4.is_empty() {
         return Err(bad_request("Stripe returned no card details"));
     }
-    store::set_payment_method(&state.db, acc.tenant(), &customer, brand, last4).await?;
+    let pm_id = stripe_id(si.get("payment_method"));
+    store::set_payment_method(&state.db, acc.tenant(), &customer, brand, last4, &pm_id).await?;
     let pm = store::payment_method(&state.db, acc.tenant()).await?;
     Ok(Json(json!({"has_card": true, "card": card_json(pm)})))
 }
@@ -146,13 +163,22 @@ fn card_json(pm: Option<store::PaymentMethod>) -> Value {
 /// What the billing page and the Go-now gate both read.
 async fn billing(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
     let pm = store::payment_method(&state.db, acc.tenant()).await?;
+    let usage = store::ensure_usage(&state.db, acc.tenant()).await?;
+    let has_card = if crate::config::is_production() {
+        store::has_real_payment_method(&state.db, acc.tenant()).await?
+    } else {
+        pm.is_some()
+    };
     Ok(Json(json!({
         // `stripe` says a real card can be taken here; `in_app` says it can be
         // taken without leaving the page (both keys present).
         "stripe": configured(),
         "in_app": configured() && publishable_key().is_some(),
-        "has_card": pm.is_some(),
-        "card": card_json(pm),
+        "production": crate::config::is_production(),
+        "has_card": has_card,
+        "has_credits": usage.credits_usd > 0.0,
+        "credits_usd": usage.credits_usd,
+        "card": if has_card { card_json(pm) } else { Value::Null },
     })))
 }
 
@@ -172,16 +198,7 @@ async fn session(
     Json(body): Json<SessionBody>,
 ) -> Result<Json<Value>, ApiError> {
     let Some(key) = secret_key() else {
-        // Mock mode: the same store path, so the gate and the UI behave as they
-        // will in production. Stripe's own test card, to make it obvious.
-        store::set_payment_method(
-            &state.db,
-            acc.tenant(),
-            &format!("cus_mock_{}", acc.tenant()),
-            "Visa",
-            "4242",
-        )
-        .await?;
+        attach_mock_card(&state, acc.tenant()).await?;
         let pm = store::payment_method(&state.db, acc.tenant()).await?;
         return Ok(Json(json!({"mocked": true, "has_card": true, "card": card_json(pm)})));
     };
@@ -243,7 +260,7 @@ async fn confirm(
         .map(|p| p.payment_ref)
         .unwrap_or_default();
     let expected = if ours.is_empty() { customer_ref(&state, acc.tenant()).await? } else { ours };
-    if customer.is_empty() || (!expected.is_empty() && customer != expected) {
+    if !expected.starts_with("cus_") || customer != expected {
         return Err(bad_request("that checkout session belongs to another account"));
     }
 
@@ -253,7 +270,8 @@ async fn confirm(
     if last4.is_empty() {
         return Err(bad_request("checkout finished without a card attached"));
     }
-    store::set_payment_method(&state.db, acc.tenant(), &customer, brand, last4).await?;
+    let pm_id = stripe_id(session.pointer("/setup_intent/payment_method"));
+    store::set_payment_method(&state.db, acc.tenant(), &customer, brand, last4, &pm_id).await?;
     let pm = store::payment_method(&state.db, acc.tenant()).await?;
     Ok(Json(json!({"has_card": true, "card": card_json(pm)})))
 }
@@ -262,7 +280,7 @@ async fn confirm(
 /// would lose the account's billing history for the sake of a UI action.
 async fn remove_card(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
     let payment_ref = customer_ref(&state, acc.tenant()).await?;
-    store::set_payment_method(&state.db, acc.tenant(), &payment_ref, "", "").await?;
+    store::set_payment_method(&state.db, acc.tenant(), &payment_ref, "", "", "").await?;
     Ok(Json(json!({"has_card": false, "card": Value::Null})))
 }
 
@@ -296,6 +314,265 @@ async fn customer_id(state: &App, acc: &store::Account, key: &str) -> Result<Str
     Ok(id.to_string())
 }
 
+/// Local-only: attach Stripe's test card and seed the prepaid wallet so a
+/// box without keys can still exercise the same gates production uses.
+async fn attach_mock_card(state: &App, account_id: i64) -> Result<(), ApiError> {
+    if !mock_allowed() {
+        return Err(bad_request(
+            "Stripe is not configured on this server — a card cannot be added in production without it",
+        ));
+    }
+    store::set_payment_method(&state.db, account_id, &format!("cus_mock_{account_id}"), "Visa", "4242", "pm_mock")
+        .await?;
+    // $50 starter so local runs are not blocked on a purchase flow that has
+    // no Stripe to charge.
+    store::grant_dev_credits_if_empty(&state.db, account_id, 50_000_000).await?;
+    Ok(())
+}
+
+/// Stripe returns a payment method as either an id string or an expanded object.
+fn stripe_id(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(obj) => obj.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+        None => String::new(),
+    }
+}
+
+/// Whole dollars between $5 and $500 — enough to run, not enough to be a
+/// typo that empties a card.
+pub fn credit_pack_micros(usd: f64) -> Result<i64, ApiError> {
+    if !usd.is_finite() || usd.fract() != 0.0 || usd < 5.0 || usd > 500.0 {
+        return Err(bad_request("buy between $5 and $500 in whole dollars"));
+    }
+    Ok((usd * 1_000_000.0).round() as i64)
+}
+
+#[derive(Deserialize)]
+struct CreditsBody {
+    usd: f64,
+    purchase_id: String,
+}
+
+/// Charges the card on file and credits the prepaid wallet.
+async fn credits(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<CreditsBody>) -> Result<Json<Value>, ApiError> {
+    purchase_credits(&state, &acc, body.usd, &body.purchase_id).await
+}
+
+/// The same purchase the Usage page and the leftover `/usage/topup` route share.
+/// Production always goes through Stripe; local mock-credits the wallet.
+pub async fn purchase_credits(
+    state: &App,
+    acc: &store::Account,
+    usd: f64,
+    purchase_id: &str,
+) -> Result<Json<Value>, ApiError> {
+    let micros = credit_pack_micros(usd)?;
+    let purchase_id = purchase_id.trim();
+    if !(8..=80).contains(&purchase_id.len())
+        || !purchase_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err(bad_request("purchase_id must be an 8–80 character request id"));
+    }
+    let Some(pm) = store::payment_method(&state.db, acc.tenant()).await? else {
+        return Err(bad_request("add a card in Usage & billing before buying credits"));
+    };
+    let Some(key) = secret_key() else {
+        if !mock_allowed() {
+            return Err(bad_request("Stripe is not configured on this server"));
+        }
+        let ref_id = format!("mock_{}_{}", acc.tenant(), purchase_id);
+        store::apply_credit_purchase(&state.db, acc.tenant(), micros, &ref_id).await?;
+        let usage = store::ensure_usage(&state.db, acc.tenant()).await?;
+        return Ok(Json(json!({"mocked": true, "credits_usd": usage.credits_usd, "usage": usage})));
+    };
+    let customer = if pm.payment_ref.starts_with("cus_") {
+        pm.payment_ref.clone()
+    } else {
+        return Err(bad_request("add a card in Usage & billing before buying credits"));
+    };
+    let mut card_pm = pm.card_pm.clone();
+    if card_pm.is_empty() {
+        card_pm = first_card_pm(&key, &customer).await?;
+        if card_pm.is_empty() {
+            return Err(bad_request("no card on file at Stripe — add one again"));
+        }
+    }
+    let cents = (micros / 10_000).to_string();
+    let account = acc.tenant().to_string();
+    let pi: Value = post_form_idempotent(
+        &key,
+        "payment_intents",
+        &format!("huntwell-{}-{purchase_id}", acc.tenant()),
+        &[
+            ("amount", cents.as_str()),
+            ("currency", "usd"),
+            ("customer", customer.as_str()),
+            ("payment_method", card_pm.as_str()),
+            ("confirm", "true"),
+            ("off_session", "true"),
+            ("metadata[account_id]", account.as_str()),
+        ],
+    )
+    .await?;
+    apply_payment_intent(state, acc.tenant(), micros, &pi).await
+}
+
+#[derive(Deserialize)]
+struct CreditsConfirmBody {
+    payment_intent_id: String,
+}
+
+/// Finishes a credit purchase that needed a second factor. The id from the
+/// browser is only a lookup key — Stripe is asked what it means.
+async fn credits_confirm(
+    State(state): State<App>,
+    AuthUser(acc): AuthUser,
+    Json(body): Json<CreditsConfirmBody>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(key) = secret_key() else {
+        return Err(bad_request("Stripe is not configured on this server"));
+    };
+    let id = body.payment_intent_id.trim();
+    if id.is_empty() || !id.starts_with("pi_") {
+        return Err(bad_request("not a payment intent id"));
+    }
+    let pi: Value = get_json(&key, &format!("payment_intents/{id}")).await?;
+    let customer = stripe_id(pi.get("customer"));
+    let ours = customer_ref(&state, acc.tenant()).await?;
+    if !ours.starts_with("cus_") || customer != ours {
+        return Err(bad_request("that payment belongs to another account"));
+    }
+    let amount_cents = pi.get("amount").and_then(Value::as_i64).unwrap_or(0);
+    let micros = amount_cents.saturating_mul(10_000);
+    apply_payment_intent(&state, acc.tenant(), micros, &pi).await
+}
+
+async fn apply_payment_intent(state: &App, account_id: i64, micros: i64, pi: &Value) -> Result<Json<Value>, ApiError> {
+    let status = pi.get("status").and_then(Value::as_str).unwrap_or("");
+    let id = pi.get("id").and_then(Value::as_str).unwrap_or_default();
+    if status == "requires_action" || status == "requires_source_action" {
+        let secret = pi.get("client_secret").and_then(Value::as_str).unwrap_or_default();
+        return Ok(Json(json!({
+            "requires_action": true,
+            "payment_intent_id": id,
+            "client_secret": secret,
+        })));
+    }
+    if status != "succeeded" {
+        return Err(bad_request(format!("the charge did not complete ({status})")));
+    }
+    if id.is_empty() {
+        return Err(bad_request("Stripe returned no payment id"));
+    }
+    let amount_micros = pi.get("amount").and_then(Value::as_i64).unwrap_or(0).saturating_mul(10_000);
+    let currency = pi.get("currency").and_then(Value::as_str).unwrap_or("");
+    let owner = pi.pointer("/metadata/account_id").and_then(Value::as_str).unwrap_or("");
+    if amount_micros != micros || currency != "usd" || owner != account_id.to_string() {
+        return Err(bad_request("Stripe payment details do not match this credit purchase"));
+    }
+    store::apply_credit_purchase(&state.db, account_id, micros, id).await?;
+    let usage = store::ensure_usage(&state.db, account_id).await?;
+    Ok(Json(json!({"credits_usd": usage.credits_usd, "usage": usage})))
+}
+
+async fn first_card_pm(key: &str, customer: &str) -> Result<String, ApiError> {
+    let body: Value = get_json(key, &format!("customers/{customer}/payment_methods?type=card")).await?;
+    let id = body
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .map(|pm| stripe_id(Some(pm)))
+        .unwrap_or_default();
+    Ok(id)
+}
+
+/// Stripe retries these events until acknowledged. The signature proves the
+/// raw body came from Stripe; `billing_event` makes applying it idempotent.
+async fn webhook(State(state): State<App>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    let secret = crate::config::get("STRIPE_WEBHOOK_SECRET")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| bad_request("Stripe webhook is not configured"))?;
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| bad_request("missing Stripe signature"))?;
+    verify_webhook_signature(&secret, signature, &body)?;
+    let event: Value = serde_json::from_slice(&body).map_err(|_| bad_request("invalid Stripe webhook JSON"))?;
+    if crate::config::is_production() && event.get("livemode").and_then(Value::as_bool) != Some(true) {
+        return Err(bad_request("test-mode Stripe event refused in production"));
+    }
+    let event_id = event.get("id").and_then(Value::as_str).unwrap_or("");
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+    if !event_id.starts_with("evt_") {
+        return Err(bad_request("Stripe event has no id"));
+    }
+    let object = event.pointer("/data/object").ok_or_else(|| bad_request("Stripe event has no object"))?;
+    let (payment_intent, reversed_cents) = match event_type {
+        "charge.refunded" => (
+            stripe_id(object.get("payment_intent")),
+            object.get("amount_refunded").and_then(Value::as_i64).unwrap_or(0),
+        ),
+        "charge.dispute.created" => (
+            stripe_id(object.get("payment_intent")),
+            object.get("amount").and_then(Value::as_i64).unwrap_or(0),
+        ),
+        _ => return Ok(Json(json!({"received": true, "ignored": true}))),
+    };
+    if !payment_intent.starts_with("pi_") || reversed_cents <= 0 {
+        return Err(bad_request("Stripe reversal has invalid payment details"));
+    }
+    // Retrieve the intent rather than trusting nested webhook metadata.
+    let key = secret_key().ok_or_else(|| bad_request("Stripe is not configured on this server"))?;
+    let pi: Value = get_json(&key, &format!("payment_intents/{payment_intent}")).await?;
+    let account_id = pi
+        .pointer("/metadata/account_id")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| bad_request("Stripe payment has no Huntwell account"))?;
+    store::apply_credit_reversal(
+        // Webhook metadata supplies the tenant, and the store still scopes
+        // both the purchase and wallet updates by it.
+        &state.db,
+        account_id,
+        event_id,
+        event_type,
+        &payment_intent,
+        reversed_cents.saturating_mul(10_000),
+    )
+    .await?;
+    Ok(Json(json!({"received": true})))
+}
+
+fn verify_webhook_signature(secret: &str, header: &str, body: &[u8]) -> Result<(), ApiError> {
+    let mut timestamp = None;
+    let mut signatures = Vec::new();
+    for part in header.split(',') {
+        if let Some(v) = part.trim().strip_prefix("t=") {
+            timestamp = v.parse::<i64>().ok();
+        } else if let Some(v) = part.trim().strip_prefix("v1=") {
+            if let Ok(bytes) = hex::decode(v) {
+                signatures.push(bytes);
+            }
+        }
+    }
+    let timestamp = timestamp.ok_or_else(|| bad_request("invalid Stripe signature timestamp"))?;
+    if (chrono::Utc::now().timestamp() - timestamp).abs() > 300 {
+        return Err(bad_request("stale Stripe webhook"));
+    }
+    let mut payload = timestamp.to_string().into_bytes();
+    payload.push(b'.');
+    payload.extend_from_slice(body);
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(&payload);
+    if signatures.iter().any(|sig| mac.clone().verify_slice(sig).is_ok()) {
+        Ok(())
+    } else {
+        Err(bad_request("invalid Stripe webhook signature"))
+    }
+}
+
 /// Where Stripe sends the browser back. The app supplies it, but only an
 /// http(s) URL is ever handed on.
 fn return_url(raw: &str) -> Result<String, ApiError> {
@@ -313,6 +590,23 @@ async fn post_form(key: &str, path: &str, form: &[(&str, &str)]) -> Result<Value
     let res = reqwest::Client::new()
         .post(format!("{}/{path}", api_base()))
         .bearer_auth(key)
+        .form(form)
+        .send()
+        .await
+        .map_err(|e| bad_request(format!("Stripe request failed: {e}")))?;
+    read(res).await
+}
+
+async fn post_form_idempotent(
+    key: &str,
+    path: &str,
+    idempotency_key: &str,
+    form: &[(&str, &str)],
+) -> Result<Value, ApiError> {
+    let res = reqwest::Client::new()
+        .post(format!("{}/{path}", api_base()))
+        .bearer_auth(key)
+        .header("Idempotency-Key", idempotency_key)
         .form(form)
         .send()
         .await
@@ -371,7 +665,39 @@ mod tests {
             brand: "Visa".into(),
             last4: "4242".into(),
             added_at: None,
+            card_pm: "pm_x".into(),
         };
         assert_eq!(card_json(Some(pm))["last4"], json!("4242"));
+    }
+
+    #[test]
+    fn credit_packs_are_whole_dollars_in_range() {
+        assert!(credit_pack_micros(4.0).is_err());
+        assert!(matches!(credit_pack_micros(25.0), Ok(25_000_000)));
+        assert!(credit_pack_micros(25.5).is_err());
+        assert!(credit_pack_micros(501.0).is_err());
+        assert!(matches!(credit_pack_micros(5.0), Ok(5_000_000)));
+    }
+
+    #[test]
+    fn a_stripe_id_reads_both_shapes() {
+        assert_eq!(stripe_id(Some(&json!("pm_abc"))), "pm_abc");
+        assert_eq!(stripe_id(Some(&json!({"id": "pm_abc"}))), "pm_abc");
+        assert_eq!(stripe_id(None), "");
+    }
+
+    #[test]
+    fn webhook_signature_covers_timestamp_and_raw_body() {
+        let secret = "whsec_test";
+        let body = br#"{"id":"evt_test"}"#;
+        let timestamp = chrono::Utc::now().timestamp();
+        let mut payload = timestamp.to_string().into_bytes();
+        payload.push(b'.');
+        payload.extend_from_slice(body);
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(&payload);
+        let header = format!("t={timestamp},v1={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(verify_webhook_signature(secret, &header, body).is_ok());
+        assert!(verify_webhook_signature(secret, &header, br#"{"id":"evt_other"}"#).is_err());
     }
 }

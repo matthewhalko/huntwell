@@ -273,13 +273,14 @@ export const ENDPOINTS: Endpoint[] = [
     group: 'Account',
     method: 'GET',
     path: '/v1/usage',
-    title: 'Usage and budget',
-    blurb: 'What this period has cost and what is left of the budget.',
+    title: 'Usage and credits',
+    blurb: 'Prepaid credits remaining and what this period has cost.',
     response: `{
   "period_start": "2026-09-01T00:00:00Z",
-  "budget_usd": 50.0,
+  "budget_usd": 37.6,
   "used_usd": 12.4,
   "remaining_usd": 37.6,
+  "credits_usd": 37.6,
   "tokens_used": 8420000
 }`,
   },

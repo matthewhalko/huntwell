@@ -107,7 +107,7 @@ pub async fn connect(service: &str) {
         crate::config::get("HUNTWELL_NATS_PASSWORD").filter(|v| !v.trim().is_empty()),
     );
     let ca = crate::config::get("HUNTWELL_NATS_CA_FILE").filter(|v| !v.trim().is_empty());
-    let options = || {
+    let options = move || {
         let mut o = async_nats::ConnectOptions::new();
         if let (Some(user), Some(password)) = &login {
             o = o.user_and_password(user.clone(), password.clone());
@@ -117,28 +117,39 @@ pub async fn connect(service: &str) {
         }
         o
     };
-    // Tried for a while, not once. A deploy restarts the bus and the services
-    // that use it together, and the services are up before nats-server has
-    // bound its listener — the first attempt is refused every time. Twenty
-    // seconds covers that and a slow VM; a bus that is really down still only
-    // costs a warning, as before.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        match options().connect(&url).await {
-            Ok(c) => {
-                tracing::info!("bus: connected to {url}");
-                let _ = CLIENT.set(Some(c));
-                break;
-            }
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    tracing::warn!("bus: could not connect to {url} ({e}) — events will be dropped");
-                    let _ = CLIENT.set(None);
-                    break;
+    // Tried for a while, not once — but never at the cost of starting. A deploy
+    // restarts the bus and the services that use it together, and the services
+    // are up before nats-server has bound its listener, so the first attempt is
+    // refused every time. The first try happens here; if it fails, the rest
+    // happen in the background for twenty seconds while the service gets on
+    // with serving. A bus that is really down costs a warning, as before — and
+    // no longer twenty seconds of startup on a box that has no NATS at all.
+    match options().connect(&url).await {
+        Ok(c) => {
+            tracing::info!("bus: connected to {url}");
+            let _ = CLIENT.set(Some(c));
+        }
+        Err(first) => {
+            tracing::debug!("bus: {url} not ready ({first}) — retrying in the background");
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    match options().connect(&url).await {
+                        Ok(c) => {
+                            tracing::info!("bus: connected to {url}");
+                            let _ = CLIENT.set(Some(c));
+                            return;
+                        }
+                        Err(e) if tokio::time::Instant::now() >= deadline => {
+                            tracing::warn!("bus: could not connect to {url} ({e}) — events will be dropped");
+                            let _ = CLIENT.set(None);
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
-                tracing::debug!("bus: {url} not ready ({e}) — retrying");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+            });
         }
     }
     // After the attempt, not only on success: the loop no-ops when there is no

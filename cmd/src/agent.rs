@@ -409,6 +409,34 @@ pub fn set_usage_flusher(f: Option<UsageFlusher>) {
     }
 }
 
+/// Set when the prepaid wallet is empty mid-run. [`wait_watching_guard`]
+/// kills the agent child within a slice so a job cannot keep spending.
+static CREDITS_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
+/// The run was stopped because the account had nothing left to spend.
+#[derive(Debug)]
+pub struct CreditsExhausted;
+
+impl std::fmt::Display for CreditsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "account credits exhausted — this run was stopped so it could not overspend")
+    }
+}
+
+impl std::error::Error for CreditsExhausted {}
+
+pub fn trip_credits() {
+    CREDITS_EXHAUSTED.store(true, Ordering::Relaxed);
+}
+
+pub fn credits_exhausted() -> bool {
+    CREDITS_EXHAUSTED.load(Ordering::Relaxed)
+}
+
+pub fn reset_credits_trip() {
+    CREDITS_EXHAUSTED.store(false, Ordering::Relaxed);
+}
+
 /// Start of one `agent -p` call: the next `result` is a new cumulative total.
 pub fn begin_usage_call() {
     if let Ok(mut slot) = usage_slot().lock() {
@@ -674,6 +702,13 @@ pub fn take_call_total() -> (crate::store::TokenUsage, i64) {
         .unwrap_or_default()
 }
 
+/// Usage Cursor has already reported for the current call. The live estimate
+/// includes this amount, so callers subtract it before deciding whether the
+/// unreported in-flight work can fit in the remaining wallet.
+pub fn booked_usage() -> crate::store::TokenUsage {
+    usage_slot().lock().map(|s| s.booked).unwrap_or_default()
+}
+
 /// If the pipeline installed a writer, book pending usage against the run
 /// now — not after the agent child exits.
 fn flush_usage_live() {
@@ -781,8 +816,16 @@ fn raw_ask_agent(
     if crate::guard::breached() {
         bail!("this run lost containment earlier — refusing to start another agent in it");
     }
+    if credits_exhausted() {
+        return Err(CreditsExhausted.into());
+    }
     begin_usage_call();
     note_prompt_chars(prompt.len());
+    // The prompt itself is input spend. Its conservative estimate may have
+    // exhausted the wallet before the provider process is even spawned.
+    if credits_exhausted() {
+        return Err(CreditsExhausted.into());
+    }
 
     let args = build_agent_args(prompt, opts);
     if rep.level().is_verbose() {
@@ -870,6 +913,13 @@ fn raw_ask_agent(
             let _ = narrate.join();
             return Err(guard.breach().into());
         }
+        Wait::CreditsExhausted => {
+            alive.store(false, Ordering::Relaxed);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = narrate.join();
+            return Err(CreditsExhausted.into());
+        }
     };
     alive.store(false, Ordering::Relaxed);
     let _ = narrate.join();
@@ -949,11 +999,13 @@ enum Wait {
     Exited(std::process::ExitStatus),
     TimedOut,
     GuardTripped,
+    CreditsExhausted,
 }
 
-/// Waits for the agent, checking the guard between slices so a forbidden tool
-/// call ends the process in about a quarter second instead of whenever the
-/// model happens to finish.
+/// Waits for the agent, checking the guard and the credit wallet between
+/// slices so a forbidden tool call — or a wallet that just emptied — ends
+/// the process in about a quarter second instead of whenever the model
+/// happens to finish.
 fn wait_watching_guard(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -964,6 +1016,9 @@ fn wait_watching_guard(
     loop {
         if guard.tripped() {
             return Ok(Wait::GuardTripped);
+        }
+        if credits_exhausted() {
+            return Ok(Wait::CreditsExhausted);
         }
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -1311,6 +1366,16 @@ mod tests {
         }));
         let after = m.usage().input;
         assert!(after > 200, "a page snapshot must move the meter, got {after}");
+    }
+
+    #[test]
+    fn a_credits_trip_stays_until_reset() {
+        reset_credits_trip();
+        assert!(!credits_exhausted());
+        trip_credits();
+        assert!(credits_exhausted());
+        reset_credits_trip();
+        assert!(!credits_exhausted());
     }
 }
 
