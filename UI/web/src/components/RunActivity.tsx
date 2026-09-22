@@ -112,8 +112,12 @@ function toAct(l: LogLine): Act | null {
     if (/asking/.test(m[1])) return act('plan', 'Working out where to look next')
     return act('plan', m[1])
   }
+  if ((m = raw.match(/^\[skip\] (.+)$/))) return act('done', m[1].charAt(0).toUpperCase() + m[1].slice(1))
   if ((m = raw.match(/^\[stop\] (.+)$/))) return act('done', asArtifacts(m[1]))
   if ((m = raw.match(/^\[done\] (.+)$/))) return act('done', asArtifacts(m[1]))
+  // An iteration that errored. Previously invisible here, which is how a run
+  // that searched nothing at all could read as a quiet success.
+  if ((m = raw.match(/^\[iter (\d+)\] error: (.+)$/))) return act('error', `Round ${m[1]} failed`, m[2])
   if ((m = raw.match(/^\[warn\] (.+)$/))) return act('warn', m[1])
   if ((m = raw.match(/^\[resume\] (.+)$/))) return act('info', m[1])
   // Pool dispatch, before the run process even starts.
@@ -122,6 +126,9 @@ function toAct(l: LogLine): Act | null {
   if (/^picked up by/.test(raw)) return act('info', 'Worker picked it up')
 
   // Stage results.
+  if ((m = raw.match(/^\s*rounds\s+(\d+) call\(s\), one per site, (\d+) page\(s\) each$/))) return act('info', `Searching ${m[1]} sites one at a time`, `up to ${m[2]} pages each`)
+  if ((m = raw.match(/^\s*→ scrape (\S+): (\d+) row\(s\) in (.+)$/))) return act('found', `${m[1]} gave ${m[2]} rows`, `took ${m[3]}`)
+  if ((m = raw.match(/^\s*→ target reached — (\d+) site\(s\) not opened this round$/))) return act('info', `Enough found — skipped ${m[1]} more sites`)
   if ((m = raw.match(/^\s*→ (\d+) rows returned in (.+)$/))) return act('found', `Came back with ${m[1]} rows`, `took ${m[2]}`)
   if ((m = raw.match(/^\s*→ (\d+) candidate file\(s\) in (.+)$/))) return act('found', `Found ${m[1]} files`, `took ${m[2]}`)
   if ((m = raw.match(/^\s*→ (\d+) new · (\d+) already stored · (\d+) unmappable · (\d+) below min value · (\d+) no name$/)))

@@ -198,6 +198,17 @@ const AUTO: Rate = Rate { input: 1.25, output: 6.0 };
 /// providers behind Cursor charge; cache writes at the input rate.
 pub fn estimate_cost_micros(model: &str, input: i64, output: i64, cache_read: i64, cache_write: i64) -> Option<i64> {
     let m = model.trim();
+    // A `provider:model` id is priced by that provider's own table, which
+    // states a cache-read rate rather than assuming one. Matching it against
+    // the Cursor fragments below would price Anthropic's Sonnet at Cursor's
+    // rate for it — a different number, and the margin column would be wrong.
+    if m.contains(':') {
+        let price = crate::llm::price_of(m)?;
+        // `input` here is already FRESH input — `llm::usage` normalises every
+        // provider to that and the execution row stores it that way — so cache
+        // reads are added, never subtracted again.
+        return Some(price.cost_micros(crate::store::TokenUsage { input, output, cache_read, cache_write }));
+    }
     let (rate, read_share) = if m.is_empty() || m.eq_ignore_ascii_case("auto") {
         (AUTO, 0.2)
     } else {
@@ -255,6 +266,28 @@ pub fn catalog() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_model_is_priced_by_its_provider_not_by_a_cursor_lookalike() {
+        // Cursor's rate for Sonnet 5 is $2/$10; Anthropic's own is $3/$15.
+        // Pricing the direct model off the Cursor table would understate our
+        // cost and overstate the margin, which is the number this feeds.
+        let direct = estimate_cost_micros("anthropic:claude-sonnet-5", 1_000_000, 0, 0, 0).unwrap();
+        let cursorish = estimate_cost_micros("claude-sonnet-5-thinking-high", 1_000_000, 0, 0, 0).unwrap();
+        assert_eq!(direct, 3_000_000);
+        assert_eq!(cursorish, 2_000_000);
+
+        // Cache reads are charged at the provider's stated cache rate, and are
+        // added to fresh input rather than taken out of it.
+        // Gemini 2.5 Flash: $0.30 fresh, $0.075 cached, $2.50 out.
+        // 100k fresh + 900k cached + 50k out = 30_000 + 67_500 + 125_000 µUSD.
+        let gemini = estimate_cost_micros("gemini:gemini-2.5-flash", 100_000, 50_000, 900_000, 0).unwrap();
+        assert_eq!(gemini, 222_500);
+
+        // A provider we have no price for says so rather than inventing one.
+        assert!(estimate_cost_micros("gemini:gemini-9-ultra", 1000, 0, 0, 0).is_none());
+        assert!(estimate_cost_micros("nosuch:model", 1000, 0, 0, 0).is_none());
+    }
 
     #[test]
     fn an_estimate_charges_us_for_the_cached_reads_customers_get_free() {

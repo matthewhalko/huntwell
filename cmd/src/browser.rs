@@ -180,8 +180,11 @@ fn border_script_path() -> PathBuf {
 }
 
 /// Where the browser server writes screenshots and page dumps.
-fn output_dir() -> PathBuf {
-    data_dir().join("output")
+/// Where the browser tools write page snapshots. Per process, not per
+/// machine: several runs share a data dir on a worker VM, and each run's
+/// snapshot trimmer (`thrift::trim::watch`) must see only its own pages.
+pub fn output_dir() -> PathBuf {
+    data_dir().join("output").join(format!("run-{}", std::process::id()))
 }
 
 /// Locates a Chrome (or Chromium) to drive.

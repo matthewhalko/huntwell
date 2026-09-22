@@ -138,6 +138,9 @@ export interface FieldSpec {
   label: string
   type: 'text' | 'longtext' | 'number' | 'money' | 'url' | 'date'
   role?: '' | 'key' | 'title' | 'url'
+  // Hard limits the brief stated; rows outside them are dropped before enrich.
+  min?: number
+  max?: number
 }
 
 // One collected artifact (custom-schema row). `fields` is keyed by schema key.

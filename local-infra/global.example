@@ -70,7 +70,19 @@ AWS_COGNITO_SECRET=...
 # HUNTWELL_BROWSER=browserbase without the keys fails a run rather than
 # falling through to Chrome.
 #HUNTWELL_BROWSER=browserbase
-#BROWSERBASE_API_KEY=bb_...
+## Model providers (llm/). A stage model of `provider:model` runs in Huntwell's
+# own agent loop; a bare id runs through the Cursor CLI. Only the providers you
+# set a key for are offered on the admin's Models page.
+# GEMINI_API_KEY=
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+# DEEPSEEK_API_KEY=      # cheapest, but a Chinese company — page content leaves the US
+# GROQ_API_KEY=
+# MISTRAL_API_KEY=
+# XAI_API_KEY=
+# <PROVIDER>_BASE_URL=   # optional: a proxy or a regional endpoint
+
+BROWSERBASE_API_KEY=bb_...
 #BROWSERBASE_PROJECT_ID=...
 # Optional: residential proxies, a region, and a persistent Context (the cloud
 # equivalent of a per-account Chrome profile, so logins survive between runs).

@@ -112,6 +112,20 @@ fn settable(key: &str) -> bool {
         || key.starts_with("CLOUDFLARE_")
         // The bot check on sign-up and sign-in (turnstile.rs).
         || key.starts_with("TURNSTILE_")
+        // Model providers (llm/). One `<PROVIDER>_API_KEY` each, plus an
+        // optional `<PROVIDER>_BASE_URL` to point at a proxy or a regional
+        // endpoint. Listed by provider rather than by suffix: `*_API_KEY`
+        // would let any file in a working directory name a credential.
+        || matches!(
+            key,
+            "GEMINI_API_KEY" | "GEMINI_BASE_URL"
+                | "ANTHROPIC_API_KEY" | "ANTHROPIC_BASE_URL"
+                | "OPENAI_API_KEY" | "OPENAI_BASE_URL"
+                | "DEEPSEEK_API_KEY" | "DEEPSEEK_BASE_URL"
+                | "GROQ_API_KEY" | "GROQ_BASE_URL"
+                | "MISTRAL_API_KEY" | "MISTRAL_BASE_URL"
+                | "XAI_API_KEY" | "XAI_BASE_URL"
+        )
 }
 
 fn load() -> &'static (Option<PathBuf>, HashMap<String, String>, Option<String>) {

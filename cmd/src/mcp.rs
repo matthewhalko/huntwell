@@ -41,7 +41,19 @@ pub struct Server {
 
 impl Server {
     /// Opens the store read-only and pins the server to one plan.
+    /// Opens the store read-only and pins the server to one plan.
+    ///
+    /// **Blocking.** It builds a runtime of its own, so calling it from a
+    /// thread that is already driving one panics inside tokio. From async
+    /// code, go through `spawn_blocking` — `direct::memory` does, and is async
+    /// for exactly that reason.
     pub fn open(database_url: &str, plan_id: i64) -> Result<Self> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            anyhow::bail!(
+                "mcp::Server::open was called from inside a runtime — it builds one of its own, \
+                 so it must be reached through spawn_blocking (see direct::memory)"
+            );
+        }
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let db = rt.block_on(crate::store::connect_read_only(database_url))?;
         let row = rt
@@ -110,7 +122,9 @@ impl Server {
         }
     }
 
-    fn call_tool(&self, name: &str, args: &Value) -> Result<String> {
+    /// One tool, by name. Public because the direct agent loop
+    /// (`direct::tools`) calls these in-process rather than over stdio.
+    pub fn call_tool(&self, name: &str, args: &Value) -> Result<String> {
         let v = match name {
             "prospect_known" => self.prospect_known(args)?,
             "searches_done" => self.searches_done(args)?,
@@ -267,7 +281,7 @@ fn parse_seed(raw: String) -> Value {
 ///
 /// Descriptions are written for the model: they say when to reach for the tool,
 /// because a tool the model does not think to call is the same as no tool.
-fn tool_definitions() -> Vec<Value> {
+pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "prospect_known",

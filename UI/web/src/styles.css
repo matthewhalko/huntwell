@@ -1198,3 +1198,13 @@ details summary { cursor: pointer; font-weight: 700; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* Watching the browser a run is driving (components/BrowserView.tsx). */
+.browser-view { max-width: min(1180px, 94vw); width: 100%; padding: 0; overflow: hidden; }
+.browser-view-frame { position: relative; }
+.browser-view-head { justify-content: space-between; padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); }
+.browser-view-frame { background: var(--bg-2); display: grid; place-items: center; min-height: min(62vh, 640px); }
+.browser-view-frame img { display: block; width: 100%; height: auto; max-height: 72vh; object-fit: contain; }
+.browser-view-waiting { padding: 4rem 1rem; text-align: center; }
+.browser-view-note { position: absolute; margin: 0.6rem; padding: 0.3rem 0.6rem; border-radius: 6px; background: var(--bad-bg); color: var(--bad); font-size: 0.82rem; }
+.browser-view-foot { padding: 0.7rem 1.1rem; border-top: 1px solid var(--border); font-size: 0.85rem; }

@@ -349,7 +349,14 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <span id="models-note" class="muted"></span>
     </div>
   </div>
+  <div class="card" style="margin-top:1rem">
+    <div class="card-head"><div><h2>Model providers</h2>
+      <div class="sub">Where a <code>provider:model</code> stage runs. The keys live in Secrets Manager; only whether each is set is shown here.</div></div></div>
+    <table><thead><tr><th>Provider</th><th>Status</th><th>Setting</th><th></th></tr></thead>
+    <tbody id="providers"></tbody></table>
+  </div>
 </section>
+
 
 <section class="page hide" data-page="routing">
   <div class="page-head"><div><h1>Routing</h1><div class="sub">How queued executions are placed, and every decision made.</div></div></div>
@@ -380,7 +387,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
   <div class="page-head"><div><h1>Logs</h1><div class="sub">Recent executions across every workspace.</div></div></div>
   <div class="card">
     <div class="card-head">
-      <div><h2>Recent executions</h2><div class="sub">The last 25, newest first.</div></div>
+      <div><h2>Recent executions</h2><div class="sub">The last 25, newest first. Click a run to read everything it printed.</div></div>
     </div>
     <table><thead><tr><th>Execution</th><th>Plan</th><th>Acct</th><th>Status</th><th>Model</th><th style="text-align:right">Charged</th><th style="text-align:right">Our cost</th><th style="text-align:right">Profit</th><th>Host</th><th>Slot</th><th>Started</th></tr></thead>
     <tbody id="executions"></tbody>
@@ -432,6 +439,23 @@ sys incus token</pre></div>
       <button onclick="document.getElementById('reg').close()">Cancel</button>
       <span id="h-err" class="muted"></span>
     </div>
+  </div>
+</dialog>
+
+<dialog id="logdlg" style="max-width:min(1100px,94vw);width:100%">
+  <div class="card" style="border:none">
+    <div class="card-head">
+      <div><h2 id="log-title">Execution</h2><div class="sub" id="log-sub"></div></div>
+      <div class="row">
+        <label class="muted" style="font-size:.85rem"><input type="checkbox" id="log-errors-only" onchange="renderLog()"> problems only</label>
+        <button class="sm" onclick="copyLog(false)" id="log-copy-all">Copy whole log</button>
+        <button class="sm" onclick="copyLog(true)" id="log-copy-shown" hidden>Copy shown</button>
+        <button class="sm" onclick="downloadLog()">Download</button>
+        <span id="log-copied" class="muted" style="font-size:.85rem"></span>
+        <button class="sm" onclick="document.getElementById('logdlg').close()">Close</button>
+      </div>
+    </div>
+    <pre id="log-body" class="mono" style="max-height:62vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:.8rem;line-height:1.5;margin:0"></pre>
   </div>
 </dialog>
 
@@ -654,9 +678,11 @@ async function refresh(){try{
   const lg=await api('GET','/admin/api/route-log?limit=300');
   lastLog=lg.log;if(routeApi)routeApi.setGridOption('rowData',lg.log);
   const usd=m=>(m<0?'−':'')+'$'+(Math.abs(m)/1e6).toFixed(Math.abs(m)<1e6?3:2);
+  window._runs={};
   const profitCell=m=>m==null?'<span class="muted">—</span>':`<span class="badge ${m>=0?'ok':'bad'}">${usd(m)}</span>`;
   const rs=await api('GET','/admin/api/executions?limit=25');
-  $('executions').innerHTML=rs.executions.map(r=>`<tr><td>#${esc(r.execution_id)}</td><td>${esc(r.source)}</td><td>${esc(r.account_id)}</td>
+  rs.executions.forEach(r=>{window._runs[r.execution_id]=r});
+  $('executions').innerHTML=rs.executions.map(r=>`<tr onclick="openLog(${r.execution_id})" style="cursor:pointer" title="Show this run's log"><td>#${esc(r.execution_id)}</td><td>${esc(r.source)}</td><td>${esc(r.account_id)}</td>
     <td><span class="badge ${r.status==='succeeded'?'ok':r.status==='failed'?'bad':'warn'}">${esc(r.status)}</span></td>
     <td class="mono">${esc(r.model_scrape||'auto')}</td>
     <td style="text-align:right">${usd(r.charged_usd_micros)}</td>
@@ -671,6 +697,116 @@ async function refresh(){try{
     <td style="text-align:right"><b>${usd(sum('charged_usd_micros'))}</b></td><td style="text-align:right"><b>${usd(sum('cost_usd_micros'))}</b></td>
     <td style="text-align:right">${profitCell(sum('profit_usd_micros'))}</td><td colspan="3"></td></tr>`:'';
 }catch(e){console.warn(e)}}
+
+// ---- one run's log -------------------------------------------------------
+// The operator's view: everything the run printed, stderr included. A
+// customer's run page hides the raw lines behind a friendly feed, which is
+// exactly what you do not want when working out why something failed.
+let _log=[];
+// A line worth jumping to. `stderr` alone is too broad — the guard and the
+// trail both narrate there — so the wording the pipeline actually uses when
+// something went wrong is what counts.
+const LOG_BAD=/^\s*(!|✖)|\berror\b|\bfailed\b|panicked|refused|\bcould not\b|\bunavailable\b|exhausted/i;
+
+async function openLog(id){
+  const dlg=$('logdlg');
+  $('log-title').textContent='Execution #'+id;
+  const r=window._runs[id];
+  $('log-sub').textContent=r?`${r.source} · account ${r.account_id} · ${r.status}`:'';
+  $('log-body').textContent='Loading…';
+  _log=[];
+  dlg.showModal();
+  try{
+    const res=await api('GET',`/admin/api/executions/${id}/log`);
+    _log=res.lines||[];
+    // Open on "problems only" when there are any: a failed run is why you
+    // clicked, and its reason is usually one line in three hundred.
+    $('log-errors-only').checked=_log.some(l=>LOG_BAD.test(l.line));
+    renderLog();
+  }catch(e){$('log-body').textContent='Could not load the log: '+(e.message||e)}
+}
+
+function logLines(){
+  return $('log-errors-only').checked ? _log.filter(l=>LOG_BAD.test(l.line)) : _log;
+}
+
+function renderLog(){
+  const lines=logLines();
+  $('log-copy-shown').hidden=lines.length===_log.length;
+  $('log-copy-all').textContent=`Copy whole log (${_log.length})`;
+  if(!lines.length){
+    $('log-body').innerHTML=`<span class="muted">${_log.length?'No problems in this run’s '+_log.length+' log line(s).':'This run printed nothing.'}</span>`;
+    return;
+  }
+  $('log-body').innerHTML=lines.map(l=>{
+    const bad=LOG_BAD.test(l.line);
+    const colour=bad?'var(--bad)':l.stream==='stderr'?'var(--text-2)':'inherit';
+    const t=new Date(l.ts);
+    const at=isNaN(t)?'':t.toLocaleTimeString();
+    return `<span style="color:${colour}"><span class="muted">${esc(at)}</span>  ${esc(l.line)}</span>`;
+  }).join('\n');
+}
+
+// The whole log by default: when a run has failed the thing you want is all
+// of it, to paste somewhere. "Copy shown" is there for when the filter is on
+// and the five lines that matter are all you want.
+function logText(shownOnly){
+  return (shownOnly?logLines():_log).map(l=>{
+    const t=new Date(l.ts); const at=isNaN(t)?'':t.toISOString().replace('T',' ').slice(0,19);
+    // The stream as a fixed tag, the way psql prints it. Not a marker
+    // character: the lines carry their own, and two `!` in a row reads badly.
+    return `${at} ${l.stream==='stderr'?'err':'out'}  ${l.line}`;
+  }).join('\n');
+}
+
+// The admin is reached over plain HTTP on a private address, where
+// `navigator.clipboard` does not exist — it is a secure-context API. Without a
+// fallback the button did nothing at all and said nothing about it.
+function toClipboard(text){
+  if(navigator.clipboard&&window.isSecureContext){
+    return navigator.clipboard.writeText(text).then(()=>true,()=>legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+function legacyCopy(text){
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  // Off-screen but focusable, and readonly so a phone keyboard stays down.
+  ta.setAttribute('readonly','');
+  ta.style.cssText='position:fixed;top:-1000px;opacity:0';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0,text.length);
+  let ok=false;
+  try{ok=document.execCommand('copy')}catch(e){ok=false}
+  document.body.removeChild(ta);
+  return ok;
+}
+
+async function copyLog(shownOnly){
+  const text=logText(shownOnly);
+  const n=(shownOnly?logLines():_log).length;
+  const ok=await toClipboard(text);
+  const note=$('log-copied');
+  note.textContent=ok?`Copied ${n} line(s)`:'Could not copy — use Download';
+  note.style.color=ok?'var(--ok)':'var(--bad)';
+  setTimeout(()=>{note.textContent=''},4000);
+}
+
+// Always available, whatever the browser allows: a big log is often easier to
+// keep as a file than to paste anyway.
+function downloadLog(){
+  const id=$('log-title').textContent.replace(/\D+/g,'')||'run';
+  const blob=new Blob([logText(false)],{type:'text/plain'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`huntwell-execution-${id}.log`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(a.href),10000);
+}
 
 let HOSTS=[];
 // Server text reaches the page escaped: last_error is Incus's own output, and
@@ -825,8 +961,16 @@ const STAGE_HELP={draft:'Writes the plan from the brief. On the critical path of
 
 async function loadModels(){
   const chosen=await api('GET','/admin/api/models');
-  let avail=[];try{avail=(await api('GET','/admin/api/models/available')).models||[]}catch(e){}
+  let avail=[],provs=[];
+  try{const r=await api('GET','/admin/api/models/available');avail=r.models||[];provs=r.providers||[]}catch(e){}
   window._avail=avail;
+  // Which providers are set up, so a missing key is seen here rather than as a
+  // failed run. Never the keys themselves — only whether each is present.
+  $('providers').innerHTML=provs.map(p=>`<tr><td><b>${esc(p.label)}</b></td>
+    <td><span class="badge ${p.configured?'ok':''}">${p.configured?'configured':'no key'}</span></td>
+    <td class="mono muted">${esc(p.setting)}</td>
+    <td class="muted">${p.configured?esc(p.models)+' model(s) offered':'set this to offer its models'}</td></tr>`).join('')
+    ||'<tr><td colspan="4" class="muted">No providers compiled in.</td></tr>';
   $('models').innerHTML=Object.keys(STAGE_HELP).map(stage=>{
     const cur=chosen[stage]||'';
     // Whatever is stored stays selectable even if the account no longer lists
@@ -834,13 +978,16 @@ async function loadModels(){
     const known=avail.some(m=>m.id===cur);
     const opts=['<option value="">Default (let Cursor choose)</option>']
       .concat(!known&&cur?[`<option value="${cur}" selected>${cur} (not in this account's list)</option>`]:[])
-      .concat(avail.map(m=>`<option value="${m.id}" ${m.id===cur?'selected':''}>${m.label} — ${m.id}</option>`)).join('');
+      .concat(avail.map(m=>{
+        const price=!m.direct?'':m.priced?` · $${m.input_per_m}/$${m.output_per_m} per M`:' · price unknown';
+        return `<option value="${esc(m.id)}" ${m.id===cur?'selected':''}>${esc(m.label)}${price}</option>`})).join('');
     const field=avail.length
       ? `<select id="m-${stage}" style="width:100%">${opts}</select>`
       : `<input id="m-${stage}" value="${cur.replace(/"/g,'&quot;')}" placeholder="model id, e.g. gemini-3.8-flash-medium">`;
     return `<tr><td><b>${stage}</b></td><td>${field}</td>
       <td class="muted" style="font-size:.82rem">${STAGE_HELP[stage]}</td></tr>`}).join('');
-  if(!avail.length)$('models-note').textContent='cursor-agent not reachable here — type an id';
+  if(!avail.length)$('models-note').textContent='no provider key set and cursor-agent not reachable here — type an id';
+  else $('models-note').textContent='A `provider:model` id runs in Huntwell\'s own agent loop; a bare id runs through the Cursor CLI.';
 }
 
 async function saveModels(){

@@ -562,6 +562,8 @@ Design the plan:
 - "FieldsSchemaJson": a JSON array (returned as a string) of the columns to collect
   for each item. Each column is
   {{"key":"snake_case_key","label":"Human Label","type":"text|longtext|number|money|url|date","role":""}}
+  A number or money column may also carry "min" and/or "max" (plain numbers) — ONLY for a hard
+  limit the brief states outright ("under $50,000" is "max":50000). Never guess one.
   Rules: include exactly one column with "role":"url" (the link to the item's source
   page), one with "role":"title" (a human label), and one with "role":"key" (a stable
   unique id — the source URL, so two listings cannot collapse into one row.

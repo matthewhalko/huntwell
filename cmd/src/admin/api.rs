@@ -77,6 +77,7 @@ pub fn router(state: Admin) -> Router {
         .route("/admin/api/accounts", get(list_accounts))
         .route("/admin/api/accounts/{id}/kinds", axum::routing::put(put_account_kinds))
         .route("/admin/api/executions", get(recent_executions))
+        .route("/admin/api/executions/{id}/log", get(execution_log))
         .route("/admin/api/route-log", get(route_log))
         .layer(middleware::from_fn(harden_headers))
         .with_state(state)
@@ -780,6 +781,31 @@ async fn put_models(State(state): State<Admin>, headers: HeaderMap, Json(body): 
         if !value.is_empty() && crate::agent::normalize_model(value).is_none() {
             return Err(ApiError(StatusCode::BAD_REQUEST, format!("{value:?} is not a valid model id")));
         }
+        // A `provider:model` id is checked here rather than at run time: a
+        // typo, or a provider whose key is not set, should be said now and not
+        // discovered by a run that has already spent its browser session.
+        if !value.is_empty() {
+            if let Err(why) = crate::llm::parse_model_id(value).and_then(|engine| match engine {
+                crate::llm::Engine::Direct { .. } => crate::llm::for_model(value).map(|_| ()),
+                crate::llm::Engine::Cursor { .. } => Ok(()),
+            }) {
+                return Err(ApiError(StatusCode::BAD_REQUEST, why));
+            }
+            // And that the provider still has it. Names get retired, and a
+            // retired one saved here is a run that dies at its first call
+            // with "this model is no longer available" — which is worth one
+            // request now to avoid.
+            if let Ok((provider, model)) = crate::llm::for_model(value) {
+                if let Ok(available) = provider.list_models().await {
+                    if !available.is_empty() && !available.iter().any(|m| m == &model) {
+                        return Err(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            format!("{} does not offer {model} any more — pick one from the list", provider.label()),
+                        ));
+                    }
+                }
+            }
+        }
         store::set_setting(&state.db, key, value).await.map_err(internal)?;
     }
     tracing::info!(operator = %who, "models updated");
@@ -793,10 +819,50 @@ async fn put_models(State(state): State<Admin>, headers: HeaderMap, Json(body): 
 /// If the CLI is missing the field still accepts a typed id.
 async fn available_models(State(state): State<Admin>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     require(&state, &headers).await?;
-    let out = tokio::task::spawn_blocking(crate::agent::available_models)
-        .await
-        .unwrap_or_default();
-    Ok(Json(json!({ "models": out })))
+    // Two worlds in one list: the providers Huntwell talks to directly
+    // (`provider:model`, priced from their own catalogues) and whatever the
+    // Cursor CLI on this machine reports. The direct ones come first, because
+    // they are the ones with a price we know and a loop we control.
+    let mut out: Vec<Value> = Vec::new();
+    for p in crate::llm::providers() {
+        if !p.configured() {
+            continue;
+        }
+        // Asked, not assumed. A list written here goes stale the day a
+        // provider retires a name, and a stale name is a run that dies on
+        // "this model is no longer available" — which is how this came to be
+        // asked. The built-in list is the fallback when a provider is
+        // unreachable, and says so.
+        let (ids, live) = match p.list_models().await {
+            Ok(ids) if !ids.is_empty() => (ids, true),
+            Ok(_) => (p.models().into_iter().map(|m| m.id).collect(), false),
+            Err(e) => {
+                tracing::warn!("{}: could not list models ({e}) — offering the built-in list", p.id());
+                (p.models().into_iter().map(|m| m.id).collect(), false)
+            }
+        };
+        for id in ids {
+            let price = p.price(&id);
+            out.push(json!({
+                "id": format!("{}:{}", p.id(), id),
+                "label": format!("{} — {}", p.label(), id),
+                "group": p.label(),
+                "input_per_m": price.map(|x| x.input),
+                "cached_input_per_m": price.map(|x| x.cached_input),
+                "output_per_m": price.map(|x| x.output),
+                "priced": price.is_some(),
+                "live": live,
+                "direct": true,
+            }));
+        }
+    }
+    let cursor = tokio::task::spawn_blocking(crate::agent::available_models).await.unwrap_or_default();
+    for m in cursor {
+        let id = m.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let label = m.get("label").and_then(Value::as_str).unwrap_or(&id).to_string();
+        out.push(json!({ "id": id, "label": label, "group": "Cursor", "direct": false }));
+    }
+    Ok(Json(json!({ "models": out, "providers": crate::llm::status() })))
 }
 
 /// What a new account may build, installation-wide.
@@ -932,9 +998,15 @@ async fn recent_executions(State(state): State<Admin>, headers: HeaderMap, Query
 }
 
 /// A run with what it earned: what the customer was charged, what it cost us,
-/// and the difference. The charge is the same sum the customer sees — billed
-/// tokens at the sell rate. Our cost is Cursor's own figure when it gave one,
-/// and otherwise an estimate from the scrape model's rates, marked as such.
+/// and the difference.
+///
+/// The charge is the same sum the customer sees — billed tokens at the sell
+/// rate. Our cost is the real one when the run recorded it: a direct-provider
+/// stage prices every call from its own provider's table as it goes, and
+/// Cursor reports a figure on usage-based plans. Only a run that recorded
+/// nothing falls back to an estimate, which is marked as one — and that
+/// estimate can only use the scrape model's rate, so a run whose stages used
+/// different models is approximate by construction.
 fn execution_money(r: &store::AdminExecutionRow) -> Value {
     let charged = store::tokens_to_usd_micros(r.input_tokens + r.output_tokens);
     let (cost, basis) = if r.cost_usd_micros > 0 {
@@ -955,6 +1027,28 @@ fn execution_money(r: &store::AdminExecutionRow) -> Value {
     v["cost_basis"] = json!(basis);
     v["profit_usd_micros"] = json!(cost.map(|c| charged - c));
     v
+}
+
+/// Everything one run printed, for the admin's log viewer.
+///
+/// Unscoped by account on purpose — this is the operator's view, and the
+/// question it answers is "why did that run fail", which is usually somebody
+/// else's run. The same lines a customer sees on their run page, plus the
+/// stderr ones their page filters out, which is where the reason usually is.
+async fn execution_log(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require(&state, &headers).await?;
+    let run = store::recent_executions_admin(&state.db, None, None, 500)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .find(|r| r.execution_id == id);
+    let lines = store::list_execution_logs(&state.db, id, 0, 5000).await.map_err(internal)?;
+    Ok(Json(json!({
+        "execution": run.as_ref().map(execution_money),
+        "lines": lines.iter().map(|l| json!({
+            "seq": l.seq, "ts": l.ts, "stream": l.stream, "line": l.line,
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1014,6 +1108,36 @@ mod tests {
 #[cfg(test)]
 mod money_tests {
     use super::*;
+
+    /// What the operator's log viewer highlights. The rule is the wording the
+    /// pipeline uses when something went wrong, not the stream it went to:
+    /// the guard and the trail both narrate on stderr without anything being
+    /// broken, and an agent's own error lines go to stdout.
+    #[test]
+    fn the_lines_worth_jumping_to_are_the_ones_that_say_what_broke() {
+        // The same regexp the page uses, kept here so a change to one is
+        // noticed against the other.
+        let bad = regex::Regex::new(r"(?i)^\s*(!|✖)|\berror\b|\bfailed\b|panicked|refused|\bcould not\b|\bunavailable\b|exhausted").unwrap();
+        for line in [
+            "  ! scrape: the model provider rejected the request: HTTP 404 from gemini",
+            "[iter 1] error: scrape: the model provider rejected the request",
+            "thread 'main' panicked at src/mcp.rs:46:21",
+            "     2m00s  ✖ [scrape] refused: attempt refused by policy",
+            "[stop] credits exhausted — stopping this run",
+            "provision: hw-app could not join the event bus",
+        ] {
+            assert!(bad.is_match(line), "should stand out: {line}");
+        }
+        for line in [
+            "huntwell run \"Reno Crosstreks\" (run #5)",
+            "[1/4 scrape] stored prompt, prompt 4.9 KB",
+            "  ✓ stored 1/3  Laif E. Meidell",
+            "  → 12 rows returned in 2m10s",
+            "  tokens     1.2M in · 40k out",
+        ] {
+            assert!(!bad.is_match(line), "ordinary progress should not: {line}");
+        }
+    }
 
     fn run(input: i64, output: i64, cache_read: i64, reported: i64, model: &str) -> store::AdminExecutionRow {
         store::AdminExecutionRow {

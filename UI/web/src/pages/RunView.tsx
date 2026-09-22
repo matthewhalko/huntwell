@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, fmtDate, fmtTokens, LogLine, Run, usd } from '../api'
 import { StatusBadge, useToast } from '../components/ui'
+import BrowserView from '../components/BrowserView'
 import { RunActivity, runProgress, toActivity } from '../components/RunActivity'
 
 export default function RunView() {
@@ -69,10 +70,15 @@ export default function RunView() {
   // Opened in a new tab, never framed: the URL is a live remote control of a
   // browser holding this workspace's signed-in sessions, and it is fetched
   // fresh each time rather than held anywhere.
+  // Huntwell's own viewer, not a link out to whoever is running the browser.
+  // Read-only on purpose: watching is what was asked for, and a view that
+  // could drive would be a way to take the browser away from the run — or to
+  // reach the sites it is signed in to.
+  const [watching, setWatching] = useState(false)
   const watch = async () => {
     try {
-      const r = await api.get<{ url: string }>(`/api/executions/${id}/browser`)
-      window.open(r.url, '_blank', 'noopener,noreferrer')
+      await api.get<{ frames: string }>(`/api/executions/${id}/browser`)
+      setWatching(true)
     } catch (e: any) {
       toast(e.message, true)
     }
@@ -92,6 +98,7 @@ export default function RunView() {
   const prog = runProgress(acts)
   return (
     <>
+      {watching && <BrowserView id={id!} onClose={() => setWatching(false)} />}
       <div className="page-head run-head">
         <div className="run-head-top">
           <h1>

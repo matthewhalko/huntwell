@@ -14,6 +14,7 @@ asset.sql
 search_frontier.sql
 search_query.sql
 visited_page.sql
+watched_page.sql
 # The edges between them: the plan's knowledge graph.
 trail_edge.sql
 prompt_variant.sql

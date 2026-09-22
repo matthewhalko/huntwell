@@ -103,7 +103,15 @@ pub fn note_rows(rows: i64, duplicate: i64, rejected: i64, stored: i64) {
 pub fn call_line(usage: TokenUsage, cost_micros: i64) -> String {
     let mut s = format!("{} in · {} out", tokens(usage.input), tokens(usage.output));
     if usage.cache_read > 0 {
-        s.push_str(&format!(" · {} cached", tokens(usage.cache_read)));
+        // As a share, because the number alone does not say whether the
+        // provider's prefix cache is working. In an agent loop nearly all
+        // input should be a hit; a low share means the conversation is being
+        // rewritten somewhere and every turn is being paid for in full.
+        let total = usage.input + usage.cache_read;
+        let share = if total > 0 { usage.cache_read * 100 / total } else { 0 };
+        s.push_str(&format!(" · {} cached ({share}% of input)", tokens(usage.cache_read)));
+    } else if usage.input > 50_000 {
+        s.push_str(" · nothing cached");
     }
     if cost_micros > 0 {
         s.push_str(&format!(" · {}", money(cost_micros)));
@@ -199,8 +207,26 @@ mod tests {
     fn a_call_line_hides_what_was_not_reported() {
         let u = TokenUsage { input: 12_345, output: 1_100, cache_read: 0, cache_write: 0 };
         assert_eq!(call_line(u, 0), "12.3k in · 1.1k out");
-        let u = TokenUsage { input: 2_000_000, output: 500, cache_read: 8_000, cache_write: 0 };
-        assert_eq!(call_line(u, 2_410_000), "2.0M in · 500 out · 8.0k cached · $2.41");
+    }
+
+    /// Whether the provider's prefix cache is working decides what a run
+    /// costs, and the raw number does not say — 8k cached against 2M fresh
+    /// reads like caching when it is the opposite. The share says it.
+    #[test]
+    fn the_line_says_how_much_of_the_input_was_a_cache_hit() {
+        let barely = TokenUsage { input: 2_000_000, output: 500, cache_read: 8_000, cache_write: 0 };
+        assert_eq!(call_line(barely, 2_410_000), "2.0M in · 500 out · 8.0k cached (0% of input) · $2.41");
+
+        // What a healthy agent loop looks like: nearly all of it a hit.
+        let healthy = TokenUsage { input: 40_000, output: 500, cache_read: 960_000, cache_write: 0 };
+        assert!(call_line(healthy, 0).contains("(96% of input)"), "{}", call_line(healthy, 0));
+
+        // A big call with no caching at all is worth saying out loud.
+        let none = TokenUsage { input: 900_000, output: 500, cache_read: 0, cache_write: 0 };
+        assert!(call_line(none, 0).contains("nothing cached"));
+        // A small one is not — plenty of calls are legitimately short.
+        let small = TokenUsage { input: 900, output: 50, cache_read: 0, cache_write: 0 };
+        assert!(!call_line(small, 0).contains("nothing cached"));
     }
 
     /// The tally is process-global and this is the only test that writes to

@@ -41,6 +41,7 @@ path = "src/bin/notification.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "json", "query"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -73,6 +74,7 @@ hmac = "0.12"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "fs", "io-util", "signal", "time", "net"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["timeout", "trace"] }
 tracing = "0.1"

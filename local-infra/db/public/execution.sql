@@ -57,3 +57,7 @@ CREATE INDEX IF NOT EXISTS execution_pool_claim_idx ON public.execution (host_id
 -- tokens go, so it is the rate the admin's cost estimate uses when Cursor
 -- reported no cost of its own (cost_usd_micros = 0).
 ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS model_scrape varchar(160) NOT NULL DEFAULT '';
+-- Why a run did no work, when it did none: 'unchanged' = the pages this plan
+-- watches showed nothing new, so no agent was started (thrift::watch). Also how
+-- consecutive skips are counted, so a plan is never skipped indefinitely.
+ALTER TABLE public.execution ADD COLUMN IF NOT EXISTS skipped_reason varchar(40) NOT NULL DEFAULT '';

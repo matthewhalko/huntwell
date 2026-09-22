@@ -541,7 +541,9 @@ fn innermost_error_line(text: &str) -> String {
 /// a `browser.` prefix; Claude-in-Chrome leftovers keep a `chrome.` prefix.
 /// The most telling argument is picked by key, falling back to the first short
 /// scalar so unfamiliar tools still say something useful.
-fn describe_tool(name: &str, input: &Value) -> String {
+/// One line naming what a tool call is doing, for the run log. Public because
+/// the direct agent loop narrates its own calls with it.
+pub fn describe_tool(name: &str, input: &Value) -> String {
     let short = shorten_tool_name(name);
     match telling_detail(input, 0) {
         Some(detail) => format!("{short} {detail}"),

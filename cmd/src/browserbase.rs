@@ -115,11 +115,17 @@ pub async fn start(account_id: i64, context_id: Option<String>) -> Result<()> {
 
     let mut body = json!({ "projectId": project });
     // Browserbase's default session timeout is ~5 minutes, and an agent-driven
-    // scrape regularly outlives that — the browser then vanishes mid-run. Ask
-    // for a longer window (seconds; the plan's own cap still applies).
+    // scrape regularly outlives that — the browser then vanishes mid-run, and
+    // every later call in the run fails with "the browser is gone".
+    //
+    // Generous on purpose. The session is released by `stop` on every path a
+    // run can end on — success, failure, cancel — so a long timeout costs
+    // nothing in the normal case; it is only the backstop for a worker that
+    // died without releasing. Half an hour was not enough: a learning plan
+    // does three rounds of search and an enrich call per row, and passes it.
     let timeout_s: u64 = crate::config::get("BROWSERBASE_TIMEOUT_S")
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(4 * 60 * 60);
     body["timeout"] = json!(timeout_s);
     if truthy("BROWSERBASE_PROXIES") {
         body["proxies"] = Value::Bool(true);
@@ -169,9 +175,16 @@ pub async fn start(account_id: i64, context_id: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow!("no connectUrl in response"))?
         .to_string();
 
-    println!("  browser     Browserbase session {id} (account {account_id})");
-    if let Some(live) = live_view_url(&key, &id).await {
-        println!("  live view   {live}");
+    println!(
+        "  browser     Browserbase session {id} (account {account_id}), good for {}",
+        crate::progress::fmt_elapsed(std::time::Duration::from_secs(timeout_s))
+    );
+    // Deliberately not printed: the run log is customer-visible, and this URL
+    // is a bearer capability — whoever holds it can watch *and drive* the
+    // browser carrying that workspace's logged-in sessions. It goes to the
+    // operator's journal, which is not.
+    if live_view_url(&key, &id).await.is_some() {
+        tracing::info!(session = %id, "browserbase live view available to operators");
     }
     *slot().lock().unwrap() = Some(Session { id, connect_url });
     Ok(())
@@ -182,6 +195,18 @@ async fn live_view_url(key: &str, id: &str) -> Option<String> {
     let resp = client().ok()?.get(format!("{API}/sessions/{id}/debug")).header("X-BB-API-Key", key).send().await.ok()?;
     let v: Value = resp.json().await.ok()?;
     v.get("debuggerFullscreenUrl").and_then(Value::as_str).map(str::to_string)
+}
+
+/// The CDP endpoint of a session by id, for Huntwell's own live viewer.
+///
+/// The session was created by a worker; the website serves the viewer, so it
+/// builds the endpoint from the id rather than sharing the worker's handle.
+pub fn connect_url_for(session_id: &str) -> Option<String> {
+    let key = api_key()?;
+    let base = crate::config::get("BROWSERBASE_CONNECT_URL")
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "wss://connect.browserbase.com".to_string());
+    Some(format!("{}?apiKey={}&sessionId={}", base.trim_end_matches('/'), key, session_id))
 }
 
 /// A viewing URL for a session someone owns.
@@ -295,6 +320,25 @@ fn trim(s: &str) -> String {
     s.chars().take(300).collect()
 }
 
+
+#[cfg(test)]
+mod lifetime_tests {
+    #[test]
+    fn a_session_outlives_the_longest_run_a_plan_can_ask_for() {
+        // The failure this guards: a run of three search rounds plus an enrich
+        // call per row passed the old half-hour window, and every call after
+        // that point failed with "the browser is gone" — for the rest of the
+        // run, because nothing renews a dead session.
+        let default_s: u64 = 4 * 60 * 60;
+        assert!(default_s >= 3 * 60 * 60, "a learning plan can run for hours");
+        // And it is settable, for a deployment that wants to bound the cost of
+        // a worker that dies without releasing its session.
+        std::env::set_var("BROWSERBASE_TIMEOUT_S", "900");
+        let read: u64 = crate::config::get("BROWSERBASE_TIMEOUT_S").and_then(|v| v.trim().parse().ok()).unwrap_or(default_s);
+        assert_eq!(read, 900);
+        std::env::remove_var("BROWSERBASE_TIMEOUT_S");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

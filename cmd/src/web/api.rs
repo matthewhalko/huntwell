@@ -160,6 +160,7 @@ pub fn runs_routes() -> Router<App> {
         .route("/executions/{id}", get(get_execution))
         .route("/executions/{id}/cancel", post(cancel_execution))
         .route("/executions/{id}/browser", get(execution_browser))
+        .route("/executions/{id}/browser/frame", get(execution_browser_frame))
         .route("/executions/{id}/log", get(execution_log_sse))
         .route("/executions/{id}/log.json", get(execution_log_json))
         // Authenticated-login (Browserbase Context) management.
@@ -1387,10 +1388,38 @@ async fn execution_browser(
     if run.browser_session_id.trim().is_empty() {
         return Err(bad_request("this execution is running a local browser, which cannot be watched remotely"));
     }
-    let url = crate::browserbase::view_url(run.browser_session_id.trim())
-        .await
+    // Huntwell's own viewer, not the provider's. The provider's URL is a
+    // bearer capability that lets whoever holds it *drive* a browser carrying
+    // this workspace's logged-in sessions, so it never leaves the server —
+    // and the customer has no reason to learn whose browser it is.
+    Ok(Json(json!({ "frames": format!("/api/executions/{id}/browser/frame") })))
+}
+
+/// One frame of the browser this execution is driving, as a JPEG.
+///
+/// Polled by the viewer. Deliberately a picture and nothing else: watching is
+/// what was asked for, and a read-only view cannot be used to take the browser
+/// away from the run or to reach the sessions it is signed in to.
+async fn execution_browser_frame(
+    State(state): State<App>,
+    AuthUser(acc): AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let run = store::get_execution(&state.db, acc.tenant(), id)
+        .await?
+        .ok_or_else(|| not_found("execution not found"))?;
+    let session = run.browser_session_id.trim().to_string();
+    if !matches!(run.status.as_str(), "queued" | "running") || session.is_empty() {
+        return Err(bad_request("that execution has no browser to watch"));
+    }
+    let endpoint = crate::browserbase::connect_url_for(&session)
         .ok_or_else(|| bad_request("that browser is no longer available"))?;
-    Ok(Json(json!({ "url": url })))
+    let jpeg = crate::direct::cdp::screenshot(&endpoint).await.map_err(|e| {
+        // The provider's endpoint is in the error; the customer gets the fact.
+        tracing::warn!(execution_id = id, "live view frame failed: {e:#}");
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, "the browser is not answering just now".into())
+    })?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")], jpeg).into_response())
 }
 
 /// Refuses unless this workspace may connect an authenticated session.

@@ -181,6 +181,20 @@ const MAX_HOPS: usize = 5;
 /// client, because a client that follows on its own resolves the next name
 /// itself, and that resolution is the one nobody checked.
 pub async fn fetch(url: &str) -> Result<FetchedFile> {
+    fetch_with(url, &FetchOpts { timeout_secs: 120, cap: max_bytes(), user_agent: "huntwell-assets/1.0" }).await
+}
+
+/// What differs between downloading a file someone asked for and reading a
+/// web page to see what is on it. The guards are the same for both.
+pub struct FetchOpts {
+    pub timeout_secs: u64,
+    pub cap: usize,
+    pub user_agent: &'static str,
+}
+
+/// [`fetch`] with its limits chosen by the caller. Every request still goes
+/// through `check_url`, pinned resolution and manual redirects.
+pub async fn fetch_with(url: &str, opts: &FetchOpts) -> Result<FetchedFile> {
     let mut current = url.trim().to_string();
     let mut resp = None;
     for hop in 0..=MAX_HOPS {
@@ -189,10 +203,10 @@ pub async fn fetch(url: &str) -> Result<FetchedFile> {
         let port = port_of(&current);
         let addrs = safe_addrs(&host, port).await?;
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(opts.timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &addrs)
-            .user_agent("huntwell-assets/1.0")
+            .user_agent(opts.user_agent)
             .build()
             .context("build download client")?;
         let r = client.get(&current).send().await.with_context(|| format!("GET {current}"))?;
@@ -218,7 +232,7 @@ pub async fn fetch(url: &str) -> Result<FetchedFile> {
     }
     // Trust the declared length only to fail fast; the streaming cap is what
     // actually protects us.
-    let cap = max_bytes();
+    let cap = opts.cap;
     if let Some(len) = resp.content_length() {
         if len as usize > cap {
             anyhow::bail!("file is {} , over the {} cap", human(len as usize), human(cap));

@@ -127,6 +127,10 @@ pub async fn serve_website(db: Db, addr: &str) -> Result<()> {
 }
 
 async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
+    // The monolithic `serve` also drafts plans, so it needs the admin's model
+    // choices the way the planning service does. Refreshed rather than pinned,
+    // because this process outlives any one draft.
+    crate::agent::refresh_stage_models(crate::store::stage_models(&db).await);
     // Runs left 'running' by a previous server are dead; say so before the
     // scheduler concludes those plans are busy. NOT in pool mode: pool runs
     // execute on remote slots and survive this process — the admin's heartbeat

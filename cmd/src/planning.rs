@@ -129,6 +129,11 @@ pub async fn serve(db: Db) -> Result<()> {
                     break;
                 }
             };
+            // Before each draft, not once at startup: this service lives for
+            // days and an operator changing a stage's model on the admin
+            // should not have to wait for a restart.
+            crate::agent::refresh_stage_models(store::stage_models(&db).await);
+            tracing::info!("drafting on model {:?}", crate::agent::draft_model().unwrap_or_else(|| "auto (Cursor)".into()));
             let store::ClaimedDraft { plan_id, account_id, request, adopt_name } = claimed;
 
             // The queued brief when there is one; otherwise this is a redraft

@@ -122,6 +122,9 @@ Plain names, exactly as the application reads them:
 {
   "HUNTWELL_SESSION_SECRET": "...",
   "CURSOR_API_KEY":            "...",
+  "GEMINI_API_KEY":            "...",
+  "ANTHROPIC_API_KEY":         "...",
+  "OPENAI_API_KEY":            "...",
   "BROWSERBASE_API_KEY":       "...",
   "BROWSERBASE_PROJECT_ID":    "...",
   "RESEND_API_KEY":          "re_...",
@@ -240,6 +243,9 @@ role, leave the file out and let the environment supply them.
 
 Only a fixed list of names is read from this file — `KEY`, `SECRET`,
 `HUNTWELL_*`, `CURSOR_API_KEY`, `BROWSERBASE_*`, `STRIPE_*`, `COGNITO_*`, the
+model providers (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, each with
+an optional `*_BASE_URL`), the
 bootstrap `AWS_*` names and the per-service `AWS_*_KEY` / `AWS_*_SECRET` pairs. A line
 setting anything else is ignored, so a file in a working directory cannot set
 `PATH`. A setting that seems not to apply is worth checking against that list

@@ -137,19 +137,39 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
     let meter_account = run.account_id;
     let meter_plan = run.plan_id;
     reset_real_booked();
+    // Called from two quite different places: the CLI path's stream reader,
+    // which is a plain thread, and the direct loop, which is a runtime worker.
+    // `block_on` is right for the first and fatal for the second — it panics
+    // rather than deadlocking, which is how a run died at this line. So which
+    // one we are on decides.
     crate::agent::set_usage_flusher(Some(std::sync::Arc::new(move |u, cost_micros| {
         let db = meter_db.clone();
-        meter_handle.block_on(async move {
+        let book = async move {
             book_tokens(&db, execution_id, meter_account, meter_plan, u, cost_micros).await;
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Already on the runtime: hand it over rather than block it. The
+            // authoritative booking happens in `meter_run` after the call, so
+            // this one is the live figure and can land a moment later.
+            Ok(_) => {
+                meter_handle.spawn(book);
+            }
+            Err(_) => meter_handle.block_on(book),
+        }
     })));
     let display_db = db.clone();
     let display_handle = tokio::runtime::Handle::current();
     crate::agent::set_display_flusher(Some(std::sync::Arc::new(move |est| {
         let db = display_db.clone();
-        display_handle.block_on(async move {
+        let show = async move {
             show_live_tokens(&db, execution_id, meter_account, meter_plan, est).await;
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                display_handle.spawn(show);
+            }
+            Err(_) => display_handle.block_on(show),
+        }
     })));
 
     // The admin's model choices, read once and published to this process.
@@ -280,6 +300,20 @@ async fn execute(db: &Db, run: &store::ExecutionRecord, sc: &SourceConfig, args:
 
     print_run_header(db, run, sc, &seed, &opts).await;
 
+    // A scheduled run whose listing pages show nothing new has nothing to find:
+    // no browser, no agent, no tokens. Only runs the clock started — a person
+    // pressing Run gets a run.
+    let watching = sc.is_artifacts() && run.trigger == "schedule";
+    if watching {
+        if let Some(pages) = crate::thrift::watch::nothing_new(db, sc.account_id, sc.plan_id).await {
+            println!(
+                "\n[skip] nothing new on the {pages} listing page(s) this plan draws from — checked without the agent, no tokens spent"
+            );
+            let _ = store::mark_execution_skipped(db, sc.account_id, run.execution_id, "unchanged").await;
+            return Ok(0);
+        }
+    }
+
     if crate::config::get("CURSOR_API_KEY").is_none() {
         println!("[warn] CURSOR_API_KEY is not set — the agent will only work if `agent login` was run on this machine");
     }
@@ -320,7 +354,20 @@ async fn execute(db: &Db, run: &store::ExecutionRecord, sc: &SourceConfig, args:
         });
     }
 
-    run_pipeline(db, sc, &seed, opts).await
+    // Page snapshots are trimmed as the browser tools write them, for the
+    // whole run, so a header seen on page one is known on page two.
+    let trimmer = crate::thrift::trim::watch(browser::output_dir());
+    let outcome = run_pipeline(db, sc, &seed, opts).await;
+    if let Some(t) = trimmer {
+        let (before, after) = t.stop();
+        if before > 0 {
+            println!("  trim        page snapshots {} → {} ({}% smaller)", human_bytes(before), human_bytes(after), 100 - after * 100 / before);
+        }
+    }
+    if outcome.is_ok() && sc.is_artifacts() {
+        crate::thrift::watch::remember(db, sc.account_id, sc.plan_id).await;
+    }
+    outcome
 }
 
 async fn print_run_header(db: &Db, run: &store::ExecutionRecord, sc: &SourceConfig, seed: &Ctx, opts: &RuntimeOpts) {
@@ -351,7 +398,13 @@ async fn print_run_header(db: &Db, run: &store::ExecutionRecord, sc: &SourceConf
     if opts.free_agent {
         println!("  free agent  on — planner may author replacement scrape prompts");
     }
-    println!("  model       {}", opts.agent.model.as_deref().unwrap_or("auto"));
+    match opts.agent.model.as_deref() {
+        Some(m) => println!("  model       {m} (every stage — set for this run)"),
+        None => {
+            let per = |stage: &str| stage_opts(&opts.agent, stage, sc).model.unwrap_or_else(|| "auto".into());
+            println!("  model       scrape {} · enrich {} · planner {}", per("scrape"), per("enrich"), per("planner"));
+        }
+    }
     let vars: Vec<String> = seed.iter().map(|(k, v)| format!("{k}={}", value_str(v))).collect();
     println!("  seed vars   {}", if vars.is_empty() { "(none)".into() } else { vars.join("  ") });
     if opts.no_enrich || sc.enrich_prompt.trim().is_empty() {
@@ -421,7 +474,25 @@ async fn agent_call(db: &Db, label: &str, prompt: String, opts: AgentOpts) -> Re
     let label = label.to_string();
     let called = label.clone();
     let progress = opts.progress;
-    let joined = tokio::task::spawn_blocking(move || ask_agent(&called, &prompt, opts)).await;
+    // A stage set to `provider:model` runs in our own loop; a bare id is
+    // Cursor's, as it always was. Both answer with the same JSON, so nothing
+    // below here knows the difference.
+    let joined = match crate::direct::handles(opts.model.as_deref()) {
+        Some((provider, model)) => {
+            let opts = crate::direct::Options {
+                label: called,
+                provider,
+                model,
+                budget: crate::direct::page_budget(),
+                progress,
+                memory: crate::direct::memory().await,
+                covered: crate::direct::covered(),
+                needs_browser: true,
+            };
+            Ok(crate::direct::run(opts, &prompt).await)
+        }
+        None => tokio::task::spawn_blocking(move || ask_agent(&called, &prompt, opts)).await,
+    };
     // Meter the tokens this call spent — whether it succeeded or not — so the
     // account's usage ticks up live and the budget cap sees it on the next run.
     meter_run(db, &label, progress).await;
@@ -518,6 +589,11 @@ async fn book_tokens(
         // untracked spend and defeat the prepaid guarantee.
         crate::agent::trip_credits();
         return;
+    }
+    // What this call cost us, beside what it cost the customer. Without this
+    // the run row keeps a zero and every margin figure is a guess.
+    if let Err(e) = store::add_execution_cost(db, execution_id, cost_micros).await {
+        tracing::warn!("meter run cost: {e:#}");
     }
     match store::add_account_usage(db, account_id, u, cost_micros).await {
         Ok(charge) if charge.exhausted() => {
@@ -622,6 +698,10 @@ async fn run_pipeline(db: &Db, sc: &SourceConfig, initial_seed: &Ctx, opts: Runt
     };
     let mut no_progress = 0i64;
     let mut total_new = 0i64;
+    // Iterations that ended in an error rather than in no results. The
+    // difference matters at the end: finding nothing is an outcome, failing to
+    // look is a fault, and they must not both read as "succeeded, 0 new".
+    let mut failures: Vec<String> = Vec::new();
     let initial_seed_key = crate::sha1_hex(&serde_json::to_string(initial_seed)?);
 
     let mut iter = 0i64;
@@ -696,7 +776,11 @@ async fn run_pipeline(db: &Db, sc: &SourceConfig, initial_seed: &Ctx, opts: Runt
                 return Err(e);
             }
             Err(e) => {
+                // Kept, not just printed. A run whose every iteration failed
+                // found nothing for a reason, and calling that "succeeded with
+                // 0 new" hides a broken run behind a normal-looking one.
                 println!("[iter {}] error: {e:#}", iter + 1);
+                failures.push(format!("iteration {}: {}", iter + 1, one_line(&format!("{e:#}"), 200)));
                 0
             }
         };
@@ -797,6 +881,19 @@ async fn run_pipeline(db: &Db, sc: &SourceConfig, initial_seed: &Ctx, opts: Runt
     for line in crate::meter::summary(total_new) {
         println!("{line}");
     }
+    // Nothing found, and every attempt at finding it failed: the run did not
+    // succeed, whatever the last line said. Reported as a failure so the run
+    // shows red, the reason is on the page, and a scheduled plan does not go
+    // on quietly finding nothing for days.
+    if total_new == 0 && !failures.is_empty() {
+        bail!(
+            "every iteration failed — nothing was searched. First failure: {}",
+            failures.first().cloned().unwrap_or_default()
+        );
+    }
+    if !failures.is_empty() {
+        println!("[warn] {} of {iter} iteration(s) failed: {}", failures.len(), failures.join(" · "));
+    }
     Ok(total_new)
 }
 
@@ -891,7 +988,6 @@ async fn iterate_once(
     if !prompt_source.contains("search_rotation") {
         prompt.push_str(&rotation_block);
     }
-    prompt.push_str(&sites_block(sc));
 
     println!(
         "\n[1/4 scrape] {prompt_label}, prompt {}, {known_count} {} excluded",
@@ -905,17 +1001,9 @@ async fn iterate_once(
         }
     }
     let t = Instant::now();
-    let scraped = agent_call(db, "scrape", prompt, stage_opts(&opts.agent, "scrape", sc)).await;
-    // Read before anything else spends: this is the scrape's own cost.
-    let scrape_tokens = crate::meter::last_call_tokens();
+    let searched = run_search(db, sc, prompt, opts, max_new, iteration).await;
     let used_queries = record_search_trail(db, sc.plan_id, &seed_key_of(seed), opts).await;
-    let v = scraped.context("scrape")?;
-    let raw_rows = v.as_array().ok_or_else(|| anyhow!("scrape: expected JSON array, got {}", json_type(&v)))?;
-    let rows: Vec<Ctx> = raw_rows
-        .iter()
-        .filter_map(|r| r.as_object())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .collect();
+    let (rows, scrape_tokens) = searched?;
     println!("  → {} rows returned in {}", rows.len(), fmt_elapsed(t.elapsed()));
 
     println!("[2/4 dedupe] checking {} rows against stored keys", rows.len());
@@ -1006,6 +1094,7 @@ async fn iterate_once(
                 &mut item.row,
                 stage_opts(&opts.agent, "enrich", sc),
                 false,
+                None,
             )
             .await
             {
@@ -1083,7 +1172,6 @@ async fn iterate_artifacts(
     if !prompt_source.contains("search_rotation") {
         prompt.push_str(&rotation_block);
     }
-    prompt.push_str(&sites_block(sc));
     println!("\n[1/4 scrape] {prompt_label}, prompt {}", human_bytes(prompt.len()));
     println!("  rotation   {}", rotation.summary());
     if opts.progress.is_verbose() {
@@ -1092,17 +1180,9 @@ async fn iterate_artifacts(
         }
     }
     let t = Instant::now();
-    let scraped = agent_call(db, "scrape", prompt, stage_opts(&opts.agent, "scrape", sc)).await;
-    // Read before anything else spends: this is the scrape's own cost.
-    let scrape_tokens = crate::meter::last_call_tokens();
+    let searched = run_search(db, sc, prompt, opts, max_new, iteration).await;
     let used_queries = record_search_trail(db, sc.plan_id, &seed_key_of(seed), opts).await;
-    let v = scraped.context("scrape")?;
-    let raw_rows = v.as_array().ok_or_else(|| anyhow!("scrape: expected JSON array, got {}", json_type(&v)))?;
-    let rows: Vec<Ctx> = raw_rows
-        .iter()
-        .filter_map(|r| r.as_object())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .collect();
+    let (rows, scrape_tokens) = searched?;
     println!("  → {} rows returned in {}", rows.len(), fmt_elapsed(t.elapsed()));
 
     println!("[2/4 dedupe] checking {} artifacts against stored keys", rows.len());
@@ -1114,6 +1194,8 @@ async fn iterate_artifacts(
     let mut queue: Vec<PendingA> = Vec::new();
     let enrich_on = !opts.no_enrich && !sc.enrich_prompt.trim().is_empty();
     let (mut dup, mut unmappable) = (0usize, 0usize);
+    let (mut outside, mut twinned) = (0usize, 0usize);
+    let mut twins = crate::thrift::twins::Twins::default();
     for r in &rows {
         let a = match amap.map(r) {
             Ok(a) => a,
@@ -1124,7 +1206,21 @@ async fn iterate_artifacts(
             }
         };
         if known_keys.contains(&a.source_key) {
+            // Remembered, so the same listing on another site is recognised
+            // against what is already stored and not only against this batch.
+            let _ = twins.twin_or_remember(&a.source_key, &a.title, &a.url, r);
             dup += 1;
+            continue;
+        }
+        // Both checks come before enrich, which is what a row costs.
+        if let Some(why) = crate::thrift::filters::outside(r, amap.schema()) {
+            outside += 1;
+            println!("     − outside the plan's limits: {} | {}", one_line(&a.title, 50), one_line(&why, 80));
+            continue;
+        }
+        if let Some(twin) = twins.twin_or_remember(&a.source_key, &a.title, &a.url, r) {
+            twinned += 1;
+            println!("     − same listing as {twin} on another site: {}", one_line(&a.title, 60));
             continue;
         }
         if opts.progress != Level::Off {
@@ -1133,7 +1229,10 @@ async fn iterate_artifacts(
         queue.push(PendingA { row: r.clone(), a });
     }
     println!("  → {} new · {dup} already stored · {unmappable} unmappable", queue.len());
-    crate::meter::note_rows(rows.len() as i64, dup as i64, unmappable as i64, 0);
+    if outside + twinned > 0 {
+        println!("  → {outside} outside the plan's limits · {twinned} already found on another site — not enriched");
+    }
+    crate::meter::note_rows(rows.len() as i64, (dup + twinned) as i64, (unmappable + outside) as i64, 0);
 
     if let Some(max) = max_new {
         if max <= 0 {
@@ -1172,6 +1271,7 @@ async fn iterate_artifacts(
                 &mut item.row,
                 stage_opts(&opts.agent, "enrich", sc),
                 true,
+                Some(amap.schema()),
             )
             .await
             {
@@ -1632,6 +1732,88 @@ async fn prompt_history_csv(db: &Db, plan_id: i64) -> String {
 /// needing the plan rebuilt. Worded as a preference: these are the places to
 /// look first, not a fence — `AllowHosts` is the fence, and being off it ends
 /// the run.
+/// The search: the rendered scrape prompt, run as `thrift::rounds` lays it
+/// out — one call per named site, each with a page budget, or one call.
+/// Returns every row the calls returned and the tokens they spent.
+async fn run_search(db: &Db, sc: &SourceConfig, prompt: String, opts: &RuntimeOpts, max_new: Option<i64>, iteration: i64) -> Result<(Vec<Ctx>, i64)> {
+    let sites = crate::guard::split_sites(&sc.sites);
+    let calls = crate::thrift::rounds::plan(&sites, iteration, store::effort_pages(&sc.effort));
+    // What this plan has already searched and opened, from its trail. Read
+    // once for the round and handed to every call, so round six does not
+    // re-run round one's searches.
+    let covered = covered_ground(db, sc).await;
+    if calls.len() > 1 {
+        println!("  rounds     {} call(s), one per site, {} page(s) each", calls.len(), calls[0].budget);
+    }
+    let mut rows: Vec<Ctx> = Vec::new();
+    let mut tokens = 0i64;
+    let mut done: Vec<String> = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+    for call in &calls {
+        let remaining = max_new.map(|n| n - rows.len() as i64);
+        if remaining.is_some_and(|n| n <= 0) {
+            println!("  → target reached — {} site(s) not opened this round", calls.len() - done.len());
+            break;
+        }
+        let mut p = prompt.clone();
+        if call.site.is_none() {
+            p.push_str(&sites_block(sc));
+        }
+        p.push_str(&call.block(rows.len(), &done, remaining));
+        let t = Instant::now();
+        // The budget stops being advice when our own loop is driving: the
+        // navigate tool refuses past it.
+        crate::direct::set_page_budget(call.budget);
+        crate::direct::set_covered(covered.clone());
+        let reply = agent_call(db, &call.label, p, stage_opts(&opts.agent, "scrape", sc)).await;
+        crate::direct::set_page_budget(0);
+        tokens += crate::meter::last_call_tokens();
+        match reply {
+            Ok(v) => {
+                let got = crate::thrift::rounds::rows_of(&v);
+                if v.as_array().is_none() {
+                    println!("  ! {}: expected a JSON array, got {}", call.label, json_type(&v));
+                }
+                println!("  → {}: {} row(s) in {}", call.label, got.len(), fmt_elapsed(t.elapsed()));
+                rows.extend(got);
+            }
+            // One site failing is not the search failing — unless every one did.
+            Err(e) if e.downcast_ref::<crate::agent::CreditsExhausted>().is_some()
+                || e.downcast_ref::<crate::browser::Unavailable>().is_some()
+                || e.downcast_ref::<guard::ContainmentBreach>().is_some() =>
+            {
+                return Err(e);
+            }
+            Err(e) => {
+                println!("  ! {}: {e:#}", call.label);
+                first_error.get_or_insert(e);
+            }
+        }
+        if let Some(site) = &call.site {
+            done.push(site.clone());
+        }
+    }
+    if rows.is_empty() {
+        if let Some(e) = first_error {
+            return Err(e).context("scrape");
+        }
+    }
+    Ok((rows, tokens))
+}
+
+/// Where this plan has been, for the search prompt's covered-ground note.
+async fn covered_ground(db: &Db, sc: &SourceConfig) -> crate::direct::context::Ground {
+    let queries = store::list_search_queries(db, sc.plan_id, 80).await.unwrap_or_default();
+    let pages = store::list_visited_pages(db, sc.plan_id, 200).await.unwrap_or_default();
+    // Scraped text, so it goes through the same filter as anything else this
+    // plan replays into a prompt.
+    let (searches, _) = guard::sanitize_replayed(queries.into_iter().map(|q| q.query).collect());
+    crate::direct::context::Ground::from_history(
+        searches,
+        pages.into_iter().map(|p| (p.url, String::new())).collect(),
+    )
+}
+
 fn sites_block(sc: &SourceConfig) -> String {
     let sites = crate::guard::split_sites(&sc.sites);
     if sites.is_empty() {
@@ -1651,9 +1833,18 @@ async fn enrich_row(
     row: &mut Ctx,
     agent_opts: AgentOpts,
     empty_only: bool,
+    schema: Option<&[crate::artifact::FieldSpec]>,
 ) -> Result<usize> {
+    // What the row's page publishes about itself, read without the agent. A
+    // complete row skips the call; otherwise the agent starts from the facts
+    // instead of from a browser. Nothing published means nothing changes.
+    let head = crate::thrift::structured::prepare(row, schema).await;
+    if head.complete {
+        return Ok(head.filled);
+    }
     let ctx = merge_ctx(seed, row);
-    let prompt = render_template(enrich_prompt, &ctx)?;
+    let mut prompt = render_template(enrich_prompt, &ctx)?;
+    prompt.push_str(&head.block);
     let v = agent_call(db, label, prompt, agent_opts).await?;
     let obj = match &v {
         Value::Object(m) => Some(m.clone()),
@@ -1673,7 +1864,7 @@ async fn enrich_row(
             filled += 1;
         }
     }
-    Ok(filled)
+    Ok(filled + head.filled)
 }
 
 fn value_blank(v: Option<&Value>) -> bool {
@@ -1702,6 +1893,49 @@ fn json_type(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod meter_thread_tests {
+    /// The crash this guards: the live token flusher used `block_on`, which is
+    /// right from the CLI's stream-reading thread and panics from the direct
+    /// loop's runtime worker. Both callers exist, so both have to work.
+    ///
+    /// The flusher's own body needs a database, so what is checked here is the
+    /// decision it makes — the part that panicked.
+    fn flush(handle: &tokio::runtime::Handle, fired: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let work = async move {
+            fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                handle.spawn(work);
+            }
+            Err(_) => handle.block_on(work),
+        }
+    }
+
+    #[test]
+    fn the_live_meter_works_from_a_plain_thread_and_from_the_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let handle = rt.handle().clone();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // The CLI path: a plain thread, no runtime context. Blocks, and the
+        // work is done by the time it returns.
+        let (h, f) = (handle.clone(), fired.clone());
+        std::thread::spawn(move || flush(&h, f)).join().unwrap();
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The direct loop: inside the runtime. Must not panic.
+        let (h, f) = (handle.clone(), fired.clone());
+        rt.block_on(async move {
+            flush(&h, f);
+            // Spawned, so give it a moment to land.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2, "the runtime path must still book the tokens");
     }
 }
 

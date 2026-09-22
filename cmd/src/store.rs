@@ -1634,6 +1634,22 @@ pub fn effort_settings(effort: &str) -> (i32, i32, bool) {
     }
 }
 
+/// Pages one search call may read, by effort.
+///
+/// The other half of "how hard to try", and the half that was missing: effort
+/// decided how many *rounds* a run did but not how much each round looked, so
+/// a thorough plan did six shallow passes over the same first page of results.
+/// A round that may read twenty pages finds things a round that may read four
+/// never will.
+pub fn effort_pages(effort: &str) -> usize {
+    match normalize_effort(effort).as_str() {
+        "quick" => 5,
+        "thorough" => 20,
+        "exhaustive" => 35,
+        _ => 10,
+    }
+}
+
 /// Inserts (plan_id == 0) or updates a plan. Returns the plan id.
 pub async fn save_plan(db: &Db, account_id: i64, sc: &SourceConfig) -> Result<i64> {
     let plan_type = normalize_plan_type(&sc.plan_type);
@@ -2852,6 +2868,86 @@ pub async fn set_execution_running(db: &Db, execution_id: i64, pid: Option<u32>)
     Ok(())
 }
 
+/// A page a plan watches, and the links it carried when last read.
+pub struct WatchedPage {
+    pub url: String,
+    pub links: Vec<String>,
+}
+
+pub async fn watched_pages(db: &Db, account_id: i64, plan_id: i64) -> Result<Vec<WatchedPage>> {
+    let rows = sqlx::query(r#"SELECT url, links FROM watched_page WHERE plan_id=$1 AND account_id=$2 ORDER BY result_links DESC LIMIT 8"#)
+        .bind(plan_id)
+        .bind(account_id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| WatchedPage { url: r.get(0), links: serde_json::from_str(&r.get::<String, _>(1)).unwrap_or_default() })
+        .collect())
+}
+
+pub async fn upsert_watched_page(db: &Db, account_id: i64, plan_id: i64, url_key: &str, url: &str, links: &[String], result_links: i32) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO watched_page (plan_id,account_id,url_key,url,links,result_links) VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (plan_id,url_key) DO UPDATE SET url=excluded.url, links=excluded.links,
+             result_links=excluded.result_links, checked_at=now()"#,
+    )
+    .bind(plan_id)
+    .bind(account_id)
+    .bind(url_key)
+    .bind(url)
+    .bind(serde_json::to_string(links).unwrap_or_else(|_| "[]".into()))
+    .bind(result_links)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Pages that stopped qualifying are forgotten, so a plan never waits on a
+/// page it no longer reads.
+pub async fn forget_watched_pages_except(db: &Db, account_id: i64, plan_id: i64, keep: &[String]) -> Result<()> {
+    sqlx::query(r#"DELETE FROM watched_page WHERE plan_id=$1 AND account_id=$2 AND NOT (url_key = ANY($3))"#)
+        .bind(plan_id)
+        .bind(account_id)
+        .bind(keep)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Where this plan's stored results live on the web — what makes a page that
+/// links to them a listing page.
+pub async fn result_urls(db: &Db, account_id: i64, plan_id: i64) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(r#"SELECT url FROM artifact WHERE plan_id=$1 AND account_id=$2 AND url <> '' ORDER BY artifact_id DESC LIMIT 2000"#)
+        .bind(plan_id)
+        .bind(account_id)
+        .fetch_all(db)
+        .await?)
+}
+
+pub async fn mark_execution_skipped(db: &Db, account_id: i64, execution_id: i64, reason: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE execution SET skipped_reason=$3 WHERE execution_id=$1 AND account_id=$2"#)
+        .bind(execution_id)
+        .bind(account_id)
+        .bind(reason)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// How many of this plan's most recent finished runs in a row were skipped.
+pub async fn skip_streak(db: &Db, account_id: i64, plan_id: i64) -> Result<i64> {
+    let recent: Vec<String> = sqlx::query_scalar(
+        r#"SELECT skipped_reason FROM execution WHERE plan_id=$1 AND account_id=$2 AND status='succeeded'
+           ORDER BY execution_id DESC LIMIT 10"#,
+    )
+    .bind(plan_id)
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    Ok(recent.iter().take_while(|r| !r.is_empty()).count() as i64)
+}
+
 /// Record the model the scrape stage runs on, for the admin's cost estimate.
 pub async fn set_execution_model(db: &Db, account_id: i64, execution_id: i64, model: &str) -> Result<()> {
     sqlx::query(r#"UPDATE execution SET model_scrape=$3 WHERE execution_id=$1 AND account_id=$2"#)
@@ -3560,6 +3656,24 @@ pub async fn add_execution_tokens(db: &Db, execution_id: i64, account_id: i64, u
 /// The number the live page shows. Absolute — a climbing estimate is replaced
 /// by the billed figure so the two never stack. Does not touch the account:
 /// estimates are not a charge.
+/// Add what one agent call cost *us*, in µUSD, to this run's running total.
+///
+/// Accumulated rather than set, because it arrives a call at a time and a run
+/// may use a different model — even a different provider — per stage. This is
+/// the number the admin's margin column subtracts from what the customer was
+/// charged, so it has to be the real one and not a rate-card guess.
+pub async fn add_execution_cost(db: &Db, execution_id: i64, cost_micros: i64) -> Result<()> {
+    if cost_micros <= 0 {
+        return Ok(());
+    }
+    sqlx::query(r#"UPDATE execution SET cost_usd_micros = cost_usd_micros + $2 WHERE execution_id=$1"#)
+        .bind(execution_id)
+        .bind(cost_micros)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_execution_token_totals(db: &Db, execution_id: i64, u: TokenUsage) -> Result<()> {
     sqlx::query(
         r#"UPDATE execution SET
@@ -4784,6 +4898,24 @@ mod tests {
     fn urls_are_redacted() {
         assert_eq!(redact("postgres://u:pw@h:1/db"), "postgres://***@h:1/db");
         assert_eq!(redact("postgres://h/db"), "postgres://h/db");
+    }
+
+    #[test]
+    fn effort_means_both_how_many_rounds_and_how_far_each_one_looks() {
+        // The gap this closes: effort set the number of rounds and nothing
+        // else, so "thorough" was six shallow passes over the same results.
+        let of = |e: &str| (effort_settings(e).0, effort_pages(e));
+        let (quick_rounds, quick_pages) = of("quick");
+        let (normal_rounds, normal_pages) = of("normal");
+        let (thorough_rounds, thorough_pages) = of("thorough");
+        let (most_rounds, most_pages) = of("exhaustive");
+
+        assert!(quick_rounds < normal_rounds && normal_rounds < thorough_rounds && thorough_rounds < most_rounds);
+        assert!(quick_pages < normal_pages && normal_pages < thorough_pages && thorough_pages < most_pages);
+        // Trying harder has to mean reading more, not only trying again.
+        assert!(thorough_pages >= quick_pages * 3, "quick {quick_pages}, thorough {thorough_pages}");
+        // Anything unrecognised is the middle, never the most expensive.
+        assert_eq!(effort_pages("nonsense"), normal_pages);
     }
 
     #[test]

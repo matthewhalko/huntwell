@@ -30,6 +30,13 @@ pub struct FieldSpec {
     /// "" | key | title | url
     #[serde(default)]
     pub role: String,
+    /// Hard limits the brief stated for a number or money column ("under
+    /// $50,000" is `max: 50000`). A scraped row outside them is dropped before
+    /// it is enriched — see `thrift::filters`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
 }
 
 impl FieldSpec {
@@ -368,7 +375,7 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
         if key.is_empty() || out.iter().any(|f| f.key == key) {
             continue;
         }
-        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new() });
+        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new(), min: None, max: None });
     }
     if out.is_empty() {
         return out;
@@ -379,7 +386,7 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
     let url_key = match out.iter().find(|f| f.typed("url")) {
         Some(f) => f.key.clone(),
         None => {
-            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new() });
+            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new(), min: None, max: None });
             "url".into()
         }
     };
