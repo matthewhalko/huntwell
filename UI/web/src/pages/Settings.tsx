@@ -84,6 +84,7 @@ export default function Settings() {
       </div>
       <div className="two">
         <div className="stack">
+          <TeamSection />
           <div className="card">
             <h3>Appearance</h3>
             <div className="seg">
@@ -116,6 +117,8 @@ export default function Settings() {
               Save
             </button>
           </div>
+        </div>
+        <div className="stack">
           <div className="card">
             <h3>Password</h3>
             <Field label="Current password">
@@ -129,10 +132,7 @@ export default function Settings() {
             </button>
           </div>
           <TwoFactor />
-        </div>
-        <div className="stack">
-        <TeamSection />
-        <ConnectedLogins />
+          <ConnectedLogins />
         </div>
       </div>
     </>
@@ -167,10 +167,9 @@ function ConnectedLogins() {
   const { me, refresh } = useAuth()
   const [conns, setConns] = useState<BrowserConnection[]>([])
   const [available, setAvailable] = useState(true)
-  // Per-workspace switch, separate from whether the server supports the feature
-  // at all. Starts true so the section does not flash a "not enabled" notice
-  // before the first response arrives.
-  const [enabled, setEnabled] = useState(true)
+  // Operator switch on the account. Null until we know: the section stays
+  // hidden rather than flashing a feature that is off for almost everyone.
+  const [enabled, setEnabled] = useState<boolean | null>(null)
   const [pending, setPending] = useState<{ session_id: string; site: string; url: string } | null>(null)
   const [customUrl, setCustomUrl] = useState('')
   const [showCustom, setShowCustom] = useState(false)
@@ -183,7 +182,7 @@ function ConnectedLogins() {
         setAvailable(r.available)
         setEnabled(r.enabled)
       })
-      .catch(() => {})
+      .catch(() => setEnabled(false))
   useEffect(() => {
     load()
   }, [])
@@ -225,6 +224,10 @@ function ConnectedLogins() {
   const sites = [...LOGIN_SITES].sort((a, b) => Number(!!connectedAt(b.site)) - Number(!!connectedAt(a.site)))
   const extra = conns.filter((c) => !LOGIN_SITES.some((s) => s.site === c.site))
 
+  // Off for this account: the feature does not exist on the page. The admin
+  // Users screen is what turns it on.
+  if (enabled !== true) return null
+
   return (
     <div className="card">
       <h3>Connected logins</h3>
@@ -265,8 +268,6 @@ function ConnectedLogins() {
 
       {!available ? (
         <p className="notice">Connected logins aren't set up on this server yet.</p>
-      ) : !enabled ? (
-        <p className="notice">Connected logins aren't enabled for this workspace yet. Get in touch and we'll turn them on.</p>
       ) : pending ? (
         <div className="notice" style={{ marginTop: '0.7rem' }}>
           A sign-in window opened in a new tab — sign in to <b style={{ textTransform: 'capitalize' }}>{pending.site}</b>{' '}

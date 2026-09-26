@@ -21,7 +21,7 @@
 //! `browser::cdp_endpoint()` names, which on a worker is the Browserbase
 //! session with the account's logged-in Context.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -41,6 +41,33 @@ const MAX_TURNS: usize = 40;
 
 /// Room for the answer. A scrape returns rows, which is a long reply.
 const MAX_OUTPUT: u32 = 16_384;
+
+/// How long one stage may take before it is stopped.
+///
+/// The CLI path has always had this; the loop did not, so a provider taking
+/// its time — or a page the model keeps going back to — showed as a run that
+/// simply sat there. A scrape reading twenty pages takes two or three minutes,
+/// so this is generous, but it is finite.
+fn deadline() -> Duration {
+    Duration::from_secs(
+        crate::config::get("HUNTWELL_AGENT_TIMEOUT_S").and_then(|v| v.trim().parse().ok()).unwrap_or(15 * 60),
+    )
+}
+
+/// Say so while a model is thinking.
+///
+/// Without this a call that takes two minutes looks identical to a run that
+/// has died: the last line is whatever tool ran, and then nothing.
+fn heartbeat(rep: Reporter, turn: usize) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut waited = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            waited += 20;
+            rep.emit('…', &format!("still waiting on the model (turn {turn}, {waited}s)"));
+        }
+    })
+}
 
 /// Whether to narrate every turn: what the model said, what it asked for, what
 /// it spent.
@@ -156,7 +183,7 @@ pub async fn run(opts: Options, task: &str) -> Result<Value> {
     // pages go away.
     let mut system = crate::agent::compose_prompt("", with_memory && opts.needs_browser);
     if opts.needs_browser {
-        system.push_str(context::NOTE);
+        system.push_str(&context::note());
     }
     let mut req = Request::new(&opts.model, system);
     req.tools = tools.as_ref().map(|t| t.definitions()).unwrap_or_default();
@@ -190,7 +217,18 @@ pub async fn run(opts: Options, task: &str) -> Result<Value> {
             ));
         }
 
-        let reply = complete(opts.provider, &mut req, &rep).await?;
+        if started.elapsed() > deadline() {
+            bail!(
+                "this stage ran for {} without finishing — stopped so the run can move on",
+                crate::progress::fmt_elapsed(started.elapsed())
+            );
+        }
+        // A model call is the one part of a turn with nothing to show while it
+        // happens, and the longest.
+        let beat = heartbeat(Reporter::new(&opts.label, opts.progress), turns);
+        let reply = complete(opts.provider, &mut req, &rep).await;
+        beat.abort();
+        let reply = reply?;
         if trace {
             rep.emit(
                 '·',

@@ -14,6 +14,16 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn
 }
 
+/// What to say when the answer is not Huntwell's own — the server could not
+/// be reached, or something in front of it answered instead.
+function unreachable(status: number): string {
+  if (status === 502 || status === 503 || status === 504 || (status >= 520 && status <= 530))
+    return "Huntwell couldn't be reached just now — try again in a moment."
+  if (status === 413) return 'That was too large to send.'
+  if (status === 429) return 'Too many requests at once — wait a moment and try again.'
+  return `Something went wrong (${status}) — try again in a moment.`
+}
+
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -27,9 +37,11 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
   try {
     data = text ? JSON.parse(text) : null
   } catch {
-    data = { error: text }
+    // Not our JSON: a proxy's or Cloudflare's error page, or a bare string.
+    // An HTML page is never shown as a message — only what it means.
+    data = /^\s*</.test(text) ? null : { error: text.slice(0, 300) }
   }
-  if (!res.ok) throw new ApiError(res.status, data?.error || `${res.status} ${res.statusText}`)
+  if (!res.ok) throw new ApiError(res.status, data?.error || unreachable(res.status))
   return data as T
 }
 
@@ -47,8 +59,15 @@ export const api = {
 /// token with those forms.
 export interface AuthConfig {
   open_signup: boolean
+  /** Sign-up needs an invitation; everyone else asks to join the waitlist. */
+  invite_only?: boolean
   turnstile_site_key: string | null
 }
+
+/** What an invitation link carries: the address it was sent to and who sent it. */
+export type InvitationInfo =
+  | { kind: 'platform'; email: string; name: string }
+  | { kind: 'team'; email: string; workspace: string }
 
 export interface Me {
   account_id: number
@@ -75,6 +94,17 @@ export interface Me {
   /// The workspace this session is working in — theirs, or a shared one.
   workspace_id: number
   own_workspace: boolean
+  /// Writes this person may make in the current workspace.
+  can?: { plans: boolean; credits: boolean; keys: boolean }
+}
+
+export type Cap = 'plans' | 'credits' | 'keys'
+
+/** Whether this session may make a write of this kind. Missing `can` (an older session payload) stays allowed. */
+export function can(me: Me | null | undefined, cap: Cap): boolean {
+  if (!me) return false
+  if (!me.can) return true
+  return !!me.can[cap]
 }
 
 /// A person with access to a workspace.
@@ -85,6 +115,8 @@ export interface Member {
   role: string
   joined_at: string
   owner: boolean
+  /** Effective tokens: `plans`, `credits`, `keys`, or `readonly`. */
+  permissions?: string[]
 }
 
 export interface InviteRow {
@@ -283,6 +315,19 @@ export interface Run {
   watchable?: boolean
 }
 
+/// How long a run took, or has been going: "42s", "3m 05s", "1h 12m".
+/// Measured to now while it is still running.
+export function fmtDuration(start: string, end?: string | null): string {
+  const a = Date.parse(start)
+  const b = end ? Date.parse(end) : Date.now()
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return '—'
+  const s = Math.max(0, Math.round((b - a) / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
+}
+
 /// Dollars at the precision small amounts need: $0.04 rather than $0.00.
 export function usdFine(n: number): string {
   if (!n) return '$0'
@@ -320,6 +365,8 @@ export interface Prospect {
 export interface ApiKey {
   key_id: number
   token: string
+  /// Shown once, at creation: the signing secret for this key.
+  secret?: string
   token_hint: string
   label: string
   plan_id: number | null
@@ -411,4 +458,61 @@ export function money(v: number | null): string {
   if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`
   if (v >= 1e3) return `$${Math.round(v / 1e3)}K`
   return `$${v}`
+}
+
+/** A cold outreach draft. `body` is without the footer; the footer is the
+ *  sender's own, appended verbatim when the email is copied. */
+export interface Outreach {
+  outreach_id: number
+  created_by: number
+  created_by_name: string
+  prospect_id: number | null
+  recipient_name: string
+  recipient_email: string
+  recipient_title: string
+  recipient_company: string
+  recipient_notes: string
+  subject: string
+  body: string
+  footer: string
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface OutreachVersion {
+  version: number
+  subject: string
+  body: string
+  /** draft | revise | edit | restore */
+  source: string
+  feedback: string
+  model: string
+  created_at: string
+}
+
+export interface OutreachProfile {
+  product: string
+  rules: string
+  footer: string
+  /** Whether this server can draft at all. */
+  ready: boolean
+}
+
+/** The recipient as one address line: `Ana Ruiz <ana@x.com>`, or whichever half is known. */
+export function outreachTo(o: Pick<Outreach, 'recipient_name' | 'recipient_email'>): string {
+  const n = o.recipient_name.trim()
+  const e = o.recipient_email.trim()
+  return n && e ? `${n} <${e}>` : e || n
+}
+
+/** The body as it is sent: the draft, then the footer. */
+export function outreachBody(o: Pick<Outreach, 'body' | 'footer'>): string {
+  return o.footer.trim() ? `${o.body.trimEnd()}\n\n${o.footer.trimEnd()}` : o.body.trimEnd()
+}
+
+/** The whole email, ready to paste. */
+export function outreachEmail(o: Outreach): string {
+  const to = outreachTo(o)
+  return `${to ? `To: ${to}\n` : ''}Subject: ${o.subject}\n\n${outreachBody(o)}`
 }

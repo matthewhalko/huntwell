@@ -1,11 +1,62 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, fmtDate, fmtTokens, LogLine, Run, usd } from '../api'
+import { api, can, fmtTokens, LogLine, Run } from '../api'
+import { useAuth } from '../auth'
 import { StatusBadge, useToast } from '../components/ui'
 import BrowserView from '../components/BrowserView'
 import { RunActivity, runProgress, toActivity } from '../components/RunActivity'
 
+/// "Today, 2:14 PM" when it is today, otherwise a short date with the clock.
+function when(s?: string | null): string {
+  if (!s) return '—'
+  const d = new Date(s)
+  if (isNaN(d.getTime())) return s
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  const now = new Date()
+  if (d.toDateString() === now.toDateString()) return `Today, ${time}`
+  const yest = new Date(now)
+  yest.setDate(now.getDate() - 1)
+  if (d.toDateString() === yest.toDateString()) return `Yesterday, ${time}`
+  const opts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' }
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric'
+  return `${d.toLocaleDateString(undefined, opts)}, ${time}`
+}
+
+/// How long between two moments, in words. A finished run rounds to the minute
+/// past a minute and a half; a run still going keeps the seconds so it ticks.
+function ranFor(start: string, end: string | null, nowMs: number): string {
+  const a = new Date(start).getTime()
+  const b = end ? new Date(end).getTime() : nowMs
+  if (isNaN(a) || isNaN(b) || b < a) return '—'
+  let sec = Math.round((b - a) / 1000)
+  if (end && sec >= 90) sec = Math.round(sec / 60) * 60
+  if (sec < 5) return 'a few seconds'
+  if (sec < 60) return `${sec} seconds`
+  const min = Math.floor(sec / 60)
+  const rem = sec % 60
+  if (min < 60) {
+    if (!end && min < 10 && rem) return `${min} min ${rem} sec`
+    return min === 1 ? '1 minute' : `${min} minutes`
+  }
+  const hr = Math.floor(min / 60)
+  const minRem = min % 60
+  const hours = hr === 1 ? '1 hour' : `${hr} hours`
+  if (hr < 48) return minRem ? `${hours} ${minRem} min` : hours
+  const days = Math.floor(hr / 24)
+  const hrRem = hr % 24
+  return hrRem ? `${days} days ${hrRem} hr` : `${days} days`
+}
+
+function startedBy(trigger: string): string {
+  if (trigger === 'manual') return 'You'
+  if (trigger === 'schedule') return 'A schedule'
+  if (trigger === 'api') return 'The API'
+  return trigger || '—'
+}
+
 export default function RunView() {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const { id } = useParams()
   const nav = useNavigate()
   const toast = useToast()
@@ -94,6 +145,14 @@ export default function RunView() {
   }
 
   const live = !!run && (run.status === 'running' || run.status === 'queued')
+  // A running execution's "running for" should move without waiting on the
+  // five-second poll that refreshes the rest of the record.
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    if (!live) return
+    const t = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [live])
   const acts = toActivity(lines)
   const prog = runProgress(acts)
   return (
@@ -110,7 +169,7 @@ export default function RunView() {
                 ▷ Watch the browser
               </button>
             )}
-            {live && (
+            {live && write && (
               <button className="btn danger" onClick={cancel}>
                 ■ Cancel execution
               </button>
@@ -123,23 +182,42 @@ export default function RunView() {
           </div>
         </div>
         {run && (
-          <div className="sub">
-            <Link to={`/app/plans/${run.plan_id}`}>{run.source}</Link> · {run.trigger} · started {fmtDate(run.started_at)}
-            {run.finished_at && <> · finished {fmtDate(run.finished_at)}</>}
-            {!live && run.new_prospects > 0 && <> · +{run.new_prospects} new artifact{run.new_prospects === 1 ? '' : 's'}</>}
-          </div>
+          <dl className="run-facts">
+            <div>
+              <dt>Plan</dt>
+              <dd>
+                <Link to={`/app/plans/${run.plan_id}`}>{run.source}</Link>
+              </dd>
+            </div>
+            <div>
+              <dt>Started</dt>
+              <dd>{when(run.started_at)}</dd>
+            </div>
+            <div>
+              <dt>Finished</dt>
+              <dd>{run.finished_at ? when(run.finished_at) : run.status === 'queued' ? 'Not yet' : live ? 'Still going' : '—'}</dd>
+            </div>
+            <div>
+              <dt>{run.status === 'queued' ? 'Waiting' : live ? 'Running for' : 'Ran for'}</dt>
+              <dd>{ranFor(run.started_at, live ? null : run.finished_at, nowMs)}</dd>
+            </div>
+            <div>
+              <dt>Started by</dt>
+              <dd>{startedBy(run.trigger)}</dd>
+            </div>
+          </dl>
         )}
       </div>
-      {run && (live || run.cost_usd > 0 || run.new_prospects > 0) && (
+      {run && (live || run.tokens > 0 || run.new_prospects > 0) && (
         <div className="run-cost">
-          <span className="rc-amount">{usd(run.cost_usd)}</span>
-          <span className="muted">{fmtTokens(run.tokens)} tokens</span>
+          <span className="rc-amount">{fmtTokens(run.tokens)}</span>
+          <span className="muted">tokens</span>
           <span className="rc-sep" />
           <span>
             <b>{run.new_prospects}</b> found
           </span>
-          {run.cost_per_result != null ? (
-            <span className="muted">{usd(run.cost_per_result)} each</span>
+          {run.new_prospects > 0 && run.tokens > 0 ? (
+            <span className="muted">{fmtTokens(Math.round(run.tokens / run.new_prospects))} each</span>
           ) : (
             run.status !== 'running' &&
             run.status !== 'queued' && <span className="danger">nothing found for it</span>

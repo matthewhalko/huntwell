@@ -256,6 +256,56 @@ pub fn invite(workspace: &str, inviter: &str, role: &str, link: &str) -> Email {
     }
 }
 
+/// An invitation to create an account, while sign-up is invite-only. Sent when
+/// an operator invites someone, or approves them off the waitlist — to the
+/// person, the two are the same good news.
+pub fn signup_invite(name: &str, link: &str, valid_days: i64) -> Email {
+    let hello = if name.trim().is_empty() { "Hi".to_string() } else { format!("Hi {}", name.trim()) };
+    let body = format!(
+        "{}{}{}{}{}{}",
+        h1("You're invited to Huntwell"),
+        p(&format!("{hello} — your invitation to Huntwell is ready.")),
+        p("Describe who or what you are looking for in a sentence, and Huntwell searches the web for it, keeps the list current, and tells you when something new turns up."),
+        button("Create your account", link),
+        fallback(link),
+        format!(
+            r#"<p style="margin:14px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">This invitation is for this address only and expires in {valid_days} days.</p>"#
+        ),
+    );
+    Email {
+        subject: "You're invited to Huntwell".into(),
+        html: layout("Your invitation to Huntwell is ready.", &body),
+        text: format!(
+            "{hello} — your invitation to Huntwell is ready.\n\n\
+             Describe who or what you are looking for in a sentence, and Huntwell searches the web for it,\n\
+             keeps the list current, and tells you when something new turns up.\n\n\
+             Create your account:\n{link}\n\n\
+             This invitation is for this address only and expires in {valid_days} days.\n"
+        ),
+    }
+}
+
+/// Sent once, when someone first asks to be let in. Says what happens next
+/// and promises nothing: they may not be approved.
+pub fn waitlist_received(name: &str) -> Email {
+    let hello = if name.trim().is_empty() { "Thanks".to_string() } else { format!("Thanks, {}", name.trim()) };
+    let body = format!(
+        "{}{}{}",
+        h1("You're on the list"),
+        p(&format!("{hello} — we've got your request to join Huntwell.")),
+        p("Huntwell is invite-only while we grow. We read every request, and if we can make room for you we'll email this address a link to create your account. There's nothing else you need to do."),
+    );
+    Email {
+        subject: "You're on the Huntwell waitlist".into(),
+        html: layout("We've got your request to join Huntwell.", &body),
+        text: format!(
+            "{hello} — we've got your request to join Huntwell.\n\n\
+             Huntwell is invite-only while we grow. We read every request, and if we can make room for you\n\
+             we'll email this address a link to create your account. There's nothing else you need to do.\n"
+        ),
+    }
+}
+
 /// Sent when building a plan did not work.
 ///
 /// Building is the one thing a user waits on without being able to do anything
@@ -475,6 +525,19 @@ mod tests {
         assert!(i.html.contains("/join/tok") && i.text.contains("/join/tok"));
         let w = welcome("Ada", "https://app.example.com/app");
         assert!(w.html.contains("/app") && w.text.contains("/app"));
+    }
+
+    #[test]
+    fn an_invitation_carries_its_link_and_the_waitlist_note_promises_nothing() {
+        let link = "https://huntwell.ai/signup?invite=abc123";
+        let m = signup_invite("Ada", link, 14);
+        assert_eq!(m.subject, "You're invited to Huntwell");
+        assert!(m.html.contains(link) && m.text.contains(link));
+        assert!(m.text.contains("Hi Ada") && m.text.contains("14 days"));
+        let w = waitlist_received("");
+        assert_eq!(w.subject, "You're on the Huntwell waitlist");
+        assert!(w.text.starts_with("Thanks —"));
+        assert!(!w.text.to_lowercase().contains("you will be approved"), "it must not promise a place");
     }
 
     #[test]

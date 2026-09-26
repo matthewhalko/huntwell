@@ -1,17 +1,20 @@
 import React, { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { ago, api, usd, fmtDate, PlanSummary, scheduleLabel } from '../api'
-import { Badge, Empty, Spinner, StatusBadge, StatusMark, useToast } from '../components/ui'
+import { ago, api, can, fmtTokens, PlanSummary, scheduleLabel } from '../api'
+import { useAuth } from '../auth'
+import { Badge, Empty, Loading, Spinner, StatusBadge, StatusMark, useToast } from '../components/ui'
 import { ClockIcon } from '../components/icons'
 
 /// One plan as a table row.
 ///
-/// A list of plans is scanned — which is running, which is costing money, which
+/// A list of plans is scanned — which is running, which is spending tokens, which
 /// found nothing last time — and a grid of cards makes every one of those a
 /// separate hunt. Columns line the answers up.
 function PlanRow({ plan, onChange }: { plan: PlanSummary; onChange: () => void }) {
+  const { me } = useAuth()
   const nav = useNavigate()
   const toast = useToast()
+  const write = can(me, 'plans')
   const run = async (e: React.MouseEvent) => {
     e.stopPropagation()
     try {
@@ -45,9 +48,15 @@ function PlanRow({ plan, onChange }: { plan: PlanSummary; onChange: () => void }
         )}
       </td>
       <td className="col-star">
-        <button className={'star' + (plan.Favorite ? ' on' : '')} onClick={star} title="Favourite">
-          {plan.Favorite ? '★' : '☆'}
-        </button>
+        {write ? (
+          <button className={'star' + (plan.Favorite ? ' on' : '')} onClick={star} title="Favourite">
+            {plan.Favorite ? '★' : '☆'}
+          </button>
+        ) : (
+          <span className={'star' + (plan.Favorite ? ' on' : '')} aria-hidden>
+            {plan.Favorite ? '★' : ''}
+          </span>
+        )}
       </td>
       <td>
         <div className="plan-name">{plan.Source}</div>
@@ -71,24 +80,26 @@ function PlanRow({ plan, onChange }: { plan: PlanSummary; onChange: () => void }
       </td>
       <td className="num">{plan.prospects}</td>
       <td className="num">{plan.executions}</td>
-      <td className="num">{plan.spend_usd ? usd(plan.spend_usd) : '—'}</td>
+      <td className="num">{plan.tokens ? fmtTokens(plan.tokens) : '—'}</td>
       <td className="nowrap muted">{plan.last_execution_status ? ago(plan.last_execution_at) : 'never run'}</td>
       <td className="num nowrap">
         {plan.active_execution_id ? (
           <Link to={`/app/executions/${plan.active_execution_id}`} className="btn sm" onClick={(e) => e.stopPropagation()}>
             Watch
           </Link>
-        ) : (
+        ) : write ? (
           <button className="btn sm" onClick={run} disabled={plan.Status !== 'ready'} title="Run now" aria-label="Run now">
             ▶ <span className="run-label">Run</span>
           </button>
-        )}
+        ) : null}
       </td>
     </tr>
   )
 }
 
 export default function Plans() {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const [plans, setPlans] = useState<PlanSummary[] | null>(null)
   const [q, setQ] = useState('')
   const load = () => api.get<PlanSummary[]>('/api/plans').then(setPlans)
@@ -110,16 +121,18 @@ export default function Plans() {
         </div>
         <div className="row">
           <input type="text" placeholder="Filter…" value={q} onChange={(e) => setQ(e.target.value)} className="head-filter" />
-          <Link to="/app/plans/new" className="btn primary">
-            + New search plan
-          </Link>
+          {write && (
+            <Link to="/app/plans/new" className="btn primary">
+              + New search plan
+            </Link>
+          )}
         </div>
       </div>
       {plans === null ? (
-        <p className="muted">Loading…</p>
+        <Loading />
       ) : shown.length === 0 ? (
         <Empty title={plans.length ? 'No search plans match' : 'No search plans yet'}>
-          {!plans.length && (
+          {!plans.length && write && (
             /* Home is where a plan is made — one box and a sentence. The
                wizard is for tuning one, not for starting from nothing. */
             <Link to="/app" className="btn primary">
@@ -132,14 +145,14 @@ export default function Plans() {
           <table className="plans-table">
             <thead>
               <tr>
-                <th className="col-status">Last</th>
+                <th className="col-status">Status</th>
                 <th className="col-star" />
                 <th>Plan</th>
                 <th>Collects</th>
                 <th className="num">Artifacts</th>
                 <th className="num">Executions</th>
-                <th className="num">Spent</th>
-                <th>Last run</th>
+                <th className="num">Tokens</th>
+                <th>Last</th>
                 <th />
               </tr>
             </thead>

@@ -125,6 +125,22 @@ pub struct SignupBody {
     /// From the Turnstile widget. Required when the check is configured.
     #[serde(default)]
     pub turnstile_token: String,
+    /// The token from an invitation link. Required while sign-up is
+    /// invite-only; otherwise it only pre-fills the form.
+    #[serde(default)]
+    pub invite: String,
+}
+
+#[derive(Deserialize)]
+pub struct WaitlistBody {
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    /// What they want Huntwell for, in their words.
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub turnstile_token: String,
 }
 
 #[derive(Deserialize)]
@@ -155,10 +171,107 @@ fn identity_error(e: anyhow::Error) -> ApiError {
     }
 }
 
+/// Whether a new account needs an invitation. The very first account never
+/// does — someone has to be able to create the operator's own workspace.
+async fn invite_only(state: &App) -> Result<bool, ApiError> {
+    Ok(!state.open_signup && store::account_count(&state.db).await? > 0)
+}
+
+/// What an invitation link is good for, once it has been checked.
+enum Invitation {
+    /// From the admin: sent to this address by us, so holding the link is
+    /// proof of the address and the emailed code can be skipped.
+    Platform { email: String, name: String },
+    /// A teammate's invitation to their workspace. Also a way in while
+    /// sign-up is closed — a team that could not add anyone would be broken —
+    /// but its link may have been copied into a chat, so it proves nothing
+    /// about the address and the code is still sent.
+    Team { email: String, workspace: String },
+}
+
+impl Invitation {
+    fn email(&self) -> &str {
+        match self {
+            Invitation::Platform { email, .. } | Invitation::Team { email, .. } => email,
+        }
+    }
+}
+
+async fn find_invitation(state: &App, token: &str) -> Result<Option<Invitation>, ApiError> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 128 {
+        return Ok(None);
+    }
+    if let Some((email, name)) = store::signup_invite(&state.db, &store::sha256_hex(token)).await? {
+        return Ok(Some(Invitation::Platform { email, name }));
+    }
+    if let Some((_, email, _, workspace)) = store::invite_by_token(&state.db, token).await? {
+        return Ok(Some(Invitation::Team { email, workspace }));
+    }
+    Ok(None)
+}
+
+/// What an invitation link says, for pre-filling the sign-up form.
+pub async fn invitation(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // A miss is a guess at a 256-bit token; counted with sign-in failures so a
+    // loop of guesses runs into the same wall.
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
+    match find_invitation(&state, &token).await? {
+        Some(Invitation::Platform { email, name }) => Ok(Json(serde_json::json!({ "email": email, "name": name, "kind": "platform" }))),
+        Some(Invitation::Team { email, workspace }) => Ok(Json(serde_json::json!({ "email": email, "workspace": workspace, "kind": "team" }))),
+        None => {
+            crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+            Err(ApiError(StatusCode::NOT_FOUND, "this invitation has expired or has already been used".into()))
+        }
+    }
+}
+
+/// Ask to be let in, while sign-up is invite-only.
+///
+/// Always answers the same way whatever the address — already waiting,
+/// already a customer, declined — so the form cannot be used to find out who
+/// has an account.
+pub async fn join_waitlist(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<WaitlistBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !invite_only(&state).await? {
+        return Err(ApiError(StatusCode::CONFLICT, "sign-up is open — you can create an account straight away".into()));
+    }
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::WAITLIST_REQUESTS.hit(&ip.to_string()).map_err(too_many)?;
+    crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
+    let email = body.email.trim().to_lowercase();
+    if email.len() > 320 || !email.contains('@') || email.starts_with('@') || email.ends_with('@') {
+        return Err(bad_request("enter a valid email address"));
+    }
+    validate_display_name(&body.name).map_err(|e| bad_request(e.to_string()))?;
+    let note: String = body.note.trim().chars().take(600).collect();
+    let added = store::join_waitlist(&state.db, &email, &body.name, &note, &ip.to_string()).await?;
+    if added {
+        let msg = crate::mail::waitlist_received(&body.name);
+        if let Err(e) = store::queue_mail(&state.db, None, &email, "waitlist", &msg).await {
+            tracing::warn!("could not queue the waitlist note to {email}: {e:#}");
+        }
+        tracing::info!("waitlist: {email} asked to join");
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// What the sign-in and sign-up pages need before anyone is signed in.
 pub async fn config(State(state): State<App>) -> Json<serde_json::Value> {
+    let invite_only = invite_only(&state).await.unwrap_or(!state.open_signup);
     Json(serde_json::json!({
-        "open_signup": state.open_signup,
+        "open_signup": !invite_only,
+        "invite_only": invite_only,
         // The site key only when tokens will be checked: a widget nobody
         // verifies is friction with nothing behind it.
         "turnstile_site_key": if crate::turnstile::configured() { crate::turnstile::site_key() } else { None },
@@ -181,9 +294,6 @@ pub async fn signup(
     headers: axum::http::HeaderMap,
     Json(body): Json<SignupBody>,
 ) -> Result<Response, ApiError> {
-    if !state.open_signup && store::account_count(&state.db).await? > 0 {
-        return Err(ApiError(StatusCode::FORBIDDEN, "sign-up is closed on this server".into()));
-    }
     let ip = super::client_ip(&headers, peer);
     crate::throttle::SIGNUPS.check(&ip.to_string()).map_err(too_many)?;
     crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
@@ -193,6 +303,23 @@ pub async fn signup(
     // one, so a capital letter at sign-up broke whatever came next.
     let mut body = body;
     body.email = body.email.trim().to_lowercase();
+    // Invite-only: no invitation, no account. An invitation is for one
+    // address, so a forwarded link cannot be spent on another.
+    let invitation = if body.invite.trim().is_empty() { None } else { find_invitation(&state, &body.invite).await? };
+    if !body.invite.trim().is_empty() && invitation.is_none() {
+        return Err(ApiError(StatusCode::GONE, "this invitation has expired or has already been used".into()));
+    }
+    if let Some(inv) = &invitation {
+        if inv.email() != body.email {
+            return Err(ApiError(StatusCode::FORBIDDEN, format!("this invitation is for {} — sign up with that address", inv.email())));
+        }
+    }
+    if invitation.is_none() && invite_only(&state).await? {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Huntwell is invite-only right now — request an invitation and we'll email you if we can make room".into(),
+        ));
+    }
     validate_signup(&body.email, &body.password).map_err(|e| bad_request(e.to_string()))?;
     validate_display_name(&body.display_name).map_err(|e| bad_request(e.to_string()))?;
     let name = if body.display_name.trim().is_empty() {
@@ -205,15 +332,22 @@ pub async fn signup(
     // squatting on the address, and its identity (a pool user, under Cognito)
     // is replaced with this one.
     if let Some(existing) = store::find_account_by_email(&state.db, &body.email).await? {
-        if existing.email_verified_at.is_some() {
+        // Only an empty one. A row made outside sign-up (the CLI, the
+        // operator endpoint) is unverified too, and may already hold plans
+        // and keys — its owner signs in or resets the password instead.
+        if existing.email_verified_at.is_some() || store::account_holds_anything(&state.db, existing.account_id).await? {
             return Err(bad_request("an account with that email already exists"));
         }
+        // Before anything is deleted: a password the pool would refuse must
+        // not cost the address its current identity.
+        crate::identity::check_password_strength(&body.password).map_err(|e| bad_request(e.to_string()))?;
         if let Err(e) = crate::identity::delete_user(&body.email).await {
             tracing::warn!("could not replace the identity for {}: {e:#}", body.email);
         }
         let sub = crate::identity::create_user(&body.email, &body.password).await.map_err(identity_error)?;
         let acc = store::reclaim_unverified_account(&state.db, existing.account_id, &name, &sub).await?;
         crate::throttle::SIGNUPS.note(&ip.to_string());
+        let acc = spend_invitation(&state, invitation.as_ref(), acc).await?;
         begin_verification(&state, &acc).await?;
         prime_enrolment(&acc, &body.password).await;
         let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
@@ -235,6 +369,7 @@ pub async fn signup(
         }
     };
     crate::throttle::SIGNUPS.note(&ip.to_string());
+    let acc = spend_invitation(&state, invitation.as_ref(), acc).await?;
     begin_verification(&state, &acc).await?;
     prime_enrolment(&acc, &body.password).await;
     let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
@@ -273,8 +408,8 @@ pub async fn login(
     };
     // The password was right and a second factor is on: no session yet. The
     // browser comes back to `mfa` with the code and this opaque challenge.
-    let sub = match outcome {
-        crate::identity::SignIn::Done { sub } => sub,
+    let (sub, access_token) = match outcome {
+        crate::identity::SignIn::Done { sub, access_token } => (sub, access_token),
         crate::identity::SignIn::MfaRequired { challenge } => {
             return Ok(Json(serde_json::json!({ "mfa_required": true, "challenge": challenge, "email": acc.email })).into_response());
         }
@@ -294,8 +429,24 @@ pub async fn login(
             return Err(ApiError(StatusCode::UNAUTHORIZED, "email or password is incorrect".into()));
         }
     }
+    // Only now that the subject is known to be this account's.
+    crate::identity::remember_access_token(acc.account_id, &access_token);
     let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
     Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, &state))).into_response())
+}
+
+/// Use up the invitation an account was made with.
+///
+/// A platform invitation came to this address from us, so following its link
+/// proves the address: the account is verified here and the emailed code is
+/// skipped. A team invitation is left for the join page to accept, and proves
+/// nothing, so the code is still sent.
+async fn spend_invitation(state: &App, invitation: Option<&Invitation>, acc: Account) -> Result<Account, ApiError> {
+    let Some(Invitation::Platform { .. }) = invitation else { return Ok(acc) };
+    store::mark_waitlist_joined(&state.db, &acc.email, acc.account_id).await?;
+    store::mark_email_verified(&state.db, acc.account_id).await?;
+    tracing::info!("waitlist: {} joined by invitation", acc.email);
+    Ok(store::get_account(&state.db, acc.account_id).await?.unwrap_or(acc))
 }
 
 /// Email a fresh confirmation code — or, on a server with no way to send
@@ -304,7 +455,9 @@ async fn begin_verification(state: &App, acc: &Account) -> Result<(), ApiError> 
     if acc.email_verified_at.is_some() {
         return Ok(());
     }
-    if !crate::mail::configured() {
+    // Only off production: there, an address nobody proved would let anyone
+    // claim any email — and with it every team invitation sent to it.
+    if !crate::mail::configured() && !crate::config::is_production() {
         tracing::warn!("no mail provider — {} is verified without an email", acc.email);
         store::mark_email_verified(&state.db, acc.account_id).await?;
         return Ok(());
@@ -388,19 +541,32 @@ pub async fn mfa(
 ) -> Result<Response, ApiError> {
     let ip = super::client_ip(&headers, peer);
     crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
-    let acc = store::find_account_by_email(&state.db, &body.email)
-        .await?
-        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "that sign-in took too long — start again".into()))?;
-    let sub = match crate::identity::answer_mfa(acc.account_id, &body.challenge, &body.code).await {
-        Ok(sub) => sub,
+    // The account is the one whose password earned this challenge, recorded
+    // when it was issued — never the address in the request, which the
+    // browser can set to anyone's. `body.email` is kept only for old clients.
+    let expired = || ApiError(StatusCode::UNAUTHORIZED, "that sign-in took too long — start again".into());
+    let Some(account_id) = crate::identity::mfa_challenge_account(&body.challenge) else {
+        crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+        return Err(expired());
+    };
+    let acc = store::get_account(&state.db, account_id).await?.ok_or_else(expired)?;
+    let (sub, access_token) = match crate::identity::answer_mfa(&body.challenge, &body.code).await {
+        Ok(v) => v,
         Err(e) => {
             crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
             return Err(identity_error(e));
         }
     };
-    if !sub.is_empty() && acc.cognito_sub.is_empty() {
+    // The same rule as a password sign-in: a bound subject must match.
+    if sub.is_empty() || (!acc.cognito_sub.is_empty() && acc.cognito_sub != sub) {
+        tracing::warn!("two-factor sign-in for account {} presented Cognito subject {sub:?}, not the bound one — refused", acc.account_id);
+        crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+        return Err(expired());
+    }
+    if acc.cognito_sub.is_empty() {
         store::set_cognito_sub(&state.db, acc.account_id, &sub).await?;
     }
+    crate::identity::remember_access_token(acc.account_id, &access_token);
     let cookie = start_session(&state, acc.account_id, &user_agent(&headers)).await?;
     Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, &state))).into_response())
 }
@@ -572,6 +738,7 @@ pub fn me_json(acc: &Account, state: &App) -> serde_json::Value {
         "workspace_id": acc.tenant(),
         "own_workspace": acc.in_own_workspace(),
         "open_signup": state.open_signup,
+        "invite_only": !state.open_signup,
     })
 }
 
@@ -583,12 +750,21 @@ pub async fn me(State(state): State<App>, AuthUser(acc): AuthUser) -> Json<serde
     // this person's own account when they are working in someone else's.
     let ws = store::get_account(&state.db, acc.tenant()).await.ok().flatten();
     let mut v = me_json(&acc, &state);
+    let caps = store::workspace_caps(&state.db, acc.tenant(), acc.account_id).await.unwrap_or_else(|_| store::Caps::none());
     if let Some(o) = v.as_object_mut() {
         o.insert("kinds".into(), serde_json::json!(kinds));
         o.insert("platform_ack".into(), serde_json::json!(ws.as_ref().is_some_and(|a| a.platform_ack_at.is_some())));
         o.insert(
             "platform_ack_at".into(),
             serde_json::json!(ws.as_ref().and_then(|a| a.platform_ack_at).map(|t| t.to_rfc3339())),
+        );
+        o.insert(
+            "can".into(),
+            serde_json::json!({
+                "plans": caps.plans,
+                "credits": caps.credits,
+                "keys": caps.keys,
+            }),
         );
     }
     Json(v)
@@ -658,6 +834,10 @@ pub async fn update_me(State(state): State<App>, AuthUser(acc): AuthUser, Json(b
     }
     if let Some(on) = body.platform_ack {
         // The workspace holds the claim; the person who clicked is recorded on it.
+        let caps = store::workspace_caps(&state.db, acc.tenant(), acc.account_id).await?;
+        if !caps.plans {
+            return Err(ApiError(StatusCode::FORBIDDEN, "you do not have permission to change this workspace".into()));
+        }
         store::set_platform_ack(&state.db, acc.tenant(), acc.account_id, on).await?;
     }
     if body.onboarded {

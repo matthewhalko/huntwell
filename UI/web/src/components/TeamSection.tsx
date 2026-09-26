@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
-import { ago, api, Team as TeamT } from '../api'
+import { ago, api, Member, Team as TeamT } from '../api'
 import { useAuth } from '../auth'
-import { Field, useToast } from './ui'
+import { Field, Modal, useToast } from './ui'
 
 /**
  * Who you work with — a section of Settings, since it is about the account
@@ -28,6 +28,17 @@ function tint(seed: number): string {
   return ['var(--brand-sky)', 'var(--brand-green)', 'var(--brand-yellow)', 'var(--brand-pink)'][Math.abs(seed) % 4]
 }
 
+/// A short read of a guest's caps, so an admin can scan the list without opening each one.
+function capHint(m: Member): string | null {
+  if (m.owner) return null
+  const p = m.permissions || []
+  if (p.includes('readonly') || p.length === 0) return 'read-only'
+  const bits = (['plans', 'credits', 'keys'] as const).filter((k) => p.includes(k))
+  if (bits.length === 3) return null
+  if (bits.length === 0) return 'read-only'
+  return bits.join(' · ')
+}
+
 export function TeamSection() {
   const { me } = useAuth()
   const toast = useToast()
@@ -41,6 +52,9 @@ export function TeamSection() {
   // in the switcher and what its invitations are sent in the name of.
   const [wsName, setWsName] = useState('')
   const [renaming, setRenaming] = useState(false)
+  const [editing, setEditing] = useState<Member | null>(null)
+  const [draft, setDraft] = useState({ role: 'member', readonly: false, plans: true, credits: false, keys: true })
+  const [saving, setSaving] = useState(false)
 
   const load = () =>
     api
@@ -106,10 +120,51 @@ export function TeamSection() {
     load()
   }
 
+  const openPerms = (m: Member) => {
+    const p = m.permissions || []
+    const readonly = p.includes('readonly')
+    setDraft({
+      role: m.role === 'admin' ? 'admin' : 'member',
+      readonly,
+      plans: !readonly && p.includes('plans'),
+      credits: !readonly && p.includes('credits'),
+      keys: !readonly && p.includes('keys'),
+    })
+    setEditing(m)
+  }
+
+  const togglePerm = (key: 'readonly' | 'plans' | 'credits' | 'keys') => {
+    if (key === 'readonly') {
+      setDraft((d) =>
+        d.readonly
+          ? { ...d, readonly: false, plans: true, credits: d.role === 'admin', keys: true }
+          : { ...d, readonly: true, plans: false, credits: false, keys: false },
+      )
+      return
+    }
+    setDraft((d) => ({ ...d, readonly: false, [key]: !d[key] }))
+  }
+
+  const savePerms = async () => {
+    if (!editing || saving) return
+    setSaving(true)
+    try {
+      const permissions = draft.readonly ? ['readonly'] : (['plans', 'credits', 'keys'] as const).filter((k) => draft[k])
+      await api.put(`/api/team/members/${editing.account_id}/permissions`, { permissions, role: draft.role })
+      toast('Permissions saved')
+      setEditing(null)
+      load()
+    } catch (e: any) {
+      toast(e.message || 'Could not save permissions', true)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <>
       {team?.can_invite && (
-        <div className="card" style={{ marginBottom: '1.4rem' }}>
+        <div className="card">
           <h3 style={{ marginTop: 0 }}>Workspace</h3>
           <p className="muted" style={{ margin: '0 0 0.9rem' }}>
             A workspace holds the search plans and everything they find. Everyone you invite works in it with you.
@@ -156,31 +211,59 @@ export function TeamSection() {
       )}
 
       <div className="card">
-        <h3 style={{ marginTop: 0 }}>{team?.can_invite ? 'Members' : 'Team'}</h3>
+        <h3 style={{ marginTop: 0 }}>Team</h3>
+        {team?.can_invite && <p className="muted" style={{ margin: '0 0 0.8rem' }}>Click a teammate to set what they can do — plans, credits, API keys, or read-only.</p>}
         <div className="members">
-          {team?.members.map((m) => (
-            <div className="member" key={m.account_id}>
-              <span className="avatar" style={{ background: tint(m.account_id) }} aria-hidden>
-                {initials(m.display_name, m.email)}
-              </span>
-              <div className="member-main">
-                <div className="member-name">
-                  {m.display_name || m.email}
-                  {m.account_id === me?.account_id && <span className="you">you</span>}
+          {team?.members.map((m) => {
+            const editable = !!(team?.can_invite && !m.owner && m.account_id !== me?.account_id)
+            const hint = capHint(m)
+            return (
+              <div
+                className={'member' + (editable ? ' can-edit' : '')}
+                key={m.account_id}
+                onClick={editable ? () => openPerms(m) : undefined}
+                role={editable ? 'button' : undefined}
+                tabIndex={editable ? 0 : undefined}
+                onKeyDown={
+                  editable
+                    ? (e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          openPerms(m)
+                        }
+                      }
+                    : undefined
+                }
+              >
+                <span className="avatar" style={{ background: tint(m.account_id) }} aria-hidden>
+                  {initials(m.display_name, m.email)}
+                </span>
+                <div className="member-main">
+                  <div className="member-name">
+                    {m.display_name || m.email}
+                    {m.account_id === me?.account_id && <span className="you">you</span>}
+                  </div>
+                  {!!m.display_name && <div className="member-sub">{m.email}</div>}
                 </div>
-                {!!m.display_name && <div className="member-sub">{m.email}</div>}
+                <span className="badge">{m.owner ? 'owner' : m.role}</span>
+                {hint && <span className="badge">{hint}</span>}
+                <span className="member-when">joined {ago(m.joined_at)}</span>
+                <span className="member-act">
+                  {editable && (
+                    <button
+                      className="btn sm danger"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        remove(m.account_id, m.display_name || m.email)
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </span>
               </div>
-              <span className="badge">{m.owner ? 'owner' : m.role}</span>
-              <span className="member-when">joined {ago(m.joined_at)}</span>
-              <span className="member-act">
-                {team?.can_invite && !m.owner && m.account_id !== me?.account_id && (
-                  <button className="btn sm danger" onClick={() => remove(m.account_id, m.display_name || m.email)}>
-                    Remove
-                  </button>
-                )}
-              </span>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
 
@@ -211,6 +294,58 @@ export function TeamSection() {
             ))}
           </div>
         </div>
+      )}
+
+      {editing && (
+        <Modal title={editing.display_name || editing.email} onClose={() => setEditing(null)}>
+          <p className="muted" style={{ margin: '0 0 0.8rem' }}>
+            What they may change in this workspace, and whether they can invite others.
+          </p>
+          <Field label="Can they invite others?">
+            <select value={draft.role} onChange={(e) => setDraft((d) => ({ ...d, role: e.target.value }))} style={{ width: 170 }}>
+              <option value="member">No — member</option>
+              <option value="admin">Yes — admin</option>
+            </select>
+          </Field>
+          <div className="perm-list">
+            <label className="check">
+              <input type="checkbox" checked={draft.readonly} onChange={() => togglePerm('readonly')} />
+              <span>
+                Read only
+                <small>Can look at plans, results and usage. Cannot change them.</small>
+              </span>
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={draft.plans} onChange={() => togglePerm('plans')} />
+              <span>
+                Create and run plans
+                <small>New searches, edits, runs, and deleting what they find.</small>
+              </span>
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={draft.credits} onChange={() => togglePerm('credits')} />
+              <span>
+                Buy credits
+                <small>Purchase prepaid credits and change the card on file.</small>
+              </span>
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={draft.keys} onChange={() => togglePerm('keys')} />
+              <span>
+                Create API keys
+                <small>Issue keys that act for this workspace.</small>
+              </span>
+            </label>
+          </div>
+          <div className="row" style={{ justifyContent: 'flex-end', gap: '0.5rem' }}>
+            <button className="btn" type="button" onClick={() => setEditing(null)}>
+              Cancel
+            </button>
+            <button className="btn primary" type="button" disabled={saving} onClick={savePerms}>
+              {saving ? 'Saving…' : 'Save permissions'}
+            </button>
+          </div>
+        </Modal>
       )}
     </>
   )

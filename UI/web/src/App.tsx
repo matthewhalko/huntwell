@@ -11,12 +11,15 @@ import PlanDetail from './pages/PlanDetail'
 import Runs from './pages/Runs'
 import RunView from './pages/RunView'
 import Prospects from './pages/Prospects'
+import Outreach from './pages/Outreach'
 import Usage from './pages/Usage'
 import ApiAccess from './pages/ApiAccess'
 import ApiReference from './pages/ApiReference'
 import Settings from './pages/Settings'
 import Join from './pages/Join'
 import { Privacy, Terms } from './pages/Legal'
+import { Developers, Pricing, Product, Security, UseCases } from './pages/Site'
+import { RouteMeta } from './components/Site'
 
 function RequireAuth({ children }: { children: React.ReactElement }) {
   const { me, loading } = useAuth()
@@ -37,6 +40,8 @@ function RunRedirect() {
 export default function App() {
   const { me, loading } = useAuth()
   return (
+    <>
+    <RouteMeta />
     <Routes>
       {/* Always the landing page, signed in or not.
           It used to redirect a signed-in visitor to /app, which broke the back
@@ -52,6 +57,12 @@ export default function App() {
       <Route path="/forgot" element={<Forgot />} />
       {/* An invite link: readable signed out, acceptable only as the invitee. */}
       <Route path="/join/:token" element={<Join />} />
+      {/* The public site: what Huntwell is, before anyone signs in. */}
+      <Route path="/product" element={<Product />} />
+      <Route path="/use-cases" element={<UseCases />} />
+      <Route path="/pricing" element={<Pricing />} />
+      <Route path="/developers" element={<Developers />} />
+      <Route path="/security" element={<Security />} />
       <Route path="/terms" element={<Terms />} />
       <Route path="/privacy" element={<Privacy />} />
       <Route
@@ -72,6 +83,7 @@ export default function App() {
         <Route path="runs" element={<Navigate to="/app/executions" replace />} />
         <Route path="runs/:id" element={<RunRedirect />} />
         <Route path="prospects" element={<Prospects />} />
+        <Route path="outreach" element={<Outreach />} />
         <Route path="usage" element={<Usage />} />
         <Route path="api-access" element={<ApiAccess />} />
         <Route path="api-docs" element={<ApiReference />} />
@@ -79,5 +91,6 @@ export default function App() {
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    </>
   )
 }

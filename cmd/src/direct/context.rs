@@ -22,7 +22,22 @@ use crate::llm::Message;
 /// Page snapshots kept in full. Two: the one the model is working from, and
 /// the one before it, so it can compare a listing page with the page it just
 /// came back from.
-const KEEP: usize = 2;
+///
+/// This number is the whole trade. Every turn, the page falling out of it is
+/// rewritten into a stub — a change in the middle of the conversation, which
+/// is what stops a provider's prefix cache matching past that point. So the
+/// tokens still being re-read each turn are exactly the ones kept here, and
+/// they are re-read as *fresh* input, which is what the customer is billed
+/// for. One page roughly halves that; two lets the model hold a listing page
+/// while it looks at something it linked to.
+const DEFAULT_KEEP: usize = 2;
+
+fn keep() -> usize {
+    crate::config::get("HUNTWELL_CONTEXT_PAGES")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_KEEP)
+        .clamp(1, 8)
+}
 
 /// Shorter than this and replacing it saves nothing worth the confusion.
 const WORTH_STUBBING: usize = 1500;
@@ -37,10 +52,11 @@ pub fn compact(messages: &mut [Message]) -> usize {
         .filter(|(_, m)| matches!(m, Message::ToolResult { content, .. } if is_page(content)))
         .map(|(i, _)| i)
         .collect();
-    if pages.len() <= KEEP {
+    let keep = keep();
+    if pages.len() <= keep {
         return 0;
     }
-    pages.truncate(pages.len() - KEEP);
+    pages.truncate(pages.len() - keep);
     let mut saved = 0;
     for i in pages {
         let Message::ToolResult { content, .. } = &mut messages[i] else { continue };
@@ -255,10 +271,17 @@ pub fn seed_note(messages: &mut Vec<Message>, ground: &Ground) {
 /// What the model is told about the rule, appended to its instructions. Says
 /// it plainly, because a model that expects to scroll back will collect
 /// nothing and then go looking.
-pub const NOTE: &str = "\n\nHOW THIS CONVERSATION WORKS — read this carefully:\n\
-    Only the last two pages you opened stay readable. An older page is replaced by a short note \
-    giving its URL. So take every row you want off a page WHILE YOU ARE LOOKING AT IT, and keep \
-    them in your reply as you go. Do not plan to come back to a page later.\n";
+pub fn note() -> String {
+    let n = keep();
+    format!(
+        "\n\nHOW THIS CONVERSATION WORKS — read this carefully:\n\
+         Only the last {} you opened {} readable. An older page is replaced by a short note giving its URL. \
+         So take every row you want off a page WHILE YOU ARE LOOKING AT IT, and keep them in your reply as \
+         you go. Do not plan to come back to a page later.\n",
+        if n == 1 { "page".to_string() } else { format!("{n} pages") },
+        if n == 1 { "stays" } else { "stay" },
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -468,7 +491,13 @@ mod tests {
 
     #[test]
     fn the_model_is_told_the_rule_it_has_to_work_under() {
-        assert!(NOTE.contains("last two pages"));
-        assert!(NOTE.to_lowercase().contains("while you are looking at it"));
+        assert!(note().contains("last 2 pages"));
+        assert!(note().to_lowercase().contains("while you are looking at it"));
+        // And the wording follows the setting, so a deployment that keeps one
+        // page does not tell the model it has two.
+        std::env::set_var("HUNTWELL_CONTEXT_PAGES", "1");
+        let one = note();
+        std::env::remove_var("HUNTWELL_CONTEXT_PAGES");
+        assert!(one.contains("last page you opened stays readable"), "{one}");
     }
 }

@@ -220,6 +220,10 @@ impl Pool {
 /// users; the detail goes to the log, where the operator reads it.
 pub const UNAVAILABLE: &str = "sign-in is temporarily unavailable — please try again in a few minutes";
 
+/// The pool wants this person to set a new password (an operator reset it, or
+/// it was imported). Theirs to fix, with the reset flow — not an outage.
+pub const RESET_REQUIRED: &str = "this account needs a new password — use \"Forgot your password?\" to set one";
+
 fn translate(operation: &str, body: &str) -> anyhow::Error {
     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let kind = parsed["__type"].as_str().unwrap_or("");
@@ -247,6 +251,10 @@ fn translate(operation: &str, body: &str) -> anyhow::Error {
         "InvalidParameterException" if operation == "InitiateAuth" => {
             tracing::error!("cognito InitiateAuth is misconfigured (InvalidParameterException): {message}");
             anyhow!(UNAVAILABLE)
+        }
+        "PasswordResetRequiredException" | "UserNotConfirmedException" => {
+            tracing::warn!("cognito {operation}: {kind}: {message}");
+            anyhow!(RESET_REQUIRED)
         }
         "UsernameExistsException" => anyhow!("that email already has an account"),
         "CodeMismatchException" | "EnableSoftwareTokenMFAException" => anyhow!("that code is not right — try the next one your app shows"),
@@ -369,6 +377,41 @@ pub async fn sign_in_full_in(kind: PoolKind, email: &str, password: &str) -> Res
         )
         .await?;
     read_sign_in(parsed, email)
+}
+
+/// Try a sign-in for an address that cannot exist and report exactly what the
+/// pool said, untranslated — for `huntwell doctor`. A healthy pool answers
+/// "Incorrect username or password" (or "user does not exist"); anything else
+/// is the app client, the pool or the region, which a real sign-in reports to
+/// a person only as "temporarily unavailable".
+pub async fn probe_sign_in(kind: PoolKind) -> Result<String, String> {
+    let pool = Pool::load_kind(kind).map_err(|e| format!("{e:#}"))?;
+    let email = "huntwell-doctor-probe@invalid.example";
+    let mut params = serde_json::Map::new();
+    params.insert(String::from("USERNAME"), Value::String(email.into()));
+    params.insert(String::from("PASSWORD"), Value::String("Probe-not-a-password-1".into()));
+    let body = json!({ "AuthFlow": "USER_PASSWORD_AUTH", "ClientId": pool.client_id, "AuthParameters": pool.auth_params(email, params) });
+    let response = http()
+        .map_err(|e| format!("{e:#}"))?
+        .post(format!("https://{}/", pool.host()))
+        .header("content-type", JSON_CONTENT_TYPE)
+        .header("x-amz-target", format!("{TARGET_PREFIX}.InitiateAuth"))
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach {}: {e}", pool.host()))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let kind_ = parsed["__type"].as_str().unwrap_or("").rsplit('#').next().unwrap_or("").to_string();
+    let message = parsed["message"].as_str().unwrap_or(&text).to_string();
+    let region = &pool.region;
+    let what = format!("pool {} in {region}: {status} {kind_}: {message}", pool.user_pool_id);
+    match kind_.as_str() {
+        "UserNotFoundException" => Ok(what),
+        "NotAuthorizedException" if is_credentials_fault(&message) => Ok(what),
+        _ => Err(what),
+    }
 }
 
 /// Answer the TOTP challenge `sign_in_full` raised.

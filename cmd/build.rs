@@ -25,6 +25,13 @@ fn main() {
     // The UI bundle is embedded from UI/web/dist; an absent dist is fine for
     // `cargo test`, rust-embed just serves nothing.
     println!("cargo:rerun-if-changed=../UI/web/dist");
+    // When the site's pages last changed, for the sitemap's <lastmod>: the day
+    // the UI bundle was built, since that is what carries them.
+    println!("cargo:rerun-if-changed=../UI/web/dist/index.html");
+    let built = fs::metadata("../UI/web/dist/index.html")
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+    println!("cargo:rustc-env=HUNTWELL_SITE_UPDATED={}", ymd(built));
 
     embed_genesis();
 }
@@ -123,4 +130,20 @@ fn read_material(path: &std::path::Path) -> Option<String> {
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .map(String::from)
+}
+
+/// A UTC calendar date, `YYYY-MM-DD`, with no date crate in the build script
+/// (Howard Hinnant's days-to-civil).
+fn ymd(t: std::time::SystemTime) -> String {
+    let days = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}")
 }

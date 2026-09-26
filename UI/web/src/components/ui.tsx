@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { SearchIcon } from './icons'
 
 // ---- toasts ----
@@ -82,15 +83,34 @@ export function Field({
   )
 }
 
-export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+/// The dimmed, blurred sheet. Portaled to `document.body` so a parent
+/// transform or overflow (the results pane) cannot trap `position: fixed`.
+export function ModalBackdrop({
+  children,
+  className = '',
+  onClick,
+}: {
+  children: React.ReactNode
+  className?: string
+  onClick?: () => void
+}) {
+  return createPortal(
+    <div className={'modal-bg' + (className ? ' ' + className : '')} onClick={onClick}>
+      {children}
+    </div>,
+    document.body,
+  )
+}
+
+export function Modal({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: React.ReactNode; className?: string }) {
   useEffect(() => {
     const fn = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
     window.addEventListener('keydown', fn)
     return () => window.removeEventListener('keydown', fn)
   }, [onClose])
   return (
-    <div className="modal-bg" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+    <ModalBackdrop onClick={onClose}>
+      <div className={'modal' + (className ? ' ' + className : '')} onClick={(e) => e.stopPropagation()}>
         <div className="row between" style={{ marginBottom: '0.8rem' }}>
           <h2 style={{ margin: 0 }}>{title}</h2>
           <button className="iconbtn" onClick={onClose} aria-label="Close">
@@ -99,7 +119,7 @@ export function Modal({ title, onClose, children }: { title: string; onClose: ()
         </div>
         {children}
       </div>
-    </div>
+    </ModalBackdrop>
   )
 }
 
@@ -117,6 +137,16 @@ export function Empty({ title, icon, children }: { title: string; icon?: React.R
 
 export function Spinner() {
   return <span className="spinner" />
+}
+
+/// A region that is not ready to show yet. Used for a grid, a picker, a page
+/// — anywhere the alternative would be an empty state that is a lie.
+export function Loading({ inline }: { inline?: boolean }) {
+  return (
+    <div className={inline ? 'loading-inline' : 'loading-block'} aria-busy="true" aria-live="polite">
+      <Spinner />
+    </div>
+  )
 }
 
 /// What the home ask box says while the agent writes the search. Single verbs,

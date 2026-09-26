@@ -25,11 +25,38 @@ pub fn to_html(markdown: &str) -> String {
         pulldown_cmark::Event::Html(t) | pulldown_cmark::Event::InlineHtml(t) => {
             pulldown_cmark::Event::Text(t)
         }
+        // Links and images only to the web: a `javascript:` or `data:` target
+        // from a scraped page is defused to a dead link. The CSP would block
+        // it too; this does not rely on it.
+        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { link_type, dest_url, title, id }) => {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { link_type, dest_url: safe_href(dest_url), title, id })
+        }
+        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { link_type, dest_url, title, id }) => {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { link_type, dest_url: safe_href(dest_url), title, id })
+        }
         other => other,
     });
     let mut out = String::new();
     html::push_html(&mut out, parser);
     out
+}
+
+/// `url` if it is http(s), mailto or an in-page anchor; `#` otherwise.
+fn safe_url(url: &str) -> &str {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") || lower.starts_with('#') {
+        url
+    } else {
+        "#"
+    }
+}
+
+fn safe_href(url: pulldown_cmark::CowStr<'_>) -> pulldown_cmark::CowStr<'_> {
+    if safe_url(&url) == "#" && !url.trim().starts_with('#') {
+        pulldown_cmark::CowStr::Borrowed("#")
+    } else {
+        url
+    }
 }
 
 fn esc(s: &str) -> String {
@@ -54,7 +81,7 @@ pub fn print_page(r: &ReportRow) -> String {
                         "<li><span class=\"n\">[{}]</span> {} <a href=\"{}\">{}</a></li>",
                         i + 1,
                         esc(label),
-                        esc(url),
+                        esc(safe_url(url)),
                         esc(url)
                     )
                 })
@@ -191,5 +218,16 @@ mod tests {
         assert!(page.contains("<h2>Hello</h2>"));
         // No app scripts or bundles — it must print the same anywhere.
         assert!(!page.contains("<script src"));
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    #[test]
+    fn only_web_links_survive() {
+        let html = super::to_html("[a](javascript:alert(1)) [b](https://ok.test/) ![c](data:text/html,x) [d](JaVaScRiPt:x)");
+        assert!(!html.to_ascii_lowercase().contains("javascript:"), "{html}");
+        assert!(!html.contains("data:text"), "{html}");
+        assert!(html.contains("href=\"https://ok.test/\""), "{html}");
     }
 }

@@ -40,7 +40,11 @@ On the server:
 4. Put Caddy (or any TLS terminator) in front — `deploy/Caddyfile.example` —
    and set `HUNTWELL_TRUST_PROXY=1` (the *last* `X-Forwarded-For` entry, the
    one the proxy appends, is taken; `cloudflare` reads `CF-Connecting-IP`).
-5. Sign up, then set `HUNTWELL_OPEN_SIGNUP=0` and restart.
+5. Sign up. The first account on an empty database needs no invitation; after
+   that Huntwell is invite-only — people request access and join the waitlist,
+   and you invite them from the admin's **Users → Waitlist & invites** (an
+   emailed link to `{HUNTWELL_PUBLIC_URL}/signup?invite=…`, valid 14 days, for
+   that address only). `HUNTWELL_OPEN_SIGNUP=1` opens sign-up to anyone.
 
 To run executions in worker VMs instead of as child processes of this server,
 use the admin control plane — see [PRODUCTION.md](PRODUCTION.md).

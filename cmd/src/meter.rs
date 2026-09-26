@@ -121,6 +121,23 @@ pub fn call_line(usage: TokenUsage, cost_micros: i64) -> String {
 
 /// The end-of-run breakdown. Empty when no call reported usage — Cursor omits
 /// it on some plans, and half a table is worse than none.
+/// A line worth acting on: in an agent loop the fixed prefix is re-sent every
+/// turn, so a low share means the conversation is being rewritten somewhere
+/// and the re-reads are being paid for at full price.
+pub fn cache_note(total: TokenUsage) -> Option<String> {
+    let input = total.input + total.cache_read;
+    if input < 200_000 {
+        return None;
+    }
+    let share = total.cache_read * 100 / input.max(1);
+    (share < 40).then(|| {
+        format!(
+            "[tokens] only {share}% of input was a cache hit — the pages kept in context are re-read fresh each turn \
+             (HUNTWELL_CONTEXT_PAGES, default 2)"
+        )
+    })
+}
+
 pub fn summary(new_rows: i64) -> Vec<String> {
     let t = match tally().lock() {
         Ok(t) => t,
@@ -148,6 +165,10 @@ pub fn summary(new_rows: i64) -> Vec<String> {
         total.calls,
         call_line(total.usage, total.cost_micros)
     ));
+
+    if let Some(note) = cache_note(total.usage) {
+        out.push(note);
+    }
 
     let billable = total.usage.billable();
     if new_rows > 0 && billable > 0 {
@@ -212,6 +233,23 @@ mod tests {
     /// Whether the provider's prefix cache is working decides what a run
     /// costs, and the raw number does not say — 8k cached against 2M fresh
     /// reads like caching when it is the opposite. The share says it.
+    /// From a real run: 872k in, 93.6k cached — 9%, which is the fixed prefix
+    /// and nothing else. Worth saying at the end of a run, because it is the
+    /// difference between paying for the pages once and paying every turn.
+    #[test]
+    fn a_run_that_cached_almost_nothing_says_so_at_the_end() {
+        let poor = TokenUsage { input: 872_100, output: 12_300, cache_read: 93_600, cache_write: 0 };
+        let note = cache_note(poor).expect("worth saying");
+        assert!(note.contains("9%") && note.contains("HUNTWELL_CONTEXT_PAGES"), "{note}");
+
+        // A healthy loop says nothing — there is nothing to act on.
+        let good = TokenUsage { input: 200_000, output: 5_000, cache_read: 1_800_000, cache_write: 0 };
+        assert!(cache_note(good).is_none());
+        // Nor does a short run, where the prefix is most of it anyway.
+        let small = TokenUsage { input: 20_000, output: 500, cache_read: 0, cache_write: 0 };
+        assert!(cache_note(small).is_none());
+    }
+
     #[test]
     fn the_line_says_how_much_of_the_input_was_a_cache_hit() {
         let barely = TokenUsage { input: 2_000_000, output: 500, cache_read: 8_000, cache_write: 0 };

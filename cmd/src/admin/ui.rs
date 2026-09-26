@@ -23,6 +23,46 @@ pub const HTML: &str = r##"<!doctype html>
   document.documentElement.dataset.theme=t}catch(e){}})();
 </script>
 <style>
+/* AG Grid, in the admin's own colours. Same idea as the app's `.hw-grid`:
+   only the theme variables are set, so a grid follows the light/dark switch
+   with every other surface. */
+.hw-grid{
+  overflow:hidden;border:1px solid var(--border);border-radius:var(--radius);
+}
+.hw-grid.card{border-color:var(--border);box-shadow:none}
+.hw-grid .ag-root-wrapper,
+.hw-grid .ag-root-wrapper-body,
+.hw-grid .ag-root{border-radius:inherit;overflow:hidden;border:none}
+.hw-grid .ag-header,
+.hw-grid .ag-header-row,
+.hw-grid .ag-header-cell,
+.hw-grid .ag-header-group-cell{
+  background:var(--surface);
+}
+.hw-grid .ag-header{
+  border-bottom:1px solid var(--border);
+  border-top-left-radius:inherit;border-top-right-radius:inherit;
+}
+.hw-grid.ag-theme-quartz{
+  --ag-background-color:var(--surface);--ag-foreground-color:var(--text);
+  --ag-secondary-foreground-color:var(--text-2);
+  --ag-header-background-color:var(--surface);--ag-header-foreground-color:var(--text-2);
+  --ag-header-cell-hover-background-color:var(--surface);
+  --ag-border-color:var(--border);--ag-row-border-color:var(--border);
+  --ag-row-hover-color:var(--bg-2);--ag-odd-row-background-color:transparent;
+  --ag-font-family:inherit;--ag-font-size:.86rem;--ag-borders:none;--ag-grid-size:5px;
+  /* Without this the grid uses the row height as line-height, and a pill
+     ("Routed", "succeeded") grows as tall as the row. */
+  --ag-line-height:1.5em;
+  --ag-wrapper-border-radius:0;
+  --ag-input-focus-border-color:var(--accent);--ag-range-selection-border-color:var(--accent);
+}
+.hw-grid .ag-row.clickable{cursor:pointer}
+.hw-grid .ag-cell{display:flex;align-items:center;line-height:1.5}
+.hw-grid .badge{line-height:1.5;height:auto;align-self:center;flex:none}
+.hw-grid .ag-right-aligned-cell,.hw-grid .ag-header-cell.ag-right-aligned-header{justify-content:flex-end}
+.hw-grid .ag-row-pinned{background:var(--bg-2);font-weight:600}
+
 /* ---------------------------------------------------------------------------
    The admin wears the product's clothes. Tokens, spacing and component shapes
    are copied from UI/web/src/styles.css by name, so the two look like one
@@ -84,7 +124,9 @@ body{margin:0;font-family:var(--font);font-size:14.5px;line-height:1.5;backgroun
 .rail-item .rlbl{font-size:10px;font-weight:500;line-height:1.1;text-align:center}
 .rail-item.active .rlbl{font-weight:700}
 .rail .spacer{flex:1}
+.page{display:flex;flex-direction:column;gap:1.1rem}
 .page.hide{display:none}
+.page .page-head{margin-bottom:0}
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 h1,h2,h3{font-weight:900;letter-spacing:-.02em;margin:0}
@@ -113,7 +155,7 @@ h2{font-size:1.05rem;letter-spacing:-.01em}
 .pane{grid-row:2;grid-column:2;background:var(--bg);border-radius:8px;margin:0 6px 6px 6px;overflow-y:auto;min-height:0;min-width:0}
 .shell.noauth .pane{grid-column:1}
 :root[data-theme='dark'] .pane{border:1px solid var(--border)}
-.content{padding:1.6rem 2rem 3rem;max-width:1150px;margin:0 auto;display:flex;flex-direction:column;gap:1.1rem}
+.content{padding:1.4rem 1.1rem 2.4rem;max-width:none;display:flex;flex-direction:column;gap:1.1rem}
 @keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
 .content>*{animation:rise .28s ease both}
 
@@ -122,7 +164,8 @@ h2{font-size:1.05rem;letter-spacing:-.01em}
 .page-head .sub{color:var(--text-2);margin-top:.2rem;font-size:.92rem}
 
 /* ---------- cards ---------- */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.2rem 1.3rem}
+.card{background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius);padding:1.2rem 1.3rem;box-shadow:var(--shadow)}
+.card.pad0{padding:0;overflow:hidden}
 .card-head{display:flex;align-items:baseline;justify-content:space-between;gap:.8rem;flex-wrap:wrap;margin-bottom:.9rem}
 .card-head .sub{color:var(--text-2);font-size:.84rem}
 
@@ -153,7 +196,7 @@ input[type='checkbox'],input[type='radio']{accent-color:var(--accent);width:auto
 /* ---------- data ---------- */
 table{width:100%;border-collapse:collapse;font-size:.88rem}
 th,td{text-align:left;padding:.6rem .75rem;border-bottom:1px solid var(--border);vertical-align:top}
-th{font-size:.76rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);font-weight:700;background:var(--surface-2)}
+th{font-size:.76rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);font-weight:700;background:var(--surface)}
 tbody tr:hover td{background:var(--surface-2)}
 tbody tr:last-child td{border-bottom:none}
 /* A row's actions are one group, not a paragraph: size the last column to its
@@ -167,7 +210,7 @@ td.row{display:table-cell;white-space:nowrap}
 td.row>button{margin-right:.4rem}
 td.row>button:last-child{margin-right:0}
 #services td:last-child{width:auto;white-space:normal}
-.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.2rem;min-width:130px;flex:1}
+.stat{background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius);padding:1rem 1.2rem;min-width:130px;flex:1;box-shadow:var(--shadow)}
 .stat .n{font-size:1.9rem;font-weight:900;line-height:1.1;letter-spacing:-.02em}
 .stat .l{color:var(--text-2);font-size:.85rem;margin-top:.15rem}
 .badge{display:inline-flex;align-items:center;gap:.3rem;padding:.15rem .6rem;border-radius:999px;font-size:.76rem;
@@ -191,6 +234,25 @@ td.row>button:last-child{margin-right:0}
 .mono{font-family:var(--mono);font-size:.82rem}
 .hide{display:none}
 
+/* Model picker: a dialog we draw, not the OS combo box. The list is long and
+   priced, so it has to be filterable and it has to wear the theme. */
+.model-pick{display:flex;align-items:center;justify-content:space-between;gap:.5rem;width:100%;
+  text-align:left;font:inherit;font-weight:500;cursor:pointer;white-space:nowrap;min-width:0}
+.model-pick .v{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-pick .caret{width:0;height:0;border:4px solid transparent;border-top-color:var(--text-3);margin-top:3px;flex:none}
+.model-list{max-height:min(50vh,22rem);overflow-y:auto;margin-top:.55rem;display:flex;flex-direction:column}
+.model-grp{font-family:var(--mono);font-size:.64rem;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--text-3);padding:.55rem .45rem .2rem}
+.model-opt{display:flex;align-items:center;justify-content:space-between;gap:.6rem;width:100%;
+  text-align:left;border:0;background:none;padding:.5rem .55rem;border-radius:var(--radius-sm);
+  cursor:pointer;font:inherit;font-weight:500;color:var(--text)}
+.model-opt:hover{background:var(--surface-2);box-shadow:none;border:0}
+.model-opt:active{transform:none}
+.model-opt.on{background:var(--surface-2);color:var(--link);font-weight:700}
+.model-opt small{color:var(--text-3);font-weight:400;white-space:nowrap;flex:none}
+.model-none{padding:.7rem .55rem}
+#models td:nth-child(2){min-width:16rem}
+
 /* ---------- sign in ---------- */
 /* The two cards that stand alone on an otherwise empty page. Both, not just
    #login: the first-run card carries the h2 and .sub that the sign-in card
@@ -204,16 +266,10 @@ td.row>button:last-child{margin-right:0}
 dialog{border:1px solid var(--border);border-radius:var(--radius);max-width:560px;width:92%;
   background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog .card{border:none;box-shadow:none}
 
 /* ---------- AG Grid, dressed in the house theme ---------- */
-#route-grid{height:380px;overflow:hidden;border-radius:var(--radius)}
-.ag-theme-quartz{--ag-font-family:var(--font);--ag-font-size:13px;--ag-accent-color:var(--selected);
-  --ag-background-color:var(--surface);--ag-foreground-color:var(--text);
-  --ag-border-color:var(--border);--ag-header-background-color:var(--surface-2);
-  --ag-header-foreground-color:var(--text-3);--ag-row-hover-color:var(--surface-2);
-  --ag-selected-row-background-color:var(--info-bg);--ag-odd-row-background-color:transparent;
-  --ag-control-panel-background-color:var(--surface-2);--ag-input-border-color:var(--border-strong);
-  --ag-wrapper-border-radius:var(--radius)}
+#route-grid{height:380px}
 .ag-theme-quartz .ag-header-cell-label{text-transform:uppercase;letter-spacing:.05em;font-size:.7rem;font-weight:700}
 
 @media (max-width:760px){
@@ -319,7 +375,22 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 </section>
 
 <section class="page hide" data-page="users">
-  <div class="page-head"><div><h1>Users</h1><div class="sub">Every account, what each may build, and connected logins.</div></div></div>
+  <div class="page-head"><div><h1>Users</h1><div class="sub">Who may join, every account, what each may build, and connected logins.</div></div></div>
+  <div class="card">
+    <div class="card-head">
+      <div><h2>Waitlist &amp; invites</h2>
+        <div class="sub" id="wl-sub">Huntwell is invite-only. People who ask to join wait here; an invitation emails them a sign-up link for their address, good for 14 days.</div></div>
+    </div>
+    <div class="row" style="align-items:flex-end">
+      <div style="flex:2;min-width:220px"><label for="wl-email">Invite someone</label>
+        <input id="wl-email" type="email" placeholder="name@company.com" autocomplete="off" onkeydown="if(event.key==='Enter')inviteSomeone()"></div>
+      <div style="flex:1;min-width:160px"><label for="wl-name">Name <span class="muted">(optional)</span></label>
+        <input id="wl-name" autocomplete="off" maxlength="80" onkeydown="if(event.key==='Enter')inviteSomeone()"></div>
+      <button class="primary" id="wl-btn" onclick="inviteSomeone()">Send invitation</button>
+    </div>
+    <div id="wl-note" class="notice" role="status" hidden style="margin-top:.8rem"></div>
+    <div id="waitlist" class="card pad0 hw-grid ag-theme-quartz" style="height:420px;margin-top:1rem"></div>
+  </div>
   <div class="card">
     <div class="card-head">
       <div><h2>What people can build</h2>
@@ -330,7 +401,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <button class="primary sm" onclick="saveFeatures()">Save default</button>
       <span id="features-note" class="muted"></span>
     </div>
-    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th></th></tr></thead>
+    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th title="What this workspace is charged per million billable tokens">Rate $/M tokens</th><th></th></tr></thead>
     <tbody id="accounts"></tbody></table>
   </div>
 </section>
@@ -379,7 +450,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
       <div><h2>Routing log</h2>
         <div class="sub">Every placement, re-queue and reap. Sortable and filterable.</div></div>
     </div>
-    <div id="route-grid" class="ag-theme-quartz"></div>
+    <div id="route-grid" class="card pad0 hw-grid ag-theme-quartz"></div>
   </div>
 </section>
 
@@ -389,9 +460,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
     <div class="card-head">
       <div><h2>Recent executions</h2><div class="sub">The last 25, newest first. Click a run to read everything it printed.</div></div>
     </div>
-    <table><thead><tr><th>Execution</th><th>Plan</th><th>Acct</th><th>Status</th><th>Model</th><th style="text-align:right">Charged</th><th style="text-align:right">Our cost</th><th style="text-align:right">Profit</th><th>Host</th><th>Slot</th><th>Started</th></tr></thead>
-    <tbody id="executions"></tbody>
-    <tfoot id="executions-total"></tfoot></table>
+    <div id="executions" class="card pad0 hw-grid ag-theme-quartz" style="height:640px"></div>
   </div>
 </section>
 </main>
@@ -459,6 +528,19 @@ sys incus token</pre></div>
   </div>
 </dialog>
 
+<dialog id="modeldlg" style="max-width:min(640px,94vw)">
+  <div class="card">
+    <h2 id="model-dlg-title">Choose a model</h2>
+    <div class="sub" id="model-dlg-help" style="margin:.2rem 0 .7rem">Filter by name, provider or id.</div>
+    <input id="model-q" type="search" placeholder="Filter models…" autocomplete="off" oninput="renderModelList()"
+      onkeydown="if(event.key==='Enter'){const b=$('model-list').querySelector('.model-opt');if(b){event.preventDefault();pickModel(b.dataset.id)}}">
+    <div id="model-list" class="model-list" onclick="if(event.target.closest('.model-opt'))pickModel(event.target.closest('.model-opt').dataset.id)"></div>
+    <div class="row" style="margin-top:1rem">
+      <button onclick="document.getElementById('modeldlg').close()">Cancel</button>
+    </div>
+  </div>
+</dialog>
+
 <dialog id="vmdlg">
   <div class="card" style="border:none">
     <h2 id="vm-title">New worker VM</h2>
@@ -520,7 +602,22 @@ async function login(){hideNotice('li-err');const b=$('li-btn');b.disabled=true;
   finally{b.disabled=false;b.textContent='Sign in'}}
 async function logout(){await api('POST','/admin/api/logout');location.reload()}
 
-// ---- routing-log grid (AG Grid) ----
+// ---- grids -----------------------------------------------------------------
+// Every table of data in here is an AG Grid, so sorting, filtering and column
+// sizing work the same way wherever you are. One helper rather than a setup
+// per grid: the options that make them look and behave alike live once.
+const GRIDS={};
+function mkGrid(id,columnDefs,opts){
+  if(GRIDS[id])return GRIDS[id];
+  GRIDS[id]=agGrid.createGrid($(id),Object.assign({
+    columnDefs,
+    defaultColDef:{sortable:true,resizable:true,minWidth:80},
+    rowData:[],animateRows:false,suppressCellFocus:true,headerHeight:38,rowHeight:40,
+  },opts||{}));
+  return GRIDS[id];
+}
+function setRows(id,rows){if(GRIDS[id])GRIDS[id].setGridOption('rowData',rows)}
+
 let routeApi=null;
 function eventBadge(p){const cls=p.value==='routed'?'ok':p.value==='reaped'?'bad':'warn';
   return `<span class="badge ${cls}">${p.value}</span>`}
@@ -562,6 +659,7 @@ function showPage(name){
   // The grid measures itself when it is made, so it is made the first time
   // its page is on screen, not while hidden at zero width.
   if(name==='routing'&&!routeApi&&window.agGrid){initGrid();routeApi.setGridOption('rowData',lastLog)}
+  if(name==='users'&&window.agGrid){initWaitlist();loadWaitlist()}
   $('app').parentElement.scrollTop=0;
 }
 window.addEventListener('hashchange',()=>{if(!$('app').classList.contains('hide'))showPage(currentPage())});
@@ -682,20 +780,50 @@ async function refresh(){try{
   const profitCell=m=>m==null?'<span class="muted">—</span>':`<span class="badge ${m>=0?'ok':'bad'}">${usd(m)}</span>`;
   const rs=await api('GET','/admin/api/executions?limit=25');
   rs.executions.forEach(r=>{window._runs[r.execution_id]=r});
-  $('executions').innerHTML=rs.executions.map(r=>`<tr onclick="openLog(${r.execution_id})" style="cursor:pointer" title="Show this run's log"><td>#${esc(r.execution_id)}</td><td>${esc(r.source)}</td><td>${esc(r.account_id)}</td>
-    <td><span class="badge ${r.status==='succeeded'?'ok':r.status==='failed'?'bad':'warn'}">${esc(r.status)}</span></td>
-    <td class="mono">${esc(r.model_scrape||'auto')}</td>
-    <td style="text-align:right">${usd(r.charged_usd_micros)}</td>
-    <td style="text-align:right" title="${r.cost_basis==='reported'?'What Cursor reported for this run':r.cost_basis==='estimated'?'Estimated from the tokens and the model’s Cursor rates — Cursor reported no cost':'No rate known for this model'}">${r.cost_usd_micros==null?'—':(r.cost_basis==='estimated'?'~':'')+usd(r.cost_usd_micros)}</td>
-    <td style="text-align:right">${profitCell(r.profit_usd_micros)}</td>
-    <td>${esc(r.host_id??'—')}</td><td class="mono">${esc(r.slot_name??'—')}</td>
-    <td class="muted">${new Date(r.started_at).toLocaleString()}</td></tr>`).join('')
-    ||'<tr><td colspan="11" class="muted">No runs yet.</td></tr>';
+
+  // Money right-aligned and sorted as numbers, not as the "$9.09" a reader
+  // sees — sorting a currency string puts $9 above $80.
+  const money=(field)=>({field,type:'rightAligned',width:120,
+    valueFormatter:p=>p.data&&p.data.total?`<b>${usd(p.value)}</b>`:usd(p.value)});
+  mkGrid('executions',[
+    {field:'execution_id',headerName:'Run',width:90,sort:'desc',
+      valueFormatter:p=>p.data&&p.data.total?'':'#'+p.value},
+    {field:'source',headerName:'Search plan',flex:1.4,minWidth:150,filter:true,
+      valueGetter:p=>p.data&&p.data.total?`Total of the ${p.data.runs} run(s) with a known cost`:p.data.source,
+      cellClass:p=>p.data&&p.data.total?'muted':''},
+    {field:'account_id',headerName:'Acct',width:80},
+    {field:'status',headerName:'Status',width:110,filter:true,
+      cellRenderer:p=>p.value?`<span class="badge ${p.value==='succeeded'?'ok':p.value==='failed'?'bad':'warn'}">${esc(p.value)}</span>`:''},
+    {field:'model_scrape',headerName:'Model',flex:1,minWidth:130,filter:true,cellClass:'mono',
+      valueFormatter:p=>p.data&&p.data.total?'':(p.value||'auto')},
+    {headerName:'Charged',field:'charged_usd_micros',type:'rightAligned',width:110,
+      cellRenderer:p=>p.data.total?`<b>${usd(p.value)}</b>`:usd(p.value)},
+    {headerName:'Our cost',field:'cost_usd_micros',type:'rightAligned',width:110,
+      // An estimate is marked, because the margin beside it is only as good.
+      cellRenderer:p=>p.value==null?'—':(p.data.total?`<b>${usd(p.value)}</b>`
+        :(p.data.cost_basis==='estimated'?'~':'')+usd(p.value)),
+      tooltipValueGetter:p=>p.data.cost_basis==='estimated'?'Estimated from the tokens and this model\u2019s rates — the provider reported no cost':'What the provider reported for this run'},
+    {headerName:'Profit',field:'profit_usd_micros',type:'rightAligned',width:110,cellRenderer:p=>profitCell(p.value)},
+    {field:'host_id',headerName:'Host',width:90,valueFormatter:p=>p.value??'—'},
+    {field:'slot_name',headerName:'Slot',flex:1,minWidth:120,cellClass:'mono',valueFormatter:p=>p.value??'—'},
+    {field:'started_at',headerName:'Started',width:180,
+      valueFormatter:p=>p.value?new Date(p.value).toLocaleString():''},
+  ],{
+    onRowClicked:e=>{if(e.data&&!e.data.total)openLog(e.data.execution_id)},
+    rowClass:'clickable',
+    overlayNoRowsTemplate:'<span class="muted">No runs yet.</span>',
+  });
+  setRows('executions',rs.executions);
+
+  // The totals as a pinned row, so they stay put while the grid is sorted.
   const known=rs.executions.filter(r=>r.profit_usd_micros!=null);
   const sum=k=>known.reduce((a,r)=>a+r[k],0);
-  $('executions-total').innerHTML=known.length?`<tr><td colspan="5" class="muted">Total of the ${known.length} run${known.length===1?'':'s'} with a known cost</td>
-    <td style="text-align:right"><b>${usd(sum('charged_usd_micros'))}</b></td><td style="text-align:right"><b>${usd(sum('cost_usd_micros'))}</b></td>
-    <td style="text-align:right">${profitCell(sum('profit_usd_micros'))}</td><td colspan="3"></td></tr>`:'';
+  GRIDS['executions'].setGridOption('pinnedBottomRowData',known.length?[{
+    total:true,runs:known.length,
+    charged_usd_micros:sum('charged_usd_micros'),
+    cost_usd_micros:sum('cost_usd_micros'),
+    profit_usd_micros:sum('profit_usd_micros'),
+  }]:[]);
 }catch(e){console.warn(e)}}
 
 // ---- one run's log -------------------------------------------------------
@@ -905,8 +1033,16 @@ async function loadFeatures(){
   $('features').innerHTML=f.all.map(k=>`<label class="row" style="margin:0">
     <input type="checkbox" data-kind="${esc(k)}" style="width:auto" ${f.kinds.includes(k)?'checked':''}>
     ${esc(KIND_LABEL[k]||k)}${EXPERIMENTAL.includes(k)?' <span class="badge warn">experimental</span>':''}</label>`).join('');
-  const as=(await api('GET','/admin/api/accounts?limit=200')).accounts;
+  const acc=await api('GET','/admin/api/accounts?limit=200'),as=acc.accounts,defRate=acc.default_usd_per_mtoken;
   $('accounts').innerHTML=as.map(a=>{
+    // Blank means the installation's rate, shown as the placeholder so the
+    // number an account actually pays is always on screen.
+    const ownRate=a.sell_usd_per_mtoken;
+    const rate=`<div class="row" style="gap:.35rem;flex-wrap:nowrap">
+        <input type="number" min="0.0001" max="1000" step="0.01" data-rate="${esc(a.account_id)}" value="${ownRate==null?'':esc(ownRate)}"
+          placeholder="${esc(defRate)}" style="width:6.5rem" onkeydown="if(event.key==='Enter')saveRate(${Number(a.account_id)})">
+        <button class="sm" onclick="saveRate(${Number(a.account_id)})">Set</button></div>
+      <span class="muted" style="font-size:.78rem">${ownRate==null?`default · $${esc(defRate)}`:'own rate'}</span>`;
     const own=(a.kinds||'').split(',').filter(Boolean);
     // No list of their own means they follow the default, and should keep
     // following it when it changes — so that state is shown, not resolved away.
@@ -924,10 +1060,74 @@ async function loadFeatures(){
       <td>${boxes}<br><span class="muted" style="font-size:.78rem">${own.length?'set for this account':'following the default'}</span></td>
       <td class="row">${cl}</td>
       <td>${a.mfa_enabled?`<span class="badge ok">on</span> <button class="sm" onclick="resetMfa(${a.account_id})" title="For someone who lost their device">Reset</button>`:'<span class="muted">off</span>'}</td>
+      <td>${rate}</td>
       <td class="row"><button class="sm" onclick="saveAccount(${a.account_id})">Save</button>
       <button class="sm" onclick="resetAccount(${a.account_id})" title="Follow the installation default again">Reset</button></td></tr>`}).join('')
-    ||'<tr><td colspan="6" class="muted">No accounts yet.</td></tr>';
+    ||'<tr><td colspan="7" class="muted">No accounts yet.</td></tr>';
 }
+
+// ---- waitlist & invitations ----
+const WL_BADGE={waiting:'info',invited:'warn',joined:'ok',declined:'bad'};
+function initWaitlist(){
+  mkGrid('waitlist',[
+    {field:'email',headerName:'Email',flex:1.3,minWidth:200,filter:true,
+      cellRenderer:p=>`<b>${esc(p.value)}</b>${p.data.name?` <span class="muted">· ${esc(p.data.name)}</span>`:''}`},
+    {field:'status',headerName:'Status',width:120,filter:true,
+      cellRenderer:p=>`<span class="badge ${WL_BADGE[p.value]||''}">${esc(p.value)}</span>`},
+    {field:'note',headerName:'What for',flex:1.4,minWidth:180,tooltipField:'note',
+      valueFormatter:p=>p.value||'—'},
+    {field:'requested_at',headerName:'Asked',width:130,
+      valueFormatter:p=>since(p.value),tooltipValueGetter:p=>p.value?new Date(p.value).toLocaleString():''},
+    {field:'invited_at',headerName:'Invited',width:150,
+      valueFormatter:p=>p.value?since(p.value)+(p.data.invited_by?' · '+p.data.invited_by.split('@')[0]:''):'—',
+      tooltipValueGetter:p=>p.value?`${new Date(p.value).toLocaleString()} by ${p.data.invited_by}`
+        +(p.data.invite_expires_at?` · link expires ${new Date(p.data.invite_expires_at).toLocaleString()}`:''):''},
+    {field:'joined_at',headerName:'Joined',width:120,valueFormatter:p=>since(p.value)},
+    {headerName:'',width:210,sortable:false,resizable:false,cellRenderer:p=>{
+      const d=p.data,id=Number(d.waitlist_id);
+      if(d.status==='joined')return `<span class="muted">account #${esc(d.account_id)}</span>`;
+      const send=d.status==='invited'
+        ?`<button class="sm" onclick="approveWaitlist(${id},true)" title="A new link; the old one stops working">Resend</button>`
+        :`<button class="sm primary" onclick="approveWaitlist(${id},false)">${d.status==='declined'?'Invite anyway':'Approve'}</button>`;
+      const decline=d.status==='declined'?'':` <button class="sm" onclick="declineWaitlist(${id})">Decline</button>`;
+      return `<span class="row" style="gap:.35rem">${send}${decline}</span>`}},
+  ],{tooltipShowDelay:300,overlayNoRowsTemplate:'<span class="muted">Nobody has asked to join yet.</span>'});
+}
+async function loadWaitlist(){
+  try{const r=await api('GET','/admin/api/waitlist');
+    setRows('waitlist',r.rows);
+    $('wl-sub').textContent=r.open_signup
+      ?'Sign-up is open right now (HUNTWELL_OPEN_SIGNUP=1), so nobody needs an invitation. Invitations still work.'
+      :'Huntwell is invite-only. People who ask to join wait here; an invitation emails them a sign-up link for their address, good for 14 days.';
+  }catch(e){showWlNote(errText(e),true)}}
+// The link is only ever shown here, once: the database keeps its hash.
+function showWlNote(html,bad){const n=$('wl-note');n.hidden=false;n.classList.toggle('info',!bad);
+  n.innerHTML=`<div style="flex:1;min-width:0">${bad?esc(html):html}</div>`}
+// Waitlist entries are days old, not hours, so this one counts in days.
+function since(iso){if(!iso)return '—';const h=(Date.now()-new Date(iso).getTime())/36e5;
+  return h<24?ago(iso):Math.floor(h/24)+'d ago'}
+function invitedNote(r){
+  const link=esc(r.link);
+  return `${r.emailed?`Invitation emailed to <b>${esc(r.row.email)}</b>.`:`<b>The email could not be queued</b> — send ${esc(r.row.email)} this link yourself.`}
+    <div class="row" style="margin-top:.5rem;gap:.4rem"><input class="mono" readonly value="${link}" style="flex:1;min-width:0" onclick="this.select()">
+    <button class="sm" onclick="navigator.clipboard.writeText(this.previousElementSibling.value).then(()=>this.textContent='Copied')">Copy link</button></div>
+    <div class="muted" style="font-size:.78rem;margin-top:.3rem">Works once, for that address only. Sending again replaces it.</div>`}
+async function inviteSomeone(){
+  const email=$('wl-email').value.trim(),name=$('wl-name').value.trim();
+  if(!email){$('wl-email').focus();return}
+  $('wl-btn').disabled=true;
+  try{const r=await api('POST','/admin/api/waitlist/invite',{email,name});
+    $('wl-email').value='';$('wl-name').value='';showWlNote(invitedNote(r));loadWaitlist()}
+  catch(e){showWlNote(errText(e),true)}
+  finally{$('wl-btn').disabled=false}}
+async function approveWaitlist(id,resend){
+  if(resend&&!confirm('Send a new invitation? The link they already have stops working.'))return;
+  try{const r=await api('POST',`/admin/api/waitlist/${id}/approve`);showWlNote(invitedNote(r));loadWaitlist()}
+  catch(e){showWlNote(errText(e),true)}}
+async function declineWaitlist(id){
+  if(!confirm('Decline this request? They are not told, and any invitation link they have stops working.'))return;
+  try{await api('POST',`/admin/api/waitlist/${id}/decline`);loadWaitlist()}
+  catch(e){showWlNote(errText(e),true)}}
 
 async function saveFeatures(){
   const kinds=[...document.querySelectorAll('#features input[data-kind]')].filter(b=>b.checked).map(b=>b.dataset.kind);
@@ -940,6 +1140,14 @@ async function saveAccount(id){
   const kinds=[...document.querySelectorAll(`#accounts input[data-acct="${id}"]`)].filter(b=>b.checked).map(b=>b.dataset.kind);
   try{await api('PUT',`/admin/api/accounts/${id}/kinds`,{kinds});loadFeatures()}catch(e){alert(e.message)}}
 
+// An empty box returns the account to the installation's rate.
+async function saveRate(id){
+  const box=document.querySelector(`input[data-rate="${id}"]`),raw=box.value.trim();
+  const usd_per_mtoken=raw===''?null:Number(raw);
+  if(usd_per_mtoken!==null&&!(usd_per_mtoken>0)){alert('Enter a rate above $0, or leave it empty for the default.');return}
+  if(!confirm(usd_per_mtoken===null?'Put this workspace back on the default rate? It applies to tokens billed from now on.'
+    :`Charge this workspace $${usd_per_mtoken} per million tokens? It applies to tokens billed from now on.`))return;
+  try{await api('PUT',`/admin/api/accounts/${id}/rate`,{usd_per_mtoken});loadFeatures()}catch(e){alert(errText(e))}}
 async function resetMfa(id){if(!confirm('Turn two-factor authentication off for this account? They sign in with their password alone until they set up a device again.'))return;
   try{await api('DELETE',`/admin/api/accounts/${id}/mfa`);loadFeatures()}catch(e){alert(errText(e))}}
 async function setConnectedLogins(id,on){
@@ -957,7 +1165,8 @@ async function resetAccount(id){
 const STAGE_HELP={draft:'Writes the plan from the brief. On the critical path of "type a sentence, wait".',
   scrape:'Reads pages and pulls rows out. Long loops over big pages — this is where the bill is.',
   enrich:'Fills a row in from its own page. One short page per row.',
-  planner:'Proposes the next search when learn mode is on. Small and occasional.'};
+  planner:'Proposes the next search when learn mode is on. Small and occasional.',
+  outreach:'Drafts cold outreach emails in the app and API, one short call each. Needs a direct provider (provider:model). Empty uses the newest Claude Sonnet, which needs the Anthropic key.'};
 
 async function loadModels(){
   const chosen=await api('GET','/admin/api/models');
@@ -973,21 +1182,62 @@ async function loadModels(){
     ||'<tr><td colspan="4" class="muted">No providers compiled in.</td></tr>';
   $('models').innerHTML=Object.keys(STAGE_HELP).map(stage=>{
     const cur=chosen[stage]||'';
-    // Whatever is stored stays selectable even if the account no longer lists
-    // it, otherwise saving the form would silently change an unrelated stage.
-    const known=avail.some(m=>m.id===cur);
-    const opts=['<option value="">Default (let Cursor choose)</option>']
-      .concat(!known&&cur?[`<option value="${cur}" selected>${cur} (not in this account's list)</option>`]:[])
-      .concat(avail.map(m=>{
-        const price=!m.direct?'':m.priced?` · $${m.input_per_m}/$${m.output_per_m} per M`:' · price unknown';
-        return `<option value="${esc(m.id)}" ${m.id===cur?'selected':''}>${esc(m.label)}${price}</option>`})).join('');
     const field=avail.length
-      ? `<select id="m-${stage}" style="width:100%">${opts}</select>`
-      : `<input id="m-${stage}" value="${cur.replace(/"/g,'&quot;')}" placeholder="model id, e.g. gemini-3.8-flash-medium">`;
+      ? `<input type="hidden" id="m-${stage}" value="${esc(cur)}">
+         <button type="button" class="model-pick" id="m-btn-${stage}" onclick="openModelPick('${stage}')">
+           <span class="v">${esc(modelLabel(cur,stage))}</span><span class="caret" aria-hidden></span>
+         </button>`
+      : `<input id="m-${stage}" value="${esc(cur)}" placeholder="model id, e.g. gemini-3.8-flash-medium">`;
     return `<tr><td><b>${stage}</b></td><td>${field}</td>
       <td class="muted" style="font-size:.82rem">${STAGE_HELP[stage]}</td></tr>`}).join('');
   if(!avail.length)$('models-note').textContent='no provider key set and cursor-agent not reachable here — type an id';
   else $('models-note').textContent='A `provider:model` id runs in Huntwell\'s own agent loop; a bare id runs through the Cursor CLI.';
+}
+
+// Stages served by one call from the website, not a run: only a provider's own
+// models can answer them, and their default is not the Cursor CLI's.
+const DIRECT_ONLY={outreach:'Default (newest Claude Sonnet)'};
+function defaultLabel(stage){return DIRECT_ONLY[stage]||'Default (let Cursor choose)'}
+function modelLabel(id,stage){
+  if(!id)return defaultLabel(stage);
+  const m=(window._avail||[]).find(x=>x.id===id);
+  if(!m)return id+' (not in this account\'s list)';
+  const price=!m.direct?'':m.priced?` · $${m.input_per_m}/$${m.output_per_m} per M`:' · price unknown';
+  return m.label+price;
+}
+function openModelPick(stage){
+  window._modelStage=stage;
+  $('model-dlg-title').textContent=stage.charAt(0).toUpperCase()+stage.slice(1)+' model';
+  $('model-q').value='';
+  renderModelList();
+  $('modeldlg').showModal();
+  $('model-q').focus();
+}
+function renderModelList(){
+  const q=$('model-q').value.trim().toLowerCase();
+  const cur=$('m-'+window._modelStage)?.value||'';
+  const stage=window._modelStage,direct=stage in DIRECT_ONLY;
+  const rows=[{id:'',label:defaultLabel(stage),group:'',detail:direct?'':'Cursor CLI default'}];
+  (window._avail||[]).filter(m=>!direct||m.direct).forEach(m=>{
+    const price=!m.direct?'':m.priced?`$${m.input_per_m}/$${m.output_per_m} per M`:'price unknown';
+    rows.push({id:m.id,label:m.label,group:m.group||'',detail:price});
+  });
+  if(cur&&!rows.some(r=>r.id===cur)) rows.splice(1,0,{id:cur,label:cur,group:'',detail:'not in this account\'s list'});
+  const shown=rows.filter(r=>!q||[r.label,r.id,r.group,r.detail].join(' ').toLowerCase().includes(q));
+  let last='\0';
+  $('model-list').innerHTML=shown.map(r=>{
+    const head=r.group&&r.group!==last?(last=r.group,`<div class="model-grp">${esc(r.group)}</div>`):'';
+    return head+`<button type="button" class="model-opt${r.id===cur?' on':''}" data-id="${esc(r.id)}">
+      <span>${esc(r.label)}</span>${r.detail?`<small>${esc(r.detail)}</small>`:''}</button>`;
+  }).join('')||'<div class="muted model-none">Nothing matches.</div>';
+}
+function pickModel(id){
+  const stage=window._modelStage;
+  const inp=$('m-'+stage);
+  if(inp)inp.value=id;
+  const btn=$('m-btn-'+stage);
+  if(btn){const v=btn.querySelector('.v');if(v)v.textContent=modelLabel(id,stage)}
+  $('modeldlg').close();
 }
 
 async function saveModels(){

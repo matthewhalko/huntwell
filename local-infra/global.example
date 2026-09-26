@@ -34,8 +34,10 @@ HUNTWELL_DATA_DIR=/abs/path/local-infra/data/huntwell
 # absent; rotate it to sign everyone out.
 #HUNTWELL_SESSION_SECRET=...
 
-# Set to 1 to let anyone sign up. Default: open. Set to 0 to require an
-# existing account to create others (`huntwell account create`).
+# Set to 1 to let anyone sign up. Default: invite-only — a new account needs an
+# invitation from the admin (Users → Waitlist & invites) or a teammate's
+# workspace invitation; everyone else joins the waitlist. The first account on
+# an empty database never needs one.
 #HUNTWELL_OPEN_SIGNUP=1
 
 # ── Identity ─────────────────────────────────────────────────────────────────
@@ -137,8 +139,10 @@ BROWSERBASE_API_KEY=bb_...
 #RESEND_API_KEY=re_...
 #HUNTWELL_MAIL_FROM=Huntwell <hello@example.com>
 #
-# Signups on the deployed app. Default 0: anyone who finds the URL would
-# otherwise get an account and start spending your agent tokens.
+# Signups on the deployed app. Default off (invite-only): anyone who finds the
+# URL would otherwise get an account and start spending your agent tokens.
+# Invitations are sent from the admin's Users page and link to
+# HUNTWELL_PUBLIC_URL, so set that too.
 #HUNTWELL_OPEN_SIGNUP=0
 
 # ── Object storage, for every VM ─────────────────────────────────────────────

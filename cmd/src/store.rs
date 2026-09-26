@@ -334,6 +334,22 @@ pub async fn account_count(db: &Db) -> Result<i64> {
 /// A sign-up for an address held by an account that never verified it. The
 /// row is taken over — new credential, new name, nothing of the squatter's
 /// kept, every session ended — rather than left blocking the address forever.
+/// Whether an account has anything in it worth protecting: plans, API keys or
+/// teammates. An unverified row made by `account create`, the website binary or
+/// the operator endpoint can hold all three, and sign-up must never hand those
+/// to whoever types the address first.
+pub async fn account_holds_anything(db: &Db, account_id: i64) -> Result<bool> {
+    let held: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (SELECT 1 FROM plan WHERE account_id=$1)
+               OR EXISTS (SELECT 1 FROM api_key WHERE account_id=$1)
+               OR EXISTS (SELECT 1 FROM membership WHERE workspace_id=$1 OR member_id=$1)"#,
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await?;
+    Ok(held)
+}
+
 pub async fn reclaim_unverified_account(db: &Db, account_id: i64, display_name: &str, cognito_sub: &str) -> Result<Account> {
     let row = sqlx::query(&format!(
         r#"UPDATE account SET display_name=$2, cognito_sub=$3, created_at=now(),
@@ -545,6 +561,95 @@ pub struct Member {
     pub joined_at: String,
     /// True for the account the workspace belongs to.
     pub owner: bool,
+    /// Effective write caps for this person in this workspace. Tokens are
+    /// `plans`, `credits`, `keys`; `readonly` means none of those.
+    pub permissions: Vec<String>,
+}
+
+/// What a teammate may write in a workspace, beyond their role.
+///
+/// Role still decides who invites and who is the owner. These tokens decide
+/// the writes: create and run plans, buy credits, issue API keys. `readonly`
+/// clears them all. An empty string is the role's default, so existing
+/// memberships keep today's behaviour (members: plans and keys; admins: those
+/// plus credits).
+pub const CAP_PLANS: &str = "plans";
+pub const CAP_CREDITS: &str = "credits";
+pub const CAP_KEYS: &str = "keys";
+pub const CAP_READONLY: &str = "readonly";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Caps {
+    pub plans: bool,
+    pub credits: bool,
+    pub keys: bool,
+}
+
+impl Caps {
+    pub fn owner() -> Self {
+        Self { plans: true, credits: true, keys: true }
+    }
+
+    pub fn none() -> Self {
+        Self { plans: false, credits: false, keys: false }
+    }
+
+    pub fn defaults_for(role: &str) -> Self {
+        match role {
+            "owner" | "admin" => Self { plans: true, credits: true, keys: true },
+            _ => Self { plans: true, credits: false, keys: true },
+        }
+    }
+
+    pub fn as_tokens(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.plans {
+            v.push(CAP_PLANS.into());
+        }
+        if self.credits {
+            v.push(CAP_CREDITS.into());
+        }
+        if self.keys {
+            v.push(CAP_KEYS.into());
+        }
+        if v.is_empty() {
+            v.push(CAP_READONLY.into());
+        }
+        v
+    }
+}
+
+/// Resolve stored tokens (or the empty default) into the writes this person
+/// may make. The owner always has every cap, even if a stale string says
+/// otherwise — they have no membership row to edit.
+pub fn parse_permissions(role: &str, owner: bool, raw: &str) -> Caps {
+    if owner || role == "owner" {
+        return Caps::owner();
+    }
+    let parts: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if parts.iter().any(|p| *p == CAP_READONLY) {
+        return Caps::none();
+    }
+    if parts.is_empty() {
+        return Caps::defaults_for(role);
+    }
+    Caps { plans: parts.contains(&CAP_PLANS), credits: parts.contains(&CAP_CREDITS), keys: parts.contains(&CAP_KEYS) }
+}
+
+/// Keep only known tokens; `readonly` wins. Unknown words are dropped so a
+/// typo cannot invent a cap.
+pub fn sanitize_permissions(tokens: &[String]) -> String {
+    let parts: Vec<&str> = tokens.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if parts.iter().any(|p| *p == CAP_READONLY) {
+        return CAP_READONLY.to_string();
+    }
+    let mut out = Vec::new();
+    for p in [CAP_PLANS, CAP_CREDITS, CAP_KEYS] {
+        if parts.iter().any(|x| *x == p) {
+            out.push(p);
+        }
+    }
+    out.join(",")
 }
 
 /// A workspace someone can work in: their own, plus any they were invited to.
@@ -617,10 +722,10 @@ pub async fn workspace_role(db: &Db, workspace_id: i64, member_id: i64) -> Resul
 /// Everyone who can open this workspace, owner first.
 pub async fn list_members(db: &Db, workspace_id: i64) -> Result<Vec<Member>> {
     let rows = sqlx::query(
-        r#"SELECT a.account_id, a.email, a.display_name, 'owner' AS role, a.created_at, true AS owner
+        r#"SELECT a.account_id, a.email, a.display_name, 'owner' AS role, a.created_at, true AS owner, '' AS permissions
              FROM account a WHERE a.account_id = $1
            UNION ALL
-           SELECT a.account_id, a.email, a.display_name, m.role, m.created_at, false
+           SELECT a.account_id, a.email, a.display_name, m.role, m.created_at, false, m.permissions
              FROM membership m JOIN account a ON a.account_id = m.member_id
             WHERE m.workspace_id = $1
            ORDER BY 6 DESC, 5"#,
@@ -630,15 +735,61 @@ pub async fn list_members(db: &Db, workspace_id: i64) -> Result<Vec<Member>> {
     .await?;
     Ok(rows
         .iter()
-        .map(|r| Member {
-            account_id: r.get(0),
-            email: r.get(1),
-            display_name: r.get(2),
-            role: r.get(3),
-            joined_at: r.get::<DateTime<Utc>, _>(4).to_rfc3339(),
-            owner: r.get(5),
+        .map(|r| {
+            let role: String = r.get(3);
+            let owner: bool = r.get(5);
+            let raw: String = r.get(6);
+            Member {
+                account_id: r.get(0),
+                email: r.get(1),
+                display_name: r.get(2),
+                role: role.clone(),
+                joined_at: r.get::<DateTime<Utc>, _>(4).to_rfc3339(),
+                owner,
+                permissions: parse_permissions(&role, owner, &raw).as_tokens(),
+            }
         })
         .collect())
+}
+
+/// The writes this person may make in this workspace. Not a member → none.
+pub async fn workspace_caps(db: &Db, workspace_id: i64, member_id: i64) -> Result<Caps> {
+    if workspace_id == member_id {
+        return Ok(Caps::owner());
+    }
+    let row = sqlx::query(r#"SELECT role, permissions FROM membership WHERE workspace_id=$1 AND member_id=$2"#)
+        .bind(workspace_id)
+        .bind(member_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(match row {
+        Some(r) => parse_permissions(&r.get::<String, _>(0), false, &r.get::<String, _>(1)),
+        None => Caps::none(),
+    })
+}
+
+/// Member or admin. The owner has no row, so this cannot touch them.
+pub async fn set_member_role(db: &Db, workspace_id: i64, member_id: i64, role: &str) -> Result<bool> {
+    let n = sqlx::query(r#"UPDATE membership SET role=$3 WHERE workspace_id=$1 AND member_id=$2"#)
+        .bind(workspace_id)
+        .bind(member_id)
+        .bind(role)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(n > 0)
+}
+
+/// Sets a guest's caps. The owner has no row, so this cannot touch them.
+pub async fn set_member_permissions(db: &Db, workspace_id: i64, member_id: i64, raw: &str) -> Result<bool> {
+    let n = sqlx::query(r#"UPDATE membership SET permissions=$3 WHERE workspace_id=$1 AND member_id=$2"#)
+        .bind(workspace_id)
+        .bind(member_id)
+        .bind(raw)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(n > 0)
 }
 
 /// The workspaces this person can switch between.
@@ -704,6 +855,20 @@ pub async fn remove_member(db: &Db, workspace_id: i64, member_id: i64) -> Result
     sqlx::query(r#"UPDATE account SET active_workspace_id=NULL WHERE account_id=$1 AND active_workspace_id=$2"#)
         .bind(member_id)
         .bind(workspace_id)
+        .execute(db)
+        .await?;
+    // Their keys act for the workspace; they leave with them. (Authentication
+    // checks membership too — this makes it visible in the key list.)
+    sqlx::query(r#"UPDATE api_key SET revoked=true WHERE account_id=$1 AND created_by=$2"#)
+        .bind(workspace_id)
+        .bind(member_id)
+        .execute(db)
+        .await?;
+    // Invitations they sent go too, so an admin on the way out cannot leave a
+    // door open for a second address of their own.
+    sqlx::query(r#"DELETE FROM invite WHERE workspace_id=$1 AND invited_by_id=$2 AND accepted_at IS NULL"#)
+        .bind(workspace_id)
+        .bind(member_id)
         .execute(db)
         .await?;
     Ok(n > 0)
@@ -800,6 +965,197 @@ pub async fn accept_invite(db: &Db, token: &str, account_id: i64) -> Result<bool
     .await?
     .rows_affected();
     Ok(n > 0)
+}
+
+// ---------------------------------------------------------------------------
+// The waitlist: who may create an account while sign-up is invite-only
+// ---------------------------------------------------------------------------
+
+/// One person on the waitlist, as the admin sees them. The token is never
+/// here: only its hash is stored, and only the email ever carried it.
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitlistRow {
+    pub waitlist_id: i64,
+    pub email: String,
+    pub name: String,
+    pub note: String,
+    pub status: String,
+    pub requested_at: Option<String>,
+    pub invited_at: Option<String>,
+    pub invited_by: String,
+    pub invite_expires_at: Option<String>,
+    pub joined_at: Option<String>,
+    pub account_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// The secret a sign-up invitation link carries. 256 bits, so it cannot be
+/// guessed, and prefixed so one found in a log is recognisable for what it is.
+pub fn new_invite_token() -> String {
+    let mut buf = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+    format!("hwi_{}", hex::encode(buf))
+}
+
+/// How long a sign-up invitation stays good.
+pub const SIGNUP_INVITE_DAYS: i64 = 14;
+
+const WAITLIST_COLS: &str = "waitlist_id,email,name,note,status,requested_at,invited_at,invited_by,invite_expires_at,joined_at,account_id,created_at";
+
+fn waitlist_from(r: &sqlx::postgres::PgRow) -> WaitlistRow {
+    let at = |i: usize| r.get::<Option<DateTime<Utc>>, _>(i).map(|d| d.to_rfc3339());
+    WaitlistRow {
+        waitlist_id: r.get(0),
+        email: r.get(1),
+        name: r.get(2),
+        note: r.get(3),
+        status: r.get(4),
+        requested_at: at(5),
+        invited_at: at(6),
+        invited_by: r.get(7),
+        invite_expires_at: at(8),
+        joined_at: at(9),
+        account_id: r.get(10),
+        created_at: r.get::<DateTime<Utc>, _>(11).to_rfc3339(),
+    }
+}
+
+/// Put someone on the waitlist from the sign-up page. Returns whether they are
+/// new to it — the caller sends the "you're on the list" email only then, so
+/// submitting the form twice cannot be used to mail an address twice.
+///
+/// Someone already invited, joined or declined is left exactly as they are: a
+/// form anyone can fill in must not be able to reset a decision an operator
+/// made.
+pub async fn join_waitlist(db: &Db, email: &str, name: &str, note: &str, ip: &str) -> Result<bool> {
+    let email = email.trim().to_lowercase();
+    let inserted: Option<i64> = sqlx::query_scalar(
+        r#"INSERT INTO waitlist (email,name,note,status,requested_at,requested_ip)
+           VALUES ($1,$2,$3,'waiting',now(),$4)
+           ON CONFLICT (email) DO NOTHING RETURNING waitlist_id"#,
+    )
+    .bind(&email)
+    .bind(name.trim())
+    .bind(note.trim())
+    .bind(ip)
+    .fetch_optional(db)
+    .await?;
+    if inserted.is_some() {
+        return Ok(true);
+    }
+    // Asking again while still waiting refreshes what they told us.
+    sqlx::query(
+        r#"UPDATE waitlist SET name=CASE WHEN $2<>'' THEN $2 ELSE name END,
+                                note=CASE WHEN $3<>'' THEN $3 ELSE note END
+           WHERE email=$1 AND status='waiting'"#,
+    )
+    .bind(&email)
+    .bind(name.trim())
+    .bind(note.trim())
+    .execute(db)
+    .await?;
+    Ok(false)
+}
+
+/// Everyone on the list, the people waiting first and then newest first.
+pub async fn list_waitlist(db: &Db, limit: i64) -> Result<Vec<WaitlistRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {WAITLIST_COLS} FROM waitlist
+           ORDER BY (status='waiting') DESC, created_at DESC LIMIT $1"#
+    ))
+    .bind(limit.clamp(1, 2000))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(waitlist_from).collect())
+}
+
+pub async fn get_waitlist(db: &Db, waitlist_id: i64) -> Result<Option<WaitlistRow>> {
+    let row = sqlx::query(&format!("SELECT {WAITLIST_COLS} FROM waitlist WHERE waitlist_id=$1"))
+        .bind(waitlist_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.as_ref().map(waitlist_from))
+}
+
+/// Invite an address to sign up: a new row for someone an operator named, or
+/// an existing one approved off the list. Either way a fresh token replaces any
+/// earlier one, so re-sending an invite leaves exactly one live link.
+///
+/// Refuses someone who already joined — they have an account, and a second
+/// invite would only confuse them.
+pub async fn invite_to_signup(
+    db: &Db,
+    email: &str,
+    name: &str,
+    operator: &str,
+    token_hash: &str,
+    valid_days: i64,
+) -> Result<WaitlistRow> {
+    let email = email.trim().to_lowercase();
+    if find_account_by_email(db, &email).await?.is_some_and(|a| a.email_verified_at.is_some()) {
+        bail!("{email} already has an account");
+    }
+    let row = sqlx::query(&format!(
+        r#"INSERT INTO waitlist (email,name,status,invited_at,invited_by,invite_token_hash,invite_expires_at)
+           VALUES ($1,$2,'invited',now(),$3,$4,now() + make_interval(days => $5::int))
+           ON CONFLICT (email) DO UPDATE SET
+             status='invited', invited_at=now(), invited_by=excluded.invited_by,
+             invite_token_hash=excluded.invite_token_hash, invite_expires_at=excluded.invite_expires_at,
+             name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE waitlist.name END,
+             declined_at=NULL
+           WHERE waitlist.status<>'joined'
+           RETURNING {WAITLIST_COLS}"#
+    ))
+    .bind(&email)
+    .bind(name.trim())
+    .bind(operator)
+    .bind(token_hash)
+    .bind(valid_days.clamp(1, 90) as i32)
+    .fetch_optional(db)
+    .await?;
+    row.as_ref().map(waitlist_from).ok_or_else(|| anyhow!("{email} has already joined"))
+}
+
+/// Turn someone down. They are not told, and a later sign-up request from the
+/// same address does not put them back in the queue — an operator can still
+/// invite them by hand if minds change.
+pub async fn decline_waitlist(db: &Db, waitlist_id: i64) -> Result<bool> {
+    let n = sqlx::query(
+        r#"UPDATE waitlist SET status='declined', declined_at=now(), invite_token_hash=NULL
+           WHERE waitlist_id=$1 AND status IN ('waiting','invited')"#,
+    )
+    .bind(waitlist_id)
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// The live invitation a sign-up link carries: its address and the name the
+/// operator gave, if the token is current and unused.
+pub async fn signup_invite(db: &Db, token_hash: &str) -> Result<Option<(String, String)>> {
+    let row = sqlx::query(
+        r#"SELECT email,name FROM waitlist
+           WHERE invite_token_hash=$1 AND status='invited' AND invite_expires_at > now()"#,
+    )
+    .bind(token_hash)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| (r.get(0), r.get(1))))
+}
+
+/// The invitation was used: the account exists. The token goes with it, so the
+/// link is dead from here on.
+pub async fn mark_waitlist_joined(db: &Db, email: &str, account_id: i64) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE waitlist SET status='joined', joined_at=now(), account_id=$2, invite_token_hash=NULL
+           WHERE email=$1"#,
+    )
+    .bind(email.trim().to_lowercase())
+    .bind(account_id)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,6 +2297,19 @@ pub async fn list_prospects_after(
 }
 
 /// Every matching row, for exports.
+/// One prospect, in its workspace only.
+pub async fn get_prospect(db: &Db, account_id: i64, prospect_id: i64) -> Result<Option<ProspectRow>> {
+    let row = sqlx::query(&format!(
+        r#"SELECT {PROSPECT_COLS} FROM prospect pr JOIN plan p ON p.plan_id = pr.plan_id
+           WHERE pr.account_id = $1 AND pr.prospect_id = $2"#
+    ))
+    .bind(account_id)
+    .bind(prospect_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.as_ref().map(ProspectRow::from_row).transpose()?)
+}
+
 pub async fn export_prospects(db: &Db, account_id: i64, plan_id: Option<i64>, min_value: i64) -> Result<Vec<ProspectRow>> {
     let rows = sqlx::query(&format!(
         r#"SELECT {PROSPECT_COLS} FROM prospect pr JOIN plan p ON p.plan_id = pr.plan_id
@@ -2334,32 +2703,66 @@ pub struct ResultsFilter {
 pub async fn list_results(db: &Db, account_id: i64, f: &ResultsFilter) -> Result<(Vec<Value>, i64)> {
     let pattern = format!("%{}%", f.search.trim().to_lowercase());
     let cte = r#"WITH r AS (
-        SELECT 'prospect' AS kind, pr.plan_id AS plan_id, p.source AS plan,
+        SELECT 'prospect' AS kind, pr.prospect_id AS id, pr.plan_id AS plan_id, p.source AS plan,
                coalesce(nullif(pr.name,''), nullif(pr.company,''), pr.source_key) AS label,
                nullif(pr.company,'') AS sublabel, pr.website AS url, pr.last_seen_utc AS seen,
-               lower(pr.name||' '||pr.company||' '||pr.title||' '||pr.email||' '||pr.location||' '||pr.website) AS hay
+               lower(pr.name||' '||pr.company||' '||pr.title||' '||pr.email||' '||pr.location||' '||pr.website) AS hay,
+               jsonb_strip_nulls(jsonb_build_object(
+                   'Title', nullif(pr.title,''),
+                   'Company', nullif(pr.company,''),
+                   'Industry', nullif(pr.industry,''),
+                   'Email', CASE WHEN pr.email = '' THEN NULL
+                     ELSE pr.email || CASE WHEN pr.email_status <> '' THEN ' (' || pr.email_status || ')' ELSE '' END
+                   END,
+                   'Phone', nullif(pr.phone,''),
+                   'Website', nullif(pr.website,''),
+                   'LinkedIn', nullif(pr.linkedin,''),
+                   'Location', nullif(pr.location,''),
+                   'Notes', nullif(pr.notes,''),
+                   'Value', pr.estimated_value,
+                   'Key', nullif(pr.source_key,''),
+                   'First seen', pr.first_seen_utc
+               )) AS detail
         FROM prospect pr JOIN plan p ON p.plan_id=pr.plan_id WHERE pr.account_id=$1
         UNION ALL
-        SELECT 'artifact', a.plan_id, p.source,
+        SELECT 'artifact', a.artifact_id, a.plan_id, p.source,
                coalesce(nullif(a.title,''), a.source_key), NULL, a.url, a.last_seen_utc,
-               lower(a.title||' '||a.fields_json::text)
+               lower(a.title||' '||a.fields_json::text),
+               jsonb_strip_nulls(jsonb_build_object(
+                   'Title', nullif(a.title,''),
+                   'URL', nullif(a.url,''),
+                   'Key', a.source_key,
+                   'First seen', a.first_seen_utc
+               )) || coalesce(a.fields_json, '{}'::jsonb)
         FROM artifact a JOIN plan p ON p.plan_id=a.plan_id WHERE a.account_id=$1
         UNION ALL
         -- Reports search their whole body, so the Results page finds a plan by
         -- something mentioned inside the document.
-        SELECT 'report', rp.plan_id, p.source,
+        SELECT 'report', rp.report_id, rp.plan_id, p.source,
                coalesce(nullif(rp.title,''), rp.subject), nullif(rp.subject,''), '', rp.last_seen_utc,
-               lower(rp.title||' '||rp.subject||' '||rp.markdown)
+               lower(rp.title||' '||rp.subject||' '||rp.markdown),
+               jsonb_strip_nulls(jsonb_build_object(
+                   'Subject', nullif(rp.subject,''),
+                   'Words', rp.word_count,
+                   'First seen', rp.first_seen_utc
+               ))
         FROM report rp JOIN plan p ON p.plan_id=rp.plan_id WHERE rp.account_id=$1
         UNION ALL
-        SELECT 'file', f.plan_id, p.source,
+        SELECT 'file', f.asset_id, f.plan_id, p.source,
                coalesce(nullif(f.title,''), f.filename), nullif(f.filename,''), f.source_url, f.last_seen_utc,
-               lower(f.title||' '||f.filename||' '||f.source_url)
+               lower(f.title||' '||f.filename||' '||f.source_url),
+               jsonb_strip_nulls(jsonb_build_object(
+                   'File', nullif(f.filename,''),
+                   'Type', nullif(f.content_type,''),
+                   'Size', f.size_bytes,
+                   'Source', nullif(f.source_url,''),
+                   'First seen', f.first_seen_utc
+               ))
         FROM asset f JOIN plan p ON p.plan_id=f.plan_id WHERE f.account_id=$1
     )"#;
     let filter = r#"WHERE ($2::bigint IS NULL OR plan_id = $2) AND ($3 = '%%' OR hay LIKE $3)"#;
     let rows = sqlx::query(&format!(
-        "{cte} SELECT kind, plan_id, plan, label, sublabel, url, seen FROM r {filter} ORDER BY seen DESC LIMIT $4 OFFSET $5"
+        "{cte} SELECT kind, id, plan_id, plan, label, sublabel, url, seen, detail FROM r {filter} ORDER BY seen DESC LIMIT $4 OFFSET $5"
     ))
     .bind(account_id)
     .bind(f.plan_id)
@@ -2373,12 +2776,14 @@ pub async fn list_results(db: &Db, account_id: i64, f: &ResultsFilter) -> Result
         .map(|r| {
             serde_json::json!({
                 "kind": r.get::<String, _>("kind"),
+                "id": r.get::<i64, _>("id"),
                 "plan_id": r.get::<i64, _>("plan_id"),
                 "plan": r.get::<String, _>("plan"),
                 "label": r.get::<Option<String>, _>("label").unwrap_or_default(),
                 "sublabel": r.get::<Option<String>, _>("sublabel").unwrap_or_default(),
                 "url": r.get::<String, _>("url"),
                 "last_seen_utc": r.get::<DateTime<Utc>, _>("seen").to_rfc3339(),
+                "detail": r.try_get::<sqlx::types::Json<Value>, _>("detail").ok().map(|j| j.0).unwrap_or(serde_json::json!({})),
             })
         })
         .collect();
@@ -2827,13 +3232,17 @@ pub struct ExecutionRecord {
     /// The DevTools port this run's Chrome was given, set at creation.
     #[serde(skip)]
     pub cdp_port: Option<i32>,
+    /// The workspace's own rate per million tokens, if an operator set one.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub sell_rate: Option<f64>,
 }
 
 impl ExecutionRecord {
     /// What this run is billed at: tokens valued at the account's sell rate.
     /// The customer's number, not our cost.
     pub fn cost_usd(&self) -> f64 {
-        (self.input_tokens + self.output_tokens) as f64 * crate::config::sell_usd_per_mtoken() / 1e6
+        (self.input_tokens + self.output_tokens) as f64 * effective_sell_rate(self.sell_rate) / 1e6
     }
 
     /// What each thing it found cost. `None` when it found nothing — which is
@@ -2844,7 +3253,8 @@ impl ExecutionRecord {
 }
 
 const EXECUTION_COLS: &str = r#"r.execution_id,r.plan_id,r.account_id,p.source,r.status,r.trigger,r.started_at,r.browser_session_id,
-r.finished_at,r.exit_code,r.args_json,r.new_prospects,r.input_tokens,r.output_tokens,r.pid,r.cdp_port"#;
+r.finished_at,r.exit_code,r.args_json,r.new_prospects,r.input_tokens,r.output_tokens,r.pid,r.cdp_port,
+(SELECT a.sell_usd_per_mtoken FROM account a WHERE a.account_id=r.account_id) AS sell_rate"#;
 
 pub async fn create_execution(db: &Db, account_id: i64, plan_id: i64, trigger: &str, args: &Value, cdp_port: u16) -> Result<i64> {
     Ok(sqlx::query_scalar(
@@ -3256,6 +3666,13 @@ pub struct ApiKeyRow {
     pub key_id: i64,
     /// Populated only by `create_api_key`, for the one response that shows it.
     pub token: String,
+    /// The signing secret, likewise shown once at creation and never again.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub secret: String,
+    /// The stored, encrypted secret. Never serialised — it goes to
+    /// `web::signing` to check a signature and nowhere else.
+    #[serde(skip)]
+    pub secret_sealed: Option<String>,
     pub token_hint: String,
     pub label: String,
     pub plan_id: Option<i64>,
@@ -3270,6 +3687,8 @@ pub struct ApiKeyRow {
     pub expired: bool,
     #[serde(skip)]
     pub account_id: i64,
+    /// The teammate who made it; `None` for older keys and operator-issued ones.
+    pub created_by: Option<i64>,
 }
 
 pub fn new_api_token() -> String {
@@ -3278,14 +3697,16 @@ pub fn new_api_token() -> String {
     format!("psk_{}", hex::encode(buf))
 }
 
-const KEY_COLS: &str = r#"k.key_id, k.token_hint, k.label, k.plan_id, coalesce(p.source,'') AS source, k.allow_cidr,
-k.expires_at, k.created_at, k.last_used_at, k.last_used_ip, k.uses, k.revoked, k.account_id,
+const KEY_COLS: &str = r#"k.key_id, k.secret_sealed, k.token_hint, k.label, k.plan_id, coalesce(p.source,'') AS source, k.allow_cidr,
+k.expires_at, k.created_at, k.last_used_at, k.last_used_ip, k.uses, k.revoked, k.account_id, k.created_by,
 (k.expires_at IS NOT NULL AND k.expires_at <= now()) AS expired"#;
 
 fn key_from(r: &sqlx::postgres::PgRow) -> ApiKeyRow {
     ApiKeyRow {
         key_id: r.get("key_id"),
         token: String::new(),
+        secret: String::new(),
+        secret_sealed: r.get("secret_sealed"),
         token_hint: r.get("token_hint"),
         label: r.get("label"),
         plan_id: r.get("plan_id"),
@@ -3299,12 +3720,14 @@ fn key_from(r: &sqlx::postgres::PgRow) -> ApiKeyRow {
         revoked: r.get("revoked"),
         expired: r.get("expired"),
         account_id: r.get("account_id"),
+        created_by: r.get("created_by"),
     }
 }
 
 pub async fn create_api_key(
     db: &Db,
     account_id: i64,
+    created_by: Option<i64>,
     label: &str,
     plan_id: Option<i64>,
     expires_in_days: i64,
@@ -3319,10 +3742,15 @@ pub async fn create_api_key(
     let token = new_api_token();
     let hash = sha256_hex(&token);
     let hint: String = token.chars().take(12).collect();
+    // A signing secret, sealed for storage. `None` when the deployment has no
+    // signing key configured — the key then works as a bearer token, which is
+    // how every key worked before signing existed.
+    let secret = crate::web::signing::new_secret();
+    let sealed = crate::web::signing::seal_secret(&secret);
     let expires = (expires_in_days > 0).then(|| Utc::now() + Duration::days(expires_in_days));
     let key_id: i64 = sqlx::query_scalar(
-        r#"INSERT INTO api_key (account_id,plan_id,token_hash,token_hint,label,allow_cidr,expires_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING key_id"#,
+        r#"INSERT INTO api_key (account_id,plan_id,token_hash,token_hint,label,allow_cidr,expires_at,secret_sealed,created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING key_id"#,
     )
     .bind(account_id)
     .bind(plan_id)
@@ -3331,10 +3759,15 @@ pub async fn create_api_key(
     .bind(label.trim())
     .bind(allow_cidr.trim())
     .bind(expires)
+    .bind(&sealed)
+    .bind(created_by)
     .fetch_one(db)
     .await?;
     let mut row = get_api_key(db, account_id, key_id).await?.ok_or_else(|| anyhow!("key vanished"))?;
     row.token = token;
+    if sealed.is_some() {
+        row.secret = secret;
+    }
     Ok(row)
 }
 
@@ -3400,11 +3833,30 @@ pub enum AuthFailure {
 /// Looks a presented token up by its hash. The hash lookup is an index probe
 /// so timing reveals nothing about *which* key was close; every failure mode
 /// maps to the same outward 401 by the caller.
+/// Whether a key would still authenticate: not revoked, not expired, and its
+/// maker (if recorded) still on the team. For a long-lived connection that was
+/// authenticated once, at the start.
+pub async fn api_key_live(db: &Db, key_id: i64) -> Result<bool> {
+    let live: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (SELECT 1 FROM api_key k
+             WHERE k.key_id=$1 AND NOT k.revoked AND (k.expires_at IS NULL OR k.expires_at > now())
+               AND (k.created_by IS NULL OR k.created_by = k.account_id
+                    OR EXISTS (SELECT 1 FROM membership m WHERE m.workspace_id=k.account_id AND m.member_id=k.created_by)))"#,
+    )
+    .bind(key_id)
+    .fetch_one(db)
+    .await?;
+    Ok(live)
+}
+
 pub async fn authenticate_api_key(db: &Db, token: &str, from: Option<IpAddr>) -> Result<Result<ApiKeyRow, AuthFailure>> {
     let hash = sha256_hex(token.trim());
     let row = sqlx::query(&format!(
         r#"SELECT {KEY_COLS} FROM api_key k LEFT JOIN plan p ON p.plan_id=k.plan_id
-           WHERE k.token_hash=$1 AND NOT k.revoked AND (k.expires_at IS NULL OR k.expires_at > now())"#
+           WHERE k.token_hash=$1 AND NOT k.revoked AND (k.expires_at IS NULL OR k.expires_at > now())
+             -- A teammate's key lasts only as long as they are on the team.
+             AND (k.created_by IS NULL OR k.created_by = k.account_id
+                  OR EXISTS (SELECT 1 FROM membership m WHERE m.workspace_id=k.account_id AND m.member_id=k.created_by))"#
     ))
     .bind(&hash)
     .fetch_optional(db)
@@ -3516,12 +3968,43 @@ impl Charge {
     }
 }
 
-/// Billable tokens → micro-USD at the sell rate. The unit the wallet spends.
+/// Billable tokens → micro-USD at the installation's sell rate.
 pub fn tokens_to_usd_micros(tokens: i64) -> i64 {
+    tokens_to_usd_micros_at(tokens, crate::config::sell_usd_per_mtoken())
+}
+
+/// Billable tokens → micro-USD at `usd_per_mtoken`. The unit the wallet spends.
+pub fn tokens_to_usd_micros_at(tokens: i64, usd_per_mtoken: f64) -> i64 {
     if tokens <= 0 {
         return 0;
     }
-    (tokens as f64 * crate::config::sell_usd_per_mtoken()).round() as i64
+    (tokens as f64 * usd_per_mtoken).round() as i64
+}
+
+/// An operator's per-account rate, or the installation's when none is set.
+pub fn effective_sell_rate(own: Option<f64>) -> f64 {
+    own.filter(|r| r.is_finite() && *r > 0.0).unwrap_or_else(crate::config::sell_usd_per_mtoken)
+}
+
+/// What `account_id` (a workspace) is charged per million billable tokens.
+pub async fn sell_rate(db: &Db, account_id: i64) -> Result<f64> {
+    let own: Option<Option<f64>> = sqlx::query_scalar(r#"SELECT sell_usd_per_mtoken FROM account WHERE account_id=$1"#)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(effective_sell_rate(own.flatten()))
+}
+
+/// Set (or, with `None`, clear) an account's own rate. Applies to tokens
+/// billed from now on; what was already charged stays charged.
+pub async fn set_sell_rate(db: &Db, account_id: i64, usd_per_mtoken: Option<f64>) -> Result<bool> {
+    let n = sqlx::query(r#"UPDATE account SET sell_usd_per_mtoken=$2 WHERE account_id=$1"#)
+        .bind(account_id)
+        .bind(usd_per_mtoken)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(n > 0)
 }
 
 /// Tokens reported by one agent call (Cursor's `usage` object).
@@ -3674,11 +4157,19 @@ pub async fn add_execution_cost(db: &Db, execution_id: i64, cost_micros: i64) ->
     Ok(())
 }
 
+/// The run's running token total.
+///
+/// `GREATEST`, not `=`. The caller passes a running total, and those are
+/// written from more than one task at once — a live per-turn booking and the
+/// end-of-call one. Out of order, a plain assignment lets a stale, smaller
+/// total overwrite a newer one, and the row's tokens are what the customer is
+/// charged from. A running total never shrinks, so taking the larger is both
+/// correct and immune to the ordering.
 pub async fn set_execution_token_totals(db: &Db, execution_id: i64, u: TokenUsage) -> Result<()> {
     sqlx::query(
         r#"UPDATE execution SET
-            input_tokens=$2, output_tokens=$3,
-            cache_read_tokens=$4, cache_write_tokens=$5
+            input_tokens=GREATEST(input_tokens,$2), output_tokens=GREATEST(output_tokens,$3),
+            cache_read_tokens=GREATEST(cache_read_tokens,$4), cache_write_tokens=GREATEST(cache_write_tokens,$5)
            WHERE execution_id=$1"#,
     )
     .bind(execution_id)
@@ -3708,7 +4199,7 @@ pub async fn charge_account_usage(db: &Db, account_id: i64, u: TokenUsage, cost_
         return Ok(Charge::Applied);
     }
     ensure_usage(db, account_id).await?;
-    let debit = tokens_to_usd_micros(u.billable());
+    let debit = tokens_to_usd_micros_at(u.billable(), sell_rate(db, account_id).await?);
     // One statement both caps the customer charge at the wallet and records
     // every provider token. Postgres evaluates each right-hand expression
     // from the row as locked, so a concurrent credit purchase is neither lost
@@ -4541,7 +5032,7 @@ pub async fn set_account_kinds(db: &Db, account_id: i64, kinds: &str) -> Result<
 pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"SELECT a.account_id, a.email, a.display_name, a.enabled_kinds, a.connected_logins, a.created_at,
-                  (a.mfa_enabled_at IS NOT NULL) AS mfa_enabled,
+                  (a.mfa_enabled_at IS NOT NULL) AS mfa_enabled, a.sell_usd_per_mtoken,
                   (SELECT count(*) FROM plan p WHERE p.account_id = a.account_id) AS plans
            FROM account a ORDER BY a.account_id DESC LIMIT $1"#,
     )
@@ -4558,6 +5049,8 @@ pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
                 "kinds": r.get::<String, _>("enabled_kinds"),
                 "connected_logins": r.get::<bool, _>("connected_logins"),
                 "mfa_enabled": r.get::<bool, _>("mfa_enabled"),
+                // Its own rate, or null when it pays the installation's.
+                "sell_usd_per_mtoken": r.get::<Option<f64>, _>("sell_usd_per_mtoken"),
                 "plans": r.get::<i64, _>("plans"),
                 "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
             })
@@ -4835,6 +5328,251 @@ pub struct AdminExecutionRow {
     /// What Cursor said the run cost, µUSD. Zero when it reported nothing.
     pub cost_usd_micros: i64,
     pub model_scrape: String,
+    /// The account's own rate per million tokens, if an operator set one.
+    #[sqlx(default)]
+    pub sell_rate: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Outreach: cold emails drafted to prospects. Every read and write is scoped to
+// the workspace (`account_id`); a draft's versions repeat it so they are too.
+// ---------------------------------------------------------------------------
+
+/// What the drafter is told about the workspace's product, and its rules.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutreachProfile {
+    pub product: String,
+    pub rules: String,
+}
+
+pub async fn get_outreach_profile(db: &Db, account_id: i64) -> Result<OutreachProfile> {
+    let row = sqlx::query(r#"SELECT product, rules FROM outreach_profile WHERE account_id=$1"#)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(|r| OutreachProfile { product: r.get(0), rules: r.get(1) }).unwrap_or_default())
+}
+
+pub async fn set_outreach_profile(db: &Db, account_id: i64, product: &str, rules: &str, by: i64) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO outreach_profile (account_id, product, rules, updated_by) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (account_id) DO UPDATE SET product=excluded.product, rules=excluded.rules,
+             updated_by=excluded.updated_by, updated_at=now()"#,
+    )
+    .bind(account_id)
+    .bind(product)
+    .bind(rules)
+    .bind(by)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// A person's own sign-off. Theirs, whichever workspace they draft in.
+pub async fn get_outreach_footer(db: &Db, person: i64) -> Result<String> {
+    let f: Option<String> = sqlx::query_scalar(r#"SELECT outreach_footer FROM account WHERE account_id=$1"#)
+        .bind(person)
+        .fetch_optional(db)
+        .await?;
+    Ok(f.unwrap_or_default())
+}
+
+pub async fn set_outreach_footer(db: &Db, person: i64, footer: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE account SET outreach_footer=$2 WHERE account_id=$1"#)
+        .bind(person)
+        .bind(footer)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct OutreachRow {
+    pub outreach_id: i64,
+    pub created_by: i64,
+    pub prospect_id: Option<i64>,
+    pub recipient_name: String,
+    pub recipient_email: String,
+    pub recipient_title: String,
+    pub recipient_company: String,
+    pub recipient_notes: String,
+    pub subject: String,
+    pub body: String,
+    pub footer: String,
+    pub version: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Who drafted it, for a team's list.
+    pub created_by_name: String,
+}
+
+const OUTREACH_COLS: &str = r#"o.outreach_id, o.created_by, o.prospect_id, o.recipient_name, o.recipient_email,
+o.recipient_title, o.recipient_company, o.recipient_notes, o.subject, o.body, o.footer, o.version,
+o.created_at, o.updated_at, coalesce(nullif(a.display_name,''), a.email, '') AS created_by_name"#;
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct OutreachVersionRow {
+    pub version: i32,
+    pub subject: String,
+    pub body: String,
+    pub source: String,
+    pub feedback: String,
+    pub model: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Who a draft is to. Everything but the name may be empty.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct Recipient {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// One version of a draft's text and what produced it.
+pub struct OutreachText<'a> {
+    pub subject: &'a str,
+    pub body: &'a str,
+    /// draft | revise | edit | restore
+    pub source: &'a str,
+    pub feedback: &'a str,
+    pub model: &'a str,
+    pub usage: TokenUsage,
+}
+
+/// A new draft and its first version, together or not at all.
+pub async fn create_outreach(
+    db: &Db,
+    account_id: i64,
+    by: i64,
+    prospect_id: Option<i64>,
+    to: &Recipient,
+    footer: &str,
+    text: &OutreachText<'_>,
+) -> Result<OutreachRow> {
+    let mut tx = db.begin().await?;
+    let id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO outreach (account_id, created_by, prospect_id, recipient_name, recipient_email, recipient_title,
+                                 recipient_company, recipient_notes, subject, body, footer)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING outreach_id"#,
+    )
+    .bind(account_id)
+    .bind(by)
+    .bind(prospect_id)
+    .bind(&to.name)
+    .bind(&to.email)
+    .bind(&to.title)
+    .bind(&to.company)
+    .bind(&to.notes)
+    .bind(text.subject)
+    .bind(text.body)
+    .bind(footer)
+    .fetch_one(&mut *tx)
+    .await?;
+    insert_outreach_version(&mut tx, account_id, id, 1, by, text).await?;
+    tx.commit().await?;
+    get_outreach(db, account_id, id).await?.ok_or_else(|| anyhow!("outreach vanished"))
+}
+
+async fn insert_outreach_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+    outreach_id: i64,
+    version: i32,
+    by: i64,
+    text: &OutreachText<'_>,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO outreach_version (outreach_id, account_id, version, subject, body, source, feedback, model,
+                                         input_tokens, output_tokens, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+    )
+    .bind(outreach_id)
+    .bind(account_id)
+    .bind(version)
+    .bind(text.subject)
+    .bind(text.body)
+    .bind(text.source)
+    .bind(text.feedback)
+    .bind(text.model)
+    .bind(text.usage.input.min(i32::MAX as i64) as i32)
+    .bind(text.usage.output.min(i32::MAX as i64) as i32)
+    .bind(by)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Make `text` the draft's current version, keeping the old one in history.
+pub async fn add_outreach_version(db: &Db, account_id: i64, outreach_id: i64, by: i64, text: &OutreachText<'_>) -> Result<Option<OutreachRow>> {
+    let mut tx = db.begin().await?;
+    let version: Option<i32> = sqlx::query_scalar(
+        r#"UPDATE outreach SET subject=$3, body=$4, version=version+1, updated_at=now()
+           WHERE account_id=$1 AND outreach_id=$2 RETURNING version"#,
+    )
+    .bind(account_id)
+    .bind(outreach_id)
+    .bind(text.subject)
+    .bind(text.body)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(version) = version else { return Ok(None) };
+    insert_outreach_version(&mut tx, account_id, outreach_id, version, by, text).await?;
+    tx.commit().await?;
+    get_outreach(db, account_id, outreach_id).await
+}
+
+pub async fn get_outreach(db: &Db, account_id: i64, outreach_id: i64) -> Result<Option<OutreachRow>> {
+    let row = sqlx::query(&format!(
+        r#"SELECT {OUTREACH_COLS} FROM outreach o LEFT JOIN account a ON a.account_id=o.created_by
+           WHERE o.account_id=$1 AND o.outreach_id=$2"#
+    ))
+    .bind(account_id)
+    .bind(outreach_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.as_ref().map(OutreachRow::from_row).transpose()?)
+}
+
+pub async fn list_outreach(db: &Db, account_id: i64, limit: i64) -> Result<Vec<OutreachRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {OUTREACH_COLS} FROM outreach o LEFT JOIN account a ON a.account_id=o.created_by
+           WHERE o.account_id=$1 ORDER BY o.updated_at DESC LIMIT $2"#
+    ))
+    .bind(account_id)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(OutreachRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+pub async fn list_outreach_versions(db: &Db, account_id: i64, outreach_id: i64) -> Result<Vec<OutreachVersionRow>> {
+    let rows = sqlx::query(
+        r#"SELECT version, subject, body, source, feedback, model, created_at FROM outreach_version
+           WHERE account_id=$1 AND outreach_id=$2 ORDER BY version DESC"#,
+    )
+    .bind(account_id)
+    .bind(outreach_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(OutreachVersionRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+pub async fn delete_outreach(db: &Db, account_id: i64, outreach_id: i64) -> Result<bool> {
+    let n = sqlx::query(r#"DELETE FROM outreach WHERE account_id=$1 AND outreach_id=$2"#)
+        .bind(account_id)
+        .bind(outreach_id)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(n > 0)
 }
 
 /// Unscoped, admin-only view of recent runs with their placement.
@@ -4842,7 +5580,8 @@ pub async fn recent_executions_admin(db: &Db, host_id: Option<i64>, slot: Option
     let rows = sqlx::query(
         r#"SELECT r.execution_id, r.plan_id, r.account_id, p.source, r.status, r.started_at, r.finished_at,
                   r.host_id, r.slot_name, r.input_tokens, r.output_tokens, r.cache_read_tokens,
-                  r.cache_write_tokens, r.cost_usd_micros, r.model_scrape
+                  r.cache_write_tokens, r.cost_usd_micros, r.model_scrape,
+                  (SELECT a.sell_usd_per_mtoken FROM account a WHERE a.account_id=r.account_id) AS sell_rate
            FROM execution r JOIN plan p ON p.plan_id=r.plan_id
            WHERE ($1::bigint IS NULL OR r.host_id=$1) AND ($2::varchar IS NULL OR r.slot_name=$2)
            ORDER BY r.execution_id DESC LIMIT $3"#,
@@ -4862,6 +5601,40 @@ mod tests {
     /// The schema is what makes the feature off for everyone, so that is what
     /// the test reads. A default that drifts to `true` in a later edit would
     /// silently switch it on for every existing workspace at the next migrate.
+    #[test]
+    fn permissions_empty_uses_role_defaults() {
+        let member = parse_permissions("member", false, "");
+        assert!(member.plans && !member.credits && member.keys);
+        let admin = parse_permissions("admin", false, "");
+        assert!(admin.plans && admin.credits && admin.keys);
+    }
+
+    #[test]
+    fn permissions_readonly_clears_writes() {
+        let c = parse_permissions("admin", false, "readonly,plans");
+        assert!(!c.plans && !c.credits && !c.keys);
+        assert_eq!(c.as_tokens(), vec!["readonly"]);
+    }
+
+    #[test]
+    fn permissions_explicit_overrides_defaults() {
+        let c = parse_permissions("member", false, "credits,keys");
+        assert!(!c.plans && c.credits && c.keys);
+    }
+
+    #[test]
+    fn permissions_owner_always_all() {
+        let c = parse_permissions("member", true, "readonly");
+        assert!(c.plans && c.credits && c.keys);
+    }
+
+    #[test]
+    fn sanitize_permissions_drops_unknown_and_readonly_wins() {
+        assert_eq!(sanitize_permissions(&["plans".into(), "shell".into()]), "plans");
+        assert_eq!(sanitize_permissions(&["plans".into(), "readonly".into()]), "readonly");
+        assert_eq!(sanitize_permissions(&[]), "");
+    }
+
     #[test]
     fn connected_logins_default_to_off() {
         let sql = include_str!("../../local-infra/db/public/account.sql");
@@ -4916,6 +5689,17 @@ mod tests {
         assert!(thorough_pages >= quick_pages * 3, "quick {quick_pages}, thorough {thorough_pages}");
         // Anything unrecognised is the middle, never the most expensive.
         assert_eq!(effort_pages("nonsense"), normal_pages);
+    }
+
+    #[test]
+    fn an_account_rate_overrides_the_default_only_when_sane() {
+        assert_eq!(tokens_to_usd_micros_at(1_000_000, 8.0), 8_000_000);
+        assert_eq!(tokens_to_usd_micros_at(250_000, 12.5), 3_125_000);
+        assert_eq!(effective_sell_rate(Some(8.0)), 8.0);
+        let default = crate::config::sell_usd_per_mtoken();
+        assert_eq!(effective_sell_rate(None), default);
+        assert_eq!(effective_sell_rate(Some(0.0)), default, "zero is not free runs");
+        assert_eq!(effective_sell_rate(Some(f64::NAN)), default);
     }
 
     #[test]

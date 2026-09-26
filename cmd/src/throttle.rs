@@ -105,6 +105,15 @@ pub static INVITES: Limiter = Limiter::new(30, 24 * 60 * 60, 24 * 60 * 60);
 /// email to whatever address was typed, so it is bounded like invitations.
 pub static RESET_REQUESTS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
 
+/// Waitlist requests from one address: five an hour. The form is public and
+/// the first request from an email address sends that address a note, so it is
+/// bounded like the other forms that can make us send mail.
+pub static WAITLIST_REQUESTS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
+
+/// Outreach drafts and revisions, per workspace: each is a paid model call,
+/// and a person working through a list does a few a minute, not dozens.
+pub static OUTREACH_DRAFTS: Limiter = Limiter::new(30, 60, 60);
+
 /// Verification emails re-sent by one account: five an hour.
 pub static VERIFY_RESENDS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
 

@@ -1,12 +1,15 @@
 import React, { useEffect, useState } from 'react'
-import { api, fmtDate, Report } from '../api'
-import { Empty, useConfirm, useToast } from './ui'
+import { api, can, fmtDate, Report } from '../api'
+import { useAuth } from '../auth'
+import { Empty, Loading, useConfirm, useToast } from './ui'
 import { SearchIcon } from './icons'
 
 // A report plan's result: one document. The server renders the Markdown (raw
 // HTML escaped there, so this is safe to inject) and also serves a
 // self-contained print page — which is how a PDF is produced.
 export function ReportView({ planId }: { planId: number }) {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const [rows, setRows] = useState<Report[] | null>(null)
   const [html, setHtml] = useState('')
   const [openId, setOpenId] = useState<number | null>(null)
@@ -39,7 +42,7 @@ export function ReportView({ planId }: { planId: number }) {
     load()
   }
 
-  if (rows === null) return <p className="muted">Loading…</p>
+  if (rows === null) return <Loading />
   if (rows.length === 0)
     return (
       <Empty title="No report yet" icon={<SearchIcon size={38} />}>
@@ -74,9 +77,11 @@ export function ReportView({ planId }: { planId: number }) {
             <a className="btn primary" href={`/api/reports/${open.report_id}/print`} target="_blank" rel="noreferrer">
               Print / Save as PDF
             </a>
-            <button className="btn danger sm" onClick={() => remove(open.report_id)}>
-              Delete
-            </button>
+            {write && (
+              <button className="btn danger sm" onClick={() => remove(open.report_id)}>
+                Delete
+              </button>
+            )}
           </div>
         </div>
         {/* Server-rendered from Markdown with raw HTML escaped. */}

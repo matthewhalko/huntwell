@@ -151,9 +151,7 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
             // Already on the runtime: hand it over rather than block it. The
             // authoritative booking happens in `meter_run` after the call, so
             // this one is the live figure and can land a moment later.
-            Ok(_) => {
-                meter_handle.spawn(book);
-            }
+            Ok(_) => note_booking(meter_handle.spawn(book)),
             Err(_) => meter_handle.block_on(book),
         }
     })));
@@ -358,6 +356,9 @@ async fn execute(db: &Db, run: &store::ExecutionRecord, sc: &SourceConfig, args:
     // whole run, so a header seen on page one is known on page two.
     let trimmer = crate::thrift::trim::watch(browser::output_dir());
     let outcome = run_pipeline(db, sc, &seed, opts).await;
+    // Before anything reports the run finished: a booking still in flight is
+    // a charge that never lands.
+    settle_bookings().await;
     if let Some(t) = trimmer {
         let (before, after) = t.stop();
         if before > 0 {
@@ -522,6 +523,32 @@ fn reset_real_booked() {
     }
 }
 
+/// Live bookings handed to the runtime rather than blocked on.
+///
+/// Kept so the run can wait for them: a fire-and-forget write that is still in
+/// flight when the process exits is a charge that never lands, and the account
+/// ledger is additive so it cannot be recovered from a later total.
+fn in_flight() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+fn note_booking(handle: tokio::task::JoinHandle<()>) {
+    if let Ok(mut v) = in_flight().lock() {
+        // Finished ones are dropped as we go, so this stays small on a long run.
+        v.retain(|h| !h.is_finished());
+        v.push(handle);
+    }
+}
+
+/// Wait for every live booking to land. Called before a run finishes.
+async fn settle_bookings() {
+    let pending: Vec<_> = in_flight().lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    for handle in pending {
+        let _ = handle.await;
+    }
+}
+
 fn add_real_booked(u: store::TokenUsage) -> store::TokenUsage {
     real_booked()
         .lock()
@@ -607,7 +634,7 @@ async fn book_tokens(
             crate::agent::trip_credits();
         }
     }
-    publish_meter(account_id, execution_id, plan_id, total.billable()).await;
+    publish_meter(db, account_id, execution_id, plan_id, total.billable()).await;
 }
 
 /// Writes the climbing estimate to the run row. Not a charge.
@@ -627,7 +654,13 @@ async fn show_live_tokens(
     let pending = est.saturating_sub(crate::agent::booked_usage());
     if !pending.is_zero() {
         match store::account_credit_micros(db, account_id).await {
-            Ok(remaining) if remaining <= store::tokens_to_usd_micros(pending.billable()) => {
+            Ok(remaining)
+                if remaining
+                    <= store::tokens_to_usd_micros_at(
+                        pending.billable(),
+                        store::sell_rate(db, account_id).await.unwrap_or_else(|_| crate::config::sell_usd_per_mtoken()),
+                    ) =>
+            {
                 crate::agent::trip_credits();
                 println!("[stop] token limit reached — stopping before more unreported spend");
             }
@@ -644,10 +677,11 @@ async fn show_live_tokens(
         tracing::warn!("meter live display: {e:#}");
         return;
     }
-    publish_meter(account_id, execution_id, plan_id, shown.billable()).await;
+    publish_meter(db, account_id, execution_id, plan_id, shown.billable()).await;
 }
 
-async fn publish_meter(account_id: i64, execution_id: i64, plan_id: i64, tokens: i64) {
+async fn publish_meter(db: &store::Db, account_id: i64, execution_id: i64, plan_id: i64, tokens: i64) {
+    let rate = store::sell_rate(db, account_id).await.unwrap_or_else(|_| crate::config::sell_usd_per_mtoken());
     crate::bus::publish(
         crate::bus::subject::RUN_METERED,
         Some(account_id),
@@ -655,7 +689,7 @@ async fn publish_meter(account_id: i64, execution_id: i64, plan_id: i64, tokens:
             "execution_id": execution_id,
             "plan_id": plan_id,
             "tokens": tokens,
-            "cost_usd": tokens as f64 * crate::config::sell_usd_per_mtoken() / 1e6,
+            "cost_usd": tokens as f64 * rate / 1e6,
         }),
     )
     .await;
@@ -1914,6 +1948,28 @@ mod meter_thread_tests {
             }
             Err(_) => handle.block_on(work),
         }
+    }
+
+    /// The charge this guards: live bookings were handed to the runtime and
+    /// forgotten, so any still in flight when the run ended never landed — and
+    /// the account ledger adds, so a lost one cannot be recovered from a later
+    /// total. The run waits for them now.
+    #[tokio::test]
+    async fn no_booking_is_left_behind_when_a_run_ends() {
+        let landed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..8 {
+            let landed = landed.clone();
+            super::note_booking(tokio::spawn(async move {
+                // Slow enough that it would still be in flight at the end.
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                landed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        assert!(landed.load(std::sync::atomic::Ordering::SeqCst) < 8, "they should still be running");
+        super::settle_bookings().await;
+        assert_eq!(landed.load(std::sync::atomic::Ordering::SeqCst), 8, "every charge must land before the run reports done");
+        // And a second wait is harmless.
+        super::settle_bookings().await;
     }
 
     #[test]

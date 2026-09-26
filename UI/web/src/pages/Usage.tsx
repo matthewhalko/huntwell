@@ -1,19 +1,32 @@
 import React, { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ago, api, Billing, fmtDate, fmtTokens, Overview, Usage as UsageT, usd } from '../api'
-import { StatusBadge, useToast } from '../components/ui'
+import { ago, api, Billing, can, fmtDate, fmtTokens, money, Overview, Prospect, Run, Usage as UsageT, usd } from '../api'
+import { useAuth } from '../auth'
+import { StatusBadge, useConfirm, useToast } from '../components/ui'
+import { CardBrandIcon, cardBrandLabel } from '../components/icons'
 import { CardDialog } from '../components/CardDialog'
+import { ResultDialog } from '../components/ResultDialog'
+import { ChartUnit, TokenChart } from '../components/TokenChart'
 
 export default function Usage() {
+  const { me } = useAuth()
+  const pay = can(me, 'credits')
+  const write = can(me, 'plans')
   const [data, setData] = useState<Overview | null>(null)
   const [usage, setUsage] = useState<UsageT | null>(null)
   const [billing, setBilling] = useState<Billing | null>(null)
+  const [runs, setRuns] = useState<Run[] | null>(null)
+  const [chartUnit, setChartUnit] = useState<ChartUnit>('tokens')
+  const [lookback, setLookback] = useState(100)
+  const [lookbackText, setLookbackText] = useState('100')
   const [cardBusy, setCardBusy] = useState(false)
   const [adding, setAdding] = useState(false)
+  const [open, setOpen] = useState<Prospect | null>(null)
   const [params, setParams] = useSearchParams()
   const loc = useLocation() as { state?: { needCard?: boolean; needCredits?: boolean; icp?: string } }
   const nav = useNavigate()
   const toast = useToast()
+  const confirm = useConfirm()
   // Sent here by "Go now" with nothing to bill: say so, and keep the prompt so
   // the trip back to Home is one click and no retyping.
   const needCard = !!loc.state?.needCard
@@ -21,14 +34,16 @@ export default function Usage() {
   const parkedIcp = loc.state?.icp || ''
 
   const load = async () => {
-    const [o, u, b] = await Promise.all([
+    const [o, u, b, r] = await Promise.all([
       api.get<Overview>('/api/overview'),
       api.get<UsageT>('/api/usage'),
       api.get<Billing>('/api/billing'),
+      api.get<Run[]>('/api/executions?limit=200'),
     ])
     setData(o)
     setUsage(u)
     setBilling(b)
+    setRuns(r)
   }
 
   /// The card field opens here too — same dialog the Go now gate raises.
@@ -51,6 +66,18 @@ export default function Usage() {
       setAdding(true)
       return
     }
+    // Charge is immediate on the card on file — say so before it happens.
+    const card = billing.card
+    const onCard = card ? ` on the ${cardBrandLabel(card.brand)} ending ${card.last4}` : ' on the card on file'
+    if (
+      !(await confirm({
+        title: `Buy $${usd} of credits?`,
+        body: `We'll charge $${usd}${onCard}. Credits are prepaid and land as soon as the charge succeeds.`,
+        confirm: `Buy $${usd}`,
+        danger: false,
+      }))
+    )
+      return
     setBuying(usd)
     try {
       const purchase_id =
@@ -64,8 +91,8 @@ export default function Usage() {
         toast('That card needs another check — remove it and add it again, then retry.', true)
         return
       }
+      toast(`Purchase confirmed — $${usd} in credits added.`)
       await load()
-      toast(`Added $${usd} in credits`)
     } catch (e: any) {
       toast(e.message || 'Could not buy credits', true)
     } finally {
@@ -125,21 +152,27 @@ export default function Usage() {
       <div className="card" style={{ marginBottom: '1.4rem' }}>
         <div className="row between">
           <h3 style={{ margin: 0 }}>Payment method</h3>
-          {billing?.card ? (
-            <button className="btn" onClick={removeCard} disabled={cardBusy}>
-              Remove
-            </button>
-          ) : (
-            <button className="btn primary" onClick={() => setAdding(true)}>
-              Add payment method
-            </button>
-          )}
+          {pay &&
+            (billing?.card ? (
+              <button className="btn" onClick={removeCard} disabled={cardBusy}>
+                Remove
+              </button>
+            ) : (
+              <button className="btn primary" onClick={() => setAdding(true)}>
+                Add payment method
+              </button>
+            ))}
         </div>
         {billing?.card ? (
-          <div className="row" style={{ marginTop: '0.5rem', gap: '0.6rem' }}>
-            <span style={{ fontWeight: 700, textTransform: 'capitalize' }}>{billing.card.brand}</span>
-            <span className="muted">•••• {billing.card.last4}</span>
-            {billing.card.added_at && <span className="muted">· added {fmtDate(billing.card.added_at)}</span>}
+          <div className="pay-method">
+            <CardBrandIcon brand={billing.card.brand} />
+            <div className="pay-method-meta">
+              <div className="pay-method-line">
+                <span style={{ fontWeight: 700 }}>{cardBrandLabel(billing.card.brand)}</span>
+                <span className="muted">•••• {billing.card.last4}</span>
+              </div>
+              {billing.card.added_at && <span className="muted sm">added {fmtDate(billing.card.added_at)}</span>}
+            </div>
           </div>
         ) : (
           <p className="muted" style={{ margin: '0.35rem 0 0' }}>
@@ -158,7 +191,7 @@ export default function Usage() {
         )}
       </div>
 
-      {adding && (
+      {adding && pay && (
         <CardDialog
           onClose={() => setAdding(false)}
           onDone={() => {
@@ -185,16 +218,67 @@ export default function Usage() {
                 ? 'No credits left — runs are paused until you buy more. A running job stops the moment this hits zero.'
                 : `${usd(usage.used_usd)} spent this period. Credits are purchased in advance and cannot go below zero.`}
             </p>
-            <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
-              {PACKS.map((n) => (
-                <button key={n} className="btn" disabled={buying !== null} onClick={() => buy(n)}>
-                  {buying === n ? 'Buying…' : `Buy $${n}`}
-                </button>
-              ))}
-            </div>
+            {pay && (
+              <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
+                {PACKS.map((n) => (
+                  <button key={n} className="btn" disabled={buying !== null} onClick={() => buy(n)}>
+                    {buying === n ? 'Buying…' : `Buy $${n}`}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )
       })()}
+
+      {runs && runs.length > 0 && (
+        <div className="card" style={{ marginBottom: '1.4rem' }}>
+          <div className="row between" style={{ marginBottom: '0.55rem', gap: '0.6rem', flexWrap: 'wrap' }}>
+            <div className="row" style={{ gap: '0.7rem' }}>
+              <h3 style={{ margin: 0 }}>{chartUnit === 'usd' ? 'Dollars per execution' : 'Tokens per execution'}</h3>
+              <div className="seg small" role="group" aria-label="Chart units">
+                <button type="button" className={chartUnit === 'tokens' ? 'active' : ''} onClick={() => setChartUnit('tokens')}>
+                  Tokens
+                </button>
+                <button type="button" className={chartUnit === 'usd' ? 'active' : ''} onClick={() => setChartUnit('usd')}>
+                  Dollars
+                </button>
+              </div>
+              <label className="chart-lookback">
+                Last
+                <input
+                  type="number"
+                  min={10}
+                  max={200}
+                  step={10}
+                  value={lookbackText}
+                  onChange={(e) => {
+                    const t = e.target.value
+                    setLookbackText(t)
+                    const n = Number(t)
+                    if (Number.isFinite(n) && n >= 10 && n <= 200) setLookback(Math.round(n))
+                  }}
+                  onBlur={() => {
+                    const n = Math.min(200, Math.max(10, Number(lookbackText) || 100))
+                    setLookback(n)
+                    setLookbackText(String(n))
+                  }}
+                />
+                executions
+              </label>
+            </div>
+            <span className="muted">
+              {(() => {
+                const shown = [...runs].sort((a, b) => a.execution_id - b.execution_id).slice(-lookback)
+                const total = shown.reduce((a, r) => a + (chartUnit === 'usd' ? r.cost_usd || 0 : r.tokens || 0), 0)
+                const amount = chartUnit === 'usd' ? usd(total) : `${fmtTokens(total)} tokens`
+                return `${shown.length} run${shown.length === 1 ? '' : 's'} · ${amount}`
+              })()}
+            </span>
+          </div>
+          <TokenChart runs={runs} unit={chartUnit} lookback={lookback} />
+        </div>
+      )}
 
       <div className="grid cols-4" style={{ marginBottom: '1.4rem' }}>
         <div className="stat">
@@ -222,14 +306,21 @@ export default function Usage() {
             <Link to="/app/executions">All →</Link>
           </div>
           {data?.recent_executions.length ? (
-            <table style={{ marginTop: '0.6rem' }}>
+            <table className="recent-runs" style={{ marginTop: '0.6rem' }}>
               <tbody>
                 {data.recent_executions.map((r) => (
-                  <tr key={r.execution_id}>
+                  <tr
+                    key={r.execution_id}
+                    className="clickable"
+                    onClick={() => nav(`/app/executions/${r.execution_id}`)}
+                  >
                     <td>
-                      <Link to={`/app/executions/${r.execution_id}`}>#{r.execution_id}</Link> <span className="muted">{r.source}</span>
+                      <Link to={`/app/executions/${r.execution_id}`} onClick={(e) => e.stopPropagation()}>
+                        #{r.execution_id}
+                      </Link>{' '}
+                      <span className="muted">{r.source}</span>
                     </td>
-                    <td>
+                    <td className="status-cell">
                       <StatusBadge status={r.status} />
                     </td>
                     <td className="num muted">{ago(r.started_at)}</td>
@@ -252,7 +343,7 @@ export default function Usage() {
             <table style={{ marginTop: '0.6rem' }}>
               <tbody>
                 {data.latest_prospects.map((p) => (
-                  <tr key={p.prospect_id}>
+                  <tr key={p.prospect_id} className="clickable" onClick={() => setOpen(p)}>
                     <td>
                       <b>{p.name || p.company}</b>
                       <br />
@@ -270,6 +361,37 @@ export default function Usage() {
           )}
         </div>
       </div>
+      {open && (
+        <ResultDialog
+          title={open.name || open.company}
+          fields={[
+            ['Title', open.title],
+            ['Company', open.company],
+            ['Industry', open.industry],
+            ['Email', open.email + (open.email_status ? ` (${open.email_status})` : '')],
+            ['Phone', open.phone],
+            ['Website', open.website],
+            ['LinkedIn', open.linkedin],
+            ['Location', open.location],
+            ['Notes', open.notes],
+            ['Value', money(open.estimated_value)],
+            ['Plan', open.source],
+            ['Key', open.source_key],
+            ['First seen', fmtDate(open.first_seen_utc)],
+          ]}
+          onClose={() => setOpen(null)}
+          onDelete={
+            write
+              ? async () => {
+                  await api.del(`/api/prospects/${open.prospect_id}`)
+                  setOpen(null)
+                  toast('Deleted')
+                  load()
+                }
+              : undefined
+          }
+        />
+      )}
     </>
   )
 }

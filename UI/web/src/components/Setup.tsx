@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import { api, Billing } from '../api'
 import { useAuth } from '../auth'
 import { CardDialog } from './CardDialog'
+import { CardBrandIcon, cardBrandLabel } from './icons'
+import { ModalBackdrop } from './ui'
 
 /// The zone the browser is already in. Nobody is asked for it — a person whose
 /// laptop is set to Denver does not want to answer a question about it.
@@ -77,7 +79,7 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
   }
 
   return (
-    <div className="modal-bg setup-bg">
+    <ModalBackdrop className="setup-bg">
       <div className="modal setup">
         <div className="setup-mark">
           <span className="grad-text" aria-hidden>
@@ -96,9 +98,16 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
             <div className="step-body">
               <div className="step-title">Add a payment method</div>
               <p className="step-hint">
-                {hasCard
-                  ? `${billing?.card?.brand} •••• ${billing?.card?.last4} on file. Credits are purchased next — a run spends only what you have preallocated.`
-                  : 'Executions cost money, so a card comes first. You then buy credits and spend only those.'}
+                {hasCard ? (
+                  <span className="pay-method" style={{ marginTop: 0 }}>
+                    <CardBrandIcon brand={billing?.card?.brand} size={32} />
+                    <span>
+                      {cardBrandLabel(billing?.card?.brand)} •••• {billing?.card?.last4} on file. Credits are purchased next — a run spends only what you have preallocated.
+                    </span>
+                  </span>
+                ) : (
+                  'Executions cost money, so a card comes first. You then buy credits and spend only those.'
+                )}
               </p>
               {!hasCard && (
                 <button className="btn primary sm" onClick={() => setAddingCard(true)}>
@@ -132,6 +141,6 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
           </span>
         </div>
       </div>
-    </div>
+    </ModalBackdrop>
   )
 }

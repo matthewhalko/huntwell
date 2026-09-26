@@ -6,11 +6,16 @@ session.sql
 # Team: other people granted access to an account's workspace.
 membership.sql
 invite.sql
+waitlist.sql
 plan.sql
 prospect.sql
 artifact.sql
 report.sql
 asset.sql
+# Outreach: cold emails drafted to prospects, and what drafts are told.
+outreach_profile.sql
+outreach.sql
+outreach_version.sql
 search_frontier.sql
 search_query.sql
 visited_page.sql

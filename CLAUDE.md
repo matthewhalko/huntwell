@@ -31,6 +31,74 @@ sqlx) on Postgres, React UI embedded in the binary, one process per run.
 - UI theme: tokens on `:root` and `:root[data-theme='dark']` in `UI/web/src/styles.css`;
   never hard-code a colour in a component.
 
+## Public API auth (`cmd/src/web/signing.rs`)
+
+A key issued today carries a **secret**. The key identifies and travels; the
+secret only signs and never leaves either end.
+`X-HW-KEY` / `X-HW-TS` / `X-HW-NONCE` / `X-HW-SIGN`, signing
+`METHOD\nPATH\nQUERY\nTIMESTAMP\nNONCE\nSHA256(BODY)` with HMAC-SHA256, 30s
+window. **Signing is the only way in** — bearer tokens and `?token=` are
+refused, including on `/dl/`.
+
+- **The body is signed.** `download::stamp_signed_parts` (on `/v1` and `/dl`)
+  reads the body once (1 MB cap → 413), hashes it, and puts the digest and the
+  raw query in internal headers it strips from the caller first; the handler
+  gets the same bytes. What is verified is exactly what the handler reads.
+- **A nonce is used once.** `signing::claim_nonce` remembers (key, nonce) for
+  the window, after the signature is good; a repeat is `Refused::Replayed`.
+  In memory — the website is one process.
+- Park River signs the same way (`shared/huntwell.rs`, `advisor/src/prospecting.rs`
+  in that repo); both repos pin the same vectors (`operator_tests::the_shared_vectors_verify`).
+  Change the scheme in both, together.
+- The secret is **encrypted, not hashed** (`signing::seal_secret`): verifying an
+  HMAC means computing it, so it has to be recoverable. Key from
+  `HUNTWELL_API_SIGNING_KEY`, falling back to `HUNTWELL_SESSION_SECRET`.
+- A key predating signing has no secret and is refused, told to make a new one.
+- Signature comparison is constant-time; the signed query is the raw string as
+  sent, never re-encoded; nothing the caller sends separately (the old
+  `X-HW-Query`) is trusted.
+- A key records `created_by`; a teammate's key stops authenticating when they
+  leave the workspace, and `remove_member` revokes it. Only its maker or an
+  admin may revoke, delete or re-pin a key. A plan-pinned key's plan always
+  wins over a `plan_id` in the request.
+- A key never does more than its maker: `Caller.can_plans` comes from the
+  maker's workspace permissions, and every `/v1` write calls `needs_plans`.
+  `/v1/stream` re-checks its key (`store::api_key_live`) every 10s and closes
+  when it is revoked, expired, or its maker leaves the team.
+- Two-factor sign-in: the account comes from the server's record of which
+  password earned the challenge (`identity::mfa_challenge_account`), never
+  from the request, and the Cognito subject must match the bound one.
+
+## Invite-only sign-up (`web/auth.rs`, `store` waitlist fns, `waitlist.sql`)
+
+Closed by default: `HUNTWELL_OPEN_SIGNUP=1` opens it; the first account on an
+empty database never needs an invitation. Without one, `/signup` is a waitlist
+request (`POST /api/auth/waitlist`, answers the same whether or not the address
+is known). Two invitations let someone in, resolved by `find_invitation`:
+
+- **Platform** — admin Users → Waitlist & invites (`/admin/api/waitlist/*`).
+  Token `hwi_…`, only its SHA-256 stored, 14 days, single-use, bound to the
+  address; link `{HUNTWELL_PUBLIC_URL}/signup?invite=…` (the admin needs that
+  setting). It was emailed, so sign-up marks the address verified — no OTP.
+- **Team** — a workspace's existing `invite`; still lets someone sign up while
+  closed. It can be copied, so the OTP is still required.
+
+## Public site and SEO (`cmd/src/web/seo.rs`, `UI/web/src/components/Site.tsx`)
+
+`seo::PAGES` is the one list of public pages: `/sitemap.xml`, `/robots.txt` and
+the per-route `<head>` (title, description, canonical, Open Graph/Twitter,
+JSON-LD) come from it. The server writes the head into `index.html` between
+`<!--seo-->` markers, so crawlers and link previews see it without running JS;
+the app, sign-in pages and unknown URLs get `noindex`. `PAGE_META` in
+`Site.tsx` mirrors it for client-side navigation — a test fails if they drift,
+or if a listed page is not routed in `App.tsx`. Absolute URLs use
+`HUNTWELL_PUBLIC_URL`. Share image: `public/og.png`, source `brand/og.html`.
+Unknown URLs are served with the app but as **404** (`seo::route`), and
+`/page/` 301s to `/page` — a test fails if a route in `App.tsx` would 404.
+Icons for Google's result favicon (48px multiple, plus `/favicon.ico`) and the
+JSON-LD logo (`icon-512.png`) are rendered from `brand/favicon.html`; see its
+comment. `<lastmod>` is the UI bundle's build date (`build.rs`).
+
 ## Model providers (`cmd/src/llm/`) and our own agent loop (`cmd/src/direct/`)
 
 A stage model id of `provider:model` runs in Huntwell's loop; a bare id is the
@@ -60,6 +128,35 @@ Cursor CLI, unchanged. `pipeline::agent_call` routes on `direct::handles`.
 - Prices themselves cannot be fetched and are **unverified**; check the
   provider's page before trusting the admin's margin column. A model from no
   known family shows "price unknown" rather than a wrong number.
+
+## Outreach (`cmd/src/outreach.rs`, `cmd/src/web/outreach.rs`, `pages/Outreach.tsx`)
+
+Cold emails drafted to a prospect or a hand-entered person — drafted, never
+sent; the person copies them into their own mail. One `llm` call per draft or
+revision (no tools), model = admin stage **outreach** (`model_outreach`), else
+the newest Claude Sonnet from Anthropic's live model list — never the plan
+drafter's model. Cursor ids cannot serve it. Current Claude models reject
+`temperature` (400); the Anthropic adapter drops it for them (`accepts_sampling`).
+Billed to the workspace via `charge_account_usage`, after a credit check.
+Product description and rules are per workspace (`outreach_profile`); the
+footer is per person (`account.outreach_footer`) and appended by code, never
+by the model. Every text change is a row in `outreach_version`. Scraped
+prospect fields go through `outreach::scraped` (flattened, bounded, dropped if
+`guard::reads_like_an_attack`) and are marked as data in the prompt.
+Also on the signed API (`/v1/outreach*`, `public_api.rs`): the handlers call
+the same `pub(crate)` functions in `web/outreach.rs` (`draft_new`,
+`revise_draft`, `edit_draft`, `restore_draft`) with a `Writer` — the key's
+maker (`api_key.created_by`), else the workspace owner. Plan-pinned keys are
+refused. Keep app and API on those functions; never copy the logic.
+
+## Billing rate
+
+Customers pay per million billable (input + output) tokens. The rate is the
+workspace's own `account.sell_usd_per_mtoken` when an operator set one (admin →
+Users → Rate), else `HUNTWELL_SELL_USD_PER_MTOKEN` (default $5). Always price
+through `store::sell_rate` / `effective_sell_rate` — never read the config rate
+directly — so the wallet debit, the live limit, run costs and the admin's
+Charged column agree. A change applies to tokens billed from then on.
 
 ## Spending less (`cmd/src/thrift/`)
 

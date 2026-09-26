@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
-import { api, Asset, fmtBytes, fmtDate } from '../api'
-import { Empty, useConfirm, useToast } from './ui'
+import { api, Asset, can, fmtBytes, fmtDate } from '../api'
+import { useAuth } from '../auth'
+import { Empty, Loading, useConfirm, useToast } from './ui'
 import { MapIcon } from './icons'
 
 // A short glyph for the file type. Text, not colour — the icon rules apply.
@@ -18,6 +19,8 @@ function typeLabel(a: Asset): string {
 // An assets plan's result: the files it collected. Bytes stream from the
 // object store through the account-scoped download endpoint.
 export function AssetGrid({ planId }: { planId: number }) {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const [rows, setRows] = useState<Asset[] | null>(null)
   const toast = useToast()
   const confirm = useConfirm()
@@ -39,7 +42,7 @@ export function AssetGrid({ planId }: { planId: number }) {
     load()
   }
 
-  if (rows === null) return <p className="muted">Loading…</p>
+  if (rows === null) return <Loading />
   if (rows.length === 0)
     return (
       <Empty title="No files yet" icon={<MapIcon size={38} />}>
@@ -78,9 +81,11 @@ export function AssetGrid({ planId }: { planId: number }) {
                     source ↗
                   </a>
                 )}
-                <button className="btn danger sm" onClick={() => remove(a)}>
-                  ✕
-                </button>
+                {write && (
+                  <button className="btn danger sm" onClick={() => remove(a)}>
+                    ✕
+                  </button>
+                )}
               </div>
             </div>
             <div className="muted sm">{fmtDate(a.last_seen_utc)}</div>

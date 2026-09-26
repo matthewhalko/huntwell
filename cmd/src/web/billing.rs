@@ -73,6 +73,20 @@ pub fn routes() -> Router<App> {
         .route("/billing/card", delete(remove_card))
 }
 
+/// Cards and payments need the credits cap. Role defaults give it to the
+/// owner and admins; an admin can grant or take it per member.
+async fn require_payer(state: &App, acc: &store::Account) -> Result<(), ApiError> {
+    let caps = store::workspace_caps(&state.db, acc.tenant(), acc.account_id).await?;
+    if caps.credits {
+        Ok(())
+    } else {
+        Err(ApiError(
+            axum::http::StatusCode::FORBIDDEN,
+            "you do not have permission to buy credits or change the card".into(),
+        ))
+    }
+}
+
 /// The publishable key the browser needs to mount Stripe's card field. Public
 /// by design — it can only start a payment, never move money.
 fn publishable_key() -> Option<String> {
@@ -86,6 +100,7 @@ fn publishable_key() -> Option<String> {
 /// into Stripe's iframe and confirmed by Stripe's own script — the number never
 /// touches this server, exactly as with Checkout, but the user stays put.
 async fn intent(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let (Some(key), Some(pk)) = (secret_key(), publishable_key()) else {
         attach_mock_card(&state, acc.tenant()).await?;
         let pm = store::payment_method(&state.db, acc.tenant()).await?;
@@ -117,6 +132,7 @@ async fn attach(
     AuthUser(acc): AuthUser,
     Json(body): Json<AttachBody>,
 ) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let Some(key) = secret_key() else {
         return Err(bad_request("Stripe is not configured on this server"));
     };
@@ -197,6 +213,7 @@ async fn session(
     AuthUser(acc): AuthUser,
     Json(body): Json<SessionBody>,
 ) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let Some(key) = secret_key() else {
         attach_mock_card(&state, acc.tenant()).await?;
         let pm = store::payment_method(&state.db, acc.tenant()).await?;
@@ -236,6 +253,7 @@ async fn confirm(
     AuthUser(acc): AuthUser,
     Json(body): Json<ConfirmBody>,
 ) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let Some(key) = secret_key() else {
         return Err(bad_request("Stripe is not configured on this server"));
     };
@@ -279,6 +297,7 @@ async fn confirm(
 /// Forgets the card. The Stripe customer is left alone — removing it there
 /// would lose the account's billing history for the sake of a UI action.
 async fn remove_card(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let payment_ref = customer_ref(&state, acc.tenant()).await?;
     store::set_payment_method(&state.db, acc.tenant(), &payment_ref, "", "", "").await?;
     Ok(Json(json!({"has_card": false, "card": Value::Null})))
@@ -367,6 +386,7 @@ pub async fn purchase_credits(
     usd: f64,
     purchase_id: &str,
 ) -> Result<Json<Value>, ApiError> {
+    require_payer(state, acc).await?;
     let micros = credit_pack_micros(usd)?;
     let purchase_id = purchase_id.trim();
     if !(8..=80).contains(&purchase_id.len())
@@ -430,6 +450,7 @@ async fn credits_confirm(
     AuthUser(acc): AuthUser,
     Json(body): Json<CreditsConfirmBody>,
 ) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
     let Some(key) = secret_key() else {
         return Err(bad_request("Stripe is not configured on this server"));
     };

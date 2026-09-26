@@ -269,12 +269,12 @@ mod tests {
 
     #[test]
     fn a_provider_model_is_priced_by_its_provider_not_by_a_cursor_lookalike() {
-        // Cursor's rate for Sonnet 5 is $2/$10; Anthropic's own is $3/$15.
-        // Pricing the direct model off the Cursor table would understate our
-        // cost and overstate the margin, which is the number this feeds.
+        // A direct model is priced from its provider's own table, whatever a
+        // Cursor id that looks like it costs. Sonnet 5 is $2/M input either
+        // way today (the adapter once had it at $3, which overstated our cost).
         let direct = estimate_cost_micros("anthropic:claude-sonnet-5", 1_000_000, 0, 0, 0).unwrap();
         let cursorish = estimate_cost_micros("claude-sonnet-5-thinking-high", 1_000_000, 0, 0, 0).unwrap();
-        assert_eq!(direct, 3_000_000);
+        assert_eq!(direct, 2_000_000);
         assert_eq!(cursorish, 2_000_000);
 
         // Cache reads are charged at the provider's stated cache rate, and are

@@ -1,16 +1,21 @@
-import React, { useEffect, useState } from 'react'
-import { Picker } from '../components/Picker'
-import { Link, useSearchParams } from 'react-router-dom'
-import { api, FieldSpec, fmtDate, money, PlanSummary, Prospect } from '../api'
-import { Badge, Empty, Modal, useConfirm, useToast } from '../components/ui'
+import React, { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { api, can, fmtDate, money, Prospect } from '../api'
+import { useAuth } from '../auth'
+import { Badge, Empty, Loading, useConfirm, useToast } from '../components/ui'
+import { ResultDialog } from '../components/ResultDialog'
+import { useDraftOutreach } from './Outreach'
 import { MapIcon } from '../components/icons'
-import { ArtifactTable } from '../components/ArtifactTable'
-import { ReportView } from '../components/ReportView'
-import { AssetGrid } from '../components/AssetGrid'
+import Grid, { LINK_COLUMN, useNarrow } from '../components/Grid'
+import type { ColDef } from 'ag-grid-community'
 
 
 export function ProspectTable({ planId }: { planId?: number }) {
-  const [rows, setRows] = useState<Prospect[]>([])
+  const { me } = useAuth()
+  const write = can(me, 'plans')
+  const outreach = useDraftOutreach()
+  const [rows, setRows] = useState<Prospect[] | null>(null)
+  const [loading, setLoading] = useState(true)
   const [total, setTotal] = useState(0)
   const [q, setQ] = useState('')
   const [minValue, setMinValue] = useState(0)
@@ -36,8 +41,26 @@ export function ProspectTable({ planId }: { planId?: number }) {
     setTotal(r.total)
   }
   useEffect(() => {
-    const t = setTimeout(load, 200)
-    return () => clearTimeout(t)
+    let cancelled = false
+    setLoading(true)
+    const t = setTimeout(async () => {
+      try {
+        const p = params()
+        p.set('limit', String(limit))
+        p.set('offset', String(page * limit))
+        const r = await api.get<{ rows: Prospect[]; total: number }>(`/api/prospects?${p}`)
+        if (!cancelled) {
+          setRows(r.rows)
+          setTotal(r.total)
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }, 200)
+    return () => {
+      cancelled = true
+      clearTimeout(t)
+    }
   }, [planId, q, minValue, page])
 
   const csvUrl = () => {
@@ -63,70 +86,77 @@ export function ProspectTable({ planId }: { planId?: number }) {
     load()
   }
 
+  // The same columns the table had, in the same order. Widths are relative:
+  // `flex` shares the space, so the grid fills its card at any window size.
+  const columns = useMemo<ColDef<Prospect>[]>(
+    () => [
+      { field: 'name', headerName: 'Name', flex: 1.4, cellRenderer: (p: { value: string }) => <b>{p.value}</b> },
+      { field: 'title', headerName: 'Title', flex: 1.4 },
+      { field: 'company', headerName: 'Company', flex: 1.4 },
+      {
+        field: 'email',
+        headerName: 'Email',
+        flex: 1.6,
+        cellRenderer: (p: { data: Prospect }) => (
+          <span className="cell">
+            {p.data.email}{' '}
+            {p.data.email_status && <Badge kind={p.data.email_status === 'verified' ? 'ok' : ''}>{p.data.email_status}</Badge>}
+          </span>
+        ),
+      },
+      { field: 'location', headerName: 'Location', flex: 1.1 },
+      ...(planId ? [] : [{ field: 'source' as const, headerName: 'Plan', flex: 1.1, cellClass: 'muted' }]),
+      {
+        field: 'estimated_value',
+        headerName: 'Value',
+        flex: 0.8,
+        type: 'rightAligned',
+        valueFormatter: (p: { value: number | null }) => money(p.value),
+        // Sorted as a number, not as the "$1,200" a reader sees.
+        comparator: (a: number | null, b: number | null) => (a ?? -1) - (b ?? -1),
+      },
+      {
+        field: 'last_seen_utc',
+        headerName: 'Seen',
+        flex: 1,
+        cellClass: 'muted',
+        valueFormatter: (p: { value: string }) => fmtDate(p.value),
+      },
+    ],
+    [planId],
+  )
+
   return (
     <div className="stack">
       <div className="row between">
         <div className="row">
           <input type="text" placeholder="Search name, company, email…" value={q} onChange={(e) => (setPage(0), setQ(e.target.value))} style={{ width: 260 }} />
           <input type="number" placeholder="Min value" min={0} value={minValue || ''} onChange={(e) => (setPage(0), setMinValue(+e.target.value || 0))} style={{ width: 130 }} />
-          <span className="muted">{total} artifacts</span>
+          {rows === null ? <Loading inline /> : <span className="muted">{total} artifacts</span>}
         </div>
         <div className="row">
           <a className="btn" href={csvUrl()}>
             ⇩ Export CSV
           </a>
-          {total > 0 && (
+          {write && total > 0 && (
             <button className="btn danger sm" onClick={clear}>
               Clear
             </button>
           )}
         </div>
       </div>
-      {rows.length === 0 ? (
+      {rows === null || (loading && rows.length === 0) ? (
+        <Grid loading rows={[]} columns={columns} />
+      ) : rows.length === 0 ? (
         <Empty title="No artifacts here yet">Run a search plan and the rows land here, deduped and cleansed.</Empty>
       ) : (
-        <div className="card pad0 table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Title</th>
-                <th>Company</th>
-                <th>Email</th>
-                <th>Location</th>
-                {!planId && <th>Plan</th>}
-                <th>Value</th>
-                <th>Seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((p) => (
-                <tr key={p.prospect_id} className="clickable" onClick={() => setOpen(p)}>
-                  <td>
-                    <b>{p.name}</b>
-                  </td>
-                  <td>
-                    <span className="cell">{p.title}</span>
-                  </td>
-                  <td>
-                    <span className="cell">{p.company}</span>
-                  </td>
-                  <td>
-                    <span className="cell">
-                      {p.email} {p.email_status && <Badge kind={p.email_status === 'verified' ? 'ok' : ''}>{p.email_status}</Badge>}
-                    </span>
-                  </td>
-                  <td>
-                    <span className="cell">{p.location}</span>
-                  </td>
-                  {!planId && <td className="muted">{p.source}</td>}
-                  <td className="num">{money(p.estimated_value)}</td>
-                  <td className="muted">{fmtDate(p.last_seen_utc)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Grid
+          rows={rows}
+          loading={loading}
+          getRowId={(p) => String(p.prospect_id)}
+          onRowClick={setOpen}
+          columns={columns}
+        />
       )}
       {total > limit && (
         <div className="row between">
@@ -142,123 +172,254 @@ export function ProspectTable({ planId }: { planId?: number }) {
         </div>
       )}
       {open && (
-        <Modal title={open.name || open.company} onClose={() => setOpen(null)}>
-          <table>
-            <tbody>
-              {(
-                [
-                  ['Title', open.title],
-                  ['Company', open.company],
-                  ['Industry', open.industry],
-                  ['Email', open.email + (open.email_status ? ` (${open.email_status})` : '')],
-                  ['Phone', open.phone],
-                  ['Website', open.website],
-                  ['LinkedIn', open.linkedin],
-                  ['Location', open.location],
-                  ['Notes', open.notes],
-                  ['Value', money(open.estimated_value)],
-                  ['Plan', open.source],
-                  ['Key', open.source_key],
-                  ['First seen', fmtDate(open.first_seen_utc)],
-                ] as [string, string][]
-              )
-                .filter(([, v]) => v)
-                .map(([k, v]) => (
-                  <tr key={k}>
-                    <td className="muted" style={{ width: 110 }}>
-                      {k}
-                    </td>
-                    <td style={{ wordBreak: 'break-word' }}>{/^https?:\/\//.test(v) ? <a href={v} target="_blank" rel="noreferrer">{v}</a> : v}</td>
-                  </tr>
-                ))}
-            </tbody>
-          </table>
-          <div className="row" style={{ justifyContent: 'flex-end', marginTop: '1rem' }}>
-            <button className="btn danger sm" onClick={() => del(open.prospect_id)}>
-              Delete
-            </button>
-          </div>
-        </Modal>
+        <ResultDialog
+          title={open.name || open.company}
+          fields={[
+            ['Title', open.title],
+            ['Company', open.company],
+            ['Industry', open.industry],
+            ['Email', open.email + (open.email_status ? ` (${open.email_status})` : '')],
+            ['Phone', open.phone],
+            ['Website', open.website],
+            ['LinkedIn', open.linkedin],
+            ['Location', open.location],
+            ['Notes', open.notes],
+            ['Value', money(open.estimated_value)],
+            ['Plan', open.source],
+            ['Key', open.source_key],
+            ['First seen', fmtDate(open.first_seen_utc)],
+          ]}
+          onClose={() => setOpen(null)}
+          onDelete={write ? () => del(open.prospect_id) : undefined}
+          actions={
+            write && (
+              <button className="btn primary sm" onClick={() => outreach.start(open.prospect_id)} disabled={outreach.busy}>
+                {outreach.busy ? 'Writing…' : 'Draft outreach'}
+              </button>
+            )
+          }
+        />
       )}
     </div>
   )
 }
 
-type ResultRow = { kind: string; plan_id: number; plan: string; label: string; sublabel: string; url: string; last_seen_utc: string }
+type ResultRow = {
+  kind: string
+  id: number
+  plan_id: number
+  plan: string
+  label: string
+  sublabel: string
+  url: string
+  last_seen_utc: string
+  detail?: Record<string, string | number | boolean | null>
+}
+
+function resultDeletePath(row: ResultRow): string | null {
+  if (row.kind === 'prospect') return `/api/prospects/${row.id}`
+  if (row.kind === 'artifact') return `/api/artifacts/${row.id}`
+  if (row.kind === 'report') return `/api/reports/${row.id}`
+  if (row.kind === 'file') return `/api/assets/${row.id}`
+  return null
+}
+
+function resultField(v: string | number | boolean | null): React.ReactNode {
+  if (v === null || v === undefined || v === '') return null
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return String(v)
+  }
+  const s = String(v)
+  if (/^https?:\/\//.test(s)) {
+    return (
+      <a href={s} target="_blank" rel="noreferrer">
+        {s}
+      </a>
+    )
+  }
+  return s
+}
 
 // Cross-plan searchable list — prospects and custom artifacts together, projected
 // onto common columns (schemas differ, so this is the shared view).
 /// The cross-plan table. The search box belongs to the page head above it, so
 /// it arrives as a prop: one query, one row of controls, whichever view is
 /// underneath.
+/// Same cutoff as the bottom rail: under it, a five-column grid does not fit.
 function UnifiedResults({ q }: { q: string }) {
-  const [rows, setRows] = useState<ResultRow[]>([])
+  const { me } = useAuth()
+  const write = can(me, 'plans')
+  const outreach = useDraftOutreach()
+  const [rows, setRows] = useState<ResultRow[] | null>(null)
+  const [loading, setLoading] = useState(true)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
+  const [open, setOpen] = useState<ResultRow | null>(null)
+  const toast = useToast()
+  const narrow = useNarrow()
   const LIMIT = 50
   // A new query starts at the first page, never mid-way through the old one.
   useEffect(() => setPage(0), [q])
   useEffect(() => {
+    let cancelled = false
+    setLoading(true)
     const t = setTimeout(async () => {
-      const p = new URLSearchParams({ search: q, limit: String(LIMIT), offset: String(page * LIMIT) })
-      const r = await api.get<{ rows: ResultRow[]; total: number }>(`/api/results?${p}`)
-      setRows(r.rows)
-      setTotal(r.total)
+      try {
+        const p = new URLSearchParams({ search: q, limit: String(LIMIT), offset: String(page * LIMIT) })
+        const r = await api.get<{ rows: ResultRow[]; total: number }>(`/api/results?${p}`)
+        if (!cancelled) {
+          setRows(r.rows)
+          setTotal(r.total)
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }, 200)
-    return () => clearTimeout(t)
+    return () => {
+      cancelled = true
+      clearTimeout(t)
+    }
   }, [q, page])
+  const columns = useMemo<ColDef<ResultRow>[]>(() => {
+    const all: ColDef<ResultRow>[] = [
+      {
+        colId: 'result',
+        headerName: 'Result',
+        flex: 1.6,
+        valueGetter: (p) => p.data?.label,
+        cellRenderer: (p: { data?: ResultRow }) =>
+          p.data ? (
+            <span>
+              <b>{p.data.label || '—'}</b>
+              {p.data.sublabel && <span className="muted"> · {p.data.sublabel}</span>}
+            </span>
+          ) : null,
+      },
+      {
+        field: 'plan',
+        headerName: 'From',
+        flex: 1.1,
+        cellRenderer: (p: { data?: ResultRow }) =>
+          p.data ? (
+            <Link to={`/app/plans/${p.data.plan_id}`} onClick={(e) => e.stopPropagation()}>
+              {p.data.plan}
+            </Link>
+          ) : null,
+      },
+      {
+        field: 'kind',
+        headerName: 'Type',
+        flex: 0.7,
+        cellRenderer: (p: { value: string }) => (
+          <span>
+            <Badge>{p.value}</Badge>
+          </span>
+        ),
+      },
+      {
+        field: 'url',
+        headerName: 'Link',
+        ...LINK_COLUMN,
+        cellRenderer: (p: { value: string }) =>
+          p.value ? (
+            <a href={p.value} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+              open ↗
+            </a>
+          ) : (
+            <span className="muted">—</span>
+          ),
+      },
+      {
+        field: 'last_seen_utc',
+        headerName: 'Seen',
+        flex: 1,
+        cellClass: 'muted',
+        valueFormatter: (p: { value: string }) => fmtDate(p.value),
+      },
+    ]
+    // A phone keeps the result. Plan, type, link and when it was seen are in
+    // the row dialog — extra columns here only crush the name.
+    return all.map((c) => {
+      const id = c.colId || c.field
+      const keep = id === 'result'
+      return { ...c, hide: narrow && !keep, minWidth: narrow ? 72 : c.minWidth }
+    })
+  }, [narrow])
   return (
     <div className="stack">
-      <span className="muted">
-        {total} result{total === 1 ? '' : 's'}
-      </span>
-      {rows.length === 0 ? (
+      {rows === null ? (
+        <Loading inline />
+      ) : (
+        <span className="muted">
+          {total} result{total === 1 ? '' : 's'}
+        </span>
+      )}
+      {rows === null || (loading && rows.length === 0) ? (
+        <Grid loading fill={narrow} rows={[]} columns={columns} />
+      ) : rows.length === 0 ? (
         <Empty title="Nothing here yet" icon={<MapIcon size={38} />}>Run a search and everything it finds lands here, searchable across all of it.</Empty>
       ) : (
-        <div className="card pad0 table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Result</th>
-                <th>From</th>
-                <th>Type</th>
-                <th>Link</th>
-                <th>Seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={i}>
-                  <td>
-                    <b>{r.label || '—'}</b>
-                    {r.sublabel && (
-                      <>
-                        <br />
-                        <span className="muted">{r.sublabel}</span>
-                      </>
-                    )}
-                  </td>
-                  <td>
-                    <Link to={`/app/plans/${r.plan_id}`}>{r.plan}</Link>
-                  </td>
-                  <td>
-                    <Badge>{r.kind}</Badge>
-                  </td>
-                  <td>
-                    {r.url ? (
-                      <a href={r.url} target="_blank" rel="noreferrer">
-                        open ↗
-                      </a>
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                  </td>
-                  <td className="muted">{fmtDate(r.last_seen_utc)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Grid
+          rows={rows}
+          loading={loading}
+          fill={narrow}
+          getRowId={(r) => `${r.kind}-${r.id || 'x'}-${r.plan_id}-${r.label}-${r.last_seen_utc}-${r.url}`}
+          onRowClick={setOpen}
+          columns={columns}
+        />
+      )}
+      {open && (
+        <ResultDialog
+          title={open.label || open.plan}
+          fields={[
+            ['Type', open.kind],
+            ['Plan', <Link to={`/app/plans/${open.plan_id}`}>{open.plan}</Link>],
+            ...Object.entries(open.detail || {}).map(([k, v]): [string, React.ReactNode] => [
+              k,
+              k === 'Value' && typeof v === 'number' ? money(v) : k === 'First seen' ? fmtDate(String(v)) : resultField(v),
+            ]),
+            ['Link', open.url],
+            ['Seen', fmtDate(open.last_seen_utc)],
+          ]}
+          extra={
+            open.kind === 'report' ? (
+              <div className="row" style={{ marginTop: '1rem' }}>
+                <a className="btn sm" href={`/api/reports/${open.id}/print`} target="_blank" rel="noreferrer">
+                  Read report
+                </a>
+              </div>
+            ) : open.kind === 'file' ? (
+              <div className="row" style={{ marginTop: '1rem' }}>
+                <a className="btn sm" href={`/api/assets/${open.id}`}>
+                  Download
+                </a>
+              </div>
+            ) : undefined
+          }
+          actions={
+            write &&
+            open.kind === 'prospect' &&
+            open.id > 0 && (
+              <button className="btn primary sm" onClick={() => outreach.start(open.id)} disabled={outreach.busy}>
+                {outreach.busy ? 'Writing…' : 'Draft outreach'}
+              </button>
+            )
+          }
+          onClose={() => setOpen(null)}
+          onDelete={
+            write && resultDeletePath(open)
+              ? async () => {
+                  const path = resultDeletePath(open)
+                  if (!path) return
+                  await api.del(path)
+                  setOpen(null)
+                  toast('Deleted')
+                  setRows((cur) => (cur ? cur.filter((r) => !(r.kind === open.kind && r.id === open.id)) : cur))
+                  setTotal((n) => Math.max(0, n - 1))
+                }
+              : undefined
+          }
+        />
       )}
       {total > LIMIT && (
         <div className="row between">
@@ -278,46 +439,19 @@ function UnifiedResults({ q }: { q: string }) {
 }
 
 export default function Results() {
-  const [params, setParams] = useSearchParams()
-  const [plans, setPlans] = useState<PlanSummary[]>([])
   const [q, setQ] = useState('')
-  const planId = Number(params.get('plan_id') || 0) || undefined
-  useEffect(() => {
-    api.get<PlanSummary[]>('/api/plans').then(setPlans)
-  }, [])
-  const plan = plans.find((p) => p.PlanId === planId)
   return (
-    <>
+    <div className="results-page">
       <div className="page-head">
         <div>
           <h1>Results</h1>
-          <div className="sub">Everything your search plans have found — search across all of them, or pick one.</div>
+          <div className="sub">Everything your search plans have found.</div>
         </div>
         <div className="row head-controls">
-          {/* Only the cross-plan view searches from here; a single plan has its
-              own filters, which are specific to what that plan collects. */}
-          {!planId && (
-            <input type="search" placeholder="Search across every plan…" value={q} onChange={(e) => setQ(e.target.value)} />
-          )}
-          <Picker
-            className="plan-picker"
-            value={planId ? String(planId) : ''}
-            onChange={(v) => setParams(v ? { plan_id: v } : {})}
-            options={[{ value: '', label: 'All search plans' }, ...plans.map((p) => ({ value: String(p.PlanId), label: p.Source }))]}
-          />
+          <input type="search" placeholder="Search across every plan…" value={q} onChange={(e) => setQ(e.target.value)} />
         </div>
       </div>
-      {!planId ? (
-        <UnifiedResults q={q} />
-      ) : plan?.Kind === 'artifacts' ? (
-        <ArtifactTable key={planId} planId={planId} />
-      ) : plan?.Kind === 'report' ? (
-        <ReportView key={planId} planId={planId} />
-      ) : plan?.Kind === 'assets' ? (
-        <AssetGrid key={planId} planId={planId} />
-      ) : (
-        <ProspectTable key={planId} planId={planId} />
-      )}
-    </>
+      <UnifiedResults q={q} />
+    </div>
   )
 }

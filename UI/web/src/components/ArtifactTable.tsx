@@ -1,5 +1,10 @@
-import React, { useEffect, useState } from 'react'
-import { api, Artifact, FieldSpec, usd } from '../api'
+import React, { useEffect, useMemo, useState } from 'react'
+import type { ColDef } from 'ag-grid-community'
+import { api, Artifact, can, FieldSpec, fmtDate, usd } from '../api'
+import { useAuth } from '../auth'
+import { ResultDialog } from './ResultDialog'
+import { Loading } from './ui'
+import Grid, { LINK_COLUMN, useNarrow } from './Grid'
 
 const NUMERIC = (t: string) => t === 'money' || t === 'number'
 
@@ -7,11 +12,14 @@ const NUMERIC = (t: string) => t === 'money' || t === 'number'
 // ProspectTable). The columns arrive with the rows: a plan's own definition
 // stays on the server, so the results endpoint is what describes their shape.
 export function ArtifactTable({ planId }: { planId: number }) {
-  const [rows, setRows] = useState<Artifact[]>([])
+  const { me } = useAuth()
+  const write = can(me, 'plans')
+  const [rows, setRows] = useState<Artifact[] | null>(null)
   const [schema, setSchema] = useState<FieldSpec[]>([])
   const [total, setTotal] = useState(0)
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(0)
+  const [open, setOpen] = useState<Artifact | null>(null)
   const LIMIT = 50
 
   const load = async () => {
@@ -22,7 +30,19 @@ export function ArtifactTable({ planId }: { planId: number }) {
     if (r.columns) setSchema(r.columns)
   }
   useEffect(() => {
-    load()
+    let cancelled = false
+    const p = new URLSearchParams({ plan_id: String(planId), search, limit: String(LIMIT), offset: String(page * LIMIT) })
+    api.get<{ rows: Artifact[]; total: number; columns: FieldSpec[] | null }>(`/api/artifacts?${p}`).then((r) => {
+      if (cancelled) return
+      setRows(r.rows)
+      setTotal(r.total)
+      if (r.columns) setSchema(r.columns)
+    }).catch(() => {
+      if (!cancelled) setRows((cur) => cur ?? [])
+    })
+    return () => {
+      cancelled = true
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planId, search, page])
 
@@ -38,7 +58,7 @@ export function ArtifactTable({ planId }: { planId: number }) {
     const s = String(v)
     if (f.type === 'url' || /^https?:\/\//.test(s)) {
       return (
-        <a href={s} target="_blank" rel="noreferrer">
+        <a href={s} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
           open ↗
         </a>
       )
@@ -46,6 +66,66 @@ export function ArtifactTable({ planId }: { planId: number }) {
     if (f.type === 'money' && typeof v === 'number') return usd(v)
     return s
   }
+
+  // One column per field in the plan's schema, sized by what it holds: links
+  // narrow, numbers compact, long text wide — and all of them together exactly
+  // the grid's width (see Grid), so it never scrolls sideways.
+  const narrow = useNarrow()
+  const columns = useMemo<ColDef<Artifact>[]>(() => {
+    // At phone width only what names the row stays: the title column, and the
+    // first number or price if there is one. Everything else, delete included,
+    // is one tap away in the row's dialog.
+    const title = cols.find((f) => f.role === 'title') || cols.find((f) => f.type === 'text') || cols[0]
+    const figure = cols.find((f) => NUMERIC(f.type))
+    const kept = (f: FieldSpec) => !narrow || f === title || f === figure
+    const out: ColDef<Artifact>[] = cols.filter(kept).map((f) => {
+      const base: ColDef<Artifact> = {
+        colId: f.key,
+        headerName: f.label || f.key,
+        valueGetter: (p) => p.data?.fields?.[f.key] ?? '',
+        cellRenderer: (p: { data?: Artifact }) => (p.data ? cell(p.data, f) : null),
+        tooltipValueGetter: (p) => {
+          const v = p.data?.fields?.[f.key]
+          return v === null || v === undefined || v === '' ? undefined : String(v)
+        },
+      }
+      if (f.type === 'url') return { ...base, ...LINK_COLUMN }
+      if (NUMERIC(f.type)) return { ...base, flex: 0.7, type: 'rightAligned' }
+      if (f.type === 'date') return { ...base, flex: 0.8 }
+      if (f.type === 'longtext') return { ...base, flex: 2 }
+      return { ...base, flex: f.role === 'title' ? 1.6 : 1.1 }
+    })
+    if (write && !narrow) {
+      out.push({
+        colId: 'delete',
+        headerName: '',
+        flex: 0,
+        width: 52,
+        minWidth: 52,
+        maxWidth: 52,
+        suppressSizeToFit: true,
+        sortable: false,
+        resizable: false,
+        cellRenderer: (p: { data?: Artifact }) =>
+          p.data ? (
+            <button
+              className="btn ghost sm"
+              onClick={(e) => {
+                e.stopPropagation()
+                del(p.data!.artifact_id)
+              }}
+              title="Delete"
+            >
+              ✕
+            </button>
+          ) : null,
+      })
+    }
+    return out
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, write, narrow])
+
+  if (rows === null) return <Loading />
 
   return (
     <>
@@ -75,36 +155,13 @@ export function ArtifactTable({ planId }: { planId: number }) {
       ) : rows.length === 0 ? (
         <p className="muted">No results yet. Run this search plan to collect items.</p>
       ) : (
-        <div style={{ overflowX: 'auto' }}>
-          <table>
-            <thead>
-              <tr>
-                {cols.map((f) => (
-                  <th key={f.key} className={NUMERIC(f.type) ? 'num' : ''}>
-                    {f.label || f.key}
-                  </th>
-                ))}
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((a) => (
-                <tr key={a.artifact_id}>
-                  {cols.map((f) => (
-                    <td key={f.key} className={NUMERIC(f.type) ? 'num' : ''}>
-                      {cell(a, f)}
-                    </td>
-                  ))}
-                  <td className="num">
-                    <button className="btn ghost sm" onClick={() => del(a.artifact_id)} title="Delete">
-                      ✕
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Grid
+          rows={rows}
+          columns={columns}
+          getRowId={(r) => String(r.artifact_id)}
+          onRowClick={setOpen}
+          options={{ tooltipShowDelay: 400 }}
+        />
       )}
 
       {total > LIMIT && (
@@ -119,6 +176,32 @@ export function ArtifactTable({ planId }: { planId: number }) {
             Next →
           </button>
         </div>
+      )}
+      {open && (
+        <ResultDialog
+          title={open.title || open.source_key}
+          fields={[
+            ...cols.map((f): [string, React.ReactNode] => {
+              const v = open.fields?.[f.key]
+              if (v === null || v === undefined || v === '') return [f.label || f.key, '']
+              if (f.type === 'money' && typeof v === 'number') return [f.label || f.key, usd(v)]
+              return [f.label || f.key, String(v)]
+            }),
+            ['URL', open.url],
+            ['Plan', open.source],
+            ['Key', open.source_key],
+            ['First seen', fmtDate(open.first_seen_utc)],
+          ]}
+          onClose={() => setOpen(null)}
+          onDelete={
+            write
+              ? async () => {
+                  await del(open.artifact_id)
+                  setOpen(null)
+                }
+              : undefined
+          }
+        />
       )}
     </>
   )

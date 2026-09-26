@@ -54,31 +54,44 @@ pub fn router(state: Admin) -> Router {
         .route("/admin/api/claim", post(claim))
         .route("/admin/api/logout", post(logout))
         .route("/admin/api/session", get(session))
-        .route("/admin/api/overview", get(overview))
-        .route("/admin/api/services", get(services))
-        .route("/admin/api/hosts", get(list_hosts).post(create_host))
-        .route("/admin/api/hosts/{id}", axum::routing::put(update_host).delete(delete_host))
-        .route("/admin/api/hosts/{id}/sync", post(sync_host))
-        .route("/admin/api/hosts/{id}/slots", get(host_slots))
-        .route("/admin/api/hosts/{id}/slots/{slot}/kill", post(kill_slot))
-        .route("/admin/api/vms", get(list_vms).post(create_vm))
-        .route("/admin/api/vms/deploy", post(deploy_all))
-        .route("/admin/api/vms/{id}", axum::routing::delete(delete_vm))
-        .route("/admin/api/vms/{id}/deploy", post(deploy_vm))
-        .route("/admin/api/vms/{id}/slots", axum::routing::put(put_vm_slots))
-        .route("/admin/api/vms/{id}/stop", post(stop_vm))
-        .route("/admin/api/vms/{id}/start", post(start_vm))
-        .route("/admin/api/accounts/{id}/connected-logins", axum::routing::put(put_account_connected_logins))
-        .route("/admin/api/accounts/{id}/mfa", axum::routing::delete(reset_account_mfa))
-        .route("/admin/api/routing", get(get_routing).put(put_routing))
-        .route("/admin/api/models", get(get_models).put(put_models))
-        .route("/admin/api/models/available", get(available_models))
-        .route("/admin/api/features", get(get_features).put(put_features))
-        .route("/admin/api/accounts", get(list_accounts))
-        .route("/admin/api/accounts/{id}/kinds", axum::routing::put(put_account_kinds))
-        .route("/admin/api/executions", get(recent_executions))
-        .route("/admin/api/executions/{id}/log", get(execution_log))
-        .route("/admin/api/route-log", get(route_log))
+        // Everything else under /admin/api needs a signed-in operator, checked
+        // here — before a body is parsed or a handler runs — so nothing about
+        // the admin API answers anyone else. Handlers still call `require`
+        // for the operator's name; this is the gate in front of them.
+        .merge(
+            Router::new()
+            .route("/admin/api/overview", get(overview))
+            .route("/admin/api/services", get(services))
+            .route("/admin/api/hosts", get(list_hosts).post(create_host))
+            .route("/admin/api/hosts/{id}", axum::routing::put(update_host).delete(delete_host))
+            .route("/admin/api/hosts/{id}/sync", post(sync_host))
+            .route("/admin/api/hosts/{id}/slots", get(host_slots))
+            .route("/admin/api/hosts/{id}/slots/{slot}/kill", post(kill_slot))
+            .route("/admin/api/vms", get(list_vms).post(create_vm))
+            .route("/admin/api/vms/deploy", post(deploy_all))
+            .route("/admin/api/vms/{id}", axum::routing::delete(delete_vm))
+            .route("/admin/api/vms/{id}/deploy", post(deploy_vm))
+            .route("/admin/api/vms/{id}/slots", axum::routing::put(put_vm_slots))
+            .route("/admin/api/vms/{id}/stop", post(stop_vm))
+            .route("/admin/api/vms/{id}/start", post(start_vm))
+            .route("/admin/api/accounts/{id}/connected-logins", axum::routing::put(put_account_connected_logins))
+            .route("/admin/api/accounts/{id}/mfa", axum::routing::delete(reset_account_mfa))
+            .route("/admin/api/routing", get(get_routing).put(put_routing))
+            .route("/admin/api/models", get(get_models).put(put_models))
+            .route("/admin/api/models/available", get(available_models))
+            .route("/admin/api/features", get(get_features).put(put_features))
+            .route("/admin/api/accounts", get(list_accounts))
+            .route("/admin/api/waitlist", get(list_waitlist))
+            .route("/admin/api/waitlist/invite", post(invite_signup))
+            .route("/admin/api/waitlist/{id}/approve", post(approve_waitlist))
+            .route("/admin/api/waitlist/{id}/decline", post(decline_waitlist))
+            .route("/admin/api/accounts/{id}/kinds", axum::routing::put(put_account_kinds))
+            .route("/admin/api/accounts/{id}/rate", axum::routing::put(put_account_rate))
+            .route("/admin/api/executions", get(recent_executions))
+            .route("/admin/api/executions/{id}/log", get(execution_log))
+            .route("/admin/api/route-log", get(route_log))
+                .route_layer(middleware::from_fn_with_state(state.clone(), signed_in)),
+        )
         .layer(middleware::from_fn(harden_headers))
         .with_state(state)
 }
@@ -111,6 +124,15 @@ async fn harden_headers(req: Request<Body>, next: Next) -> Response {
 fn token_from(headers: &HeaderMap) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")).map(str::to_string))
+}
+
+/// The gate on every protected admin route: a live operator session, or 401
+/// before anything else happens.
+async fn signed_in(State(state): State<Admin>, req: Request<Body>, next: Next) -> Response {
+    if require(&state, req.headers()).await.is_err() {
+        return ApiError(StatusCode::UNAUTHORIZED, "sign in".into()).into_response();
+    }
+    next.run(req).await
 }
 
 async fn require(state: &Admin, headers: &HeaderMap) -> Result<String, ApiError> {
@@ -787,6 +809,11 @@ async fn put_models(State(state): State<Admin>, headers: HeaderMap, Json(body): 
         if !value.is_empty() {
             if let Err(why) = crate::llm::parse_model_id(value).and_then(|engine| match engine {
                 crate::llm::Engine::Direct { .. } => crate::llm::for_model(value).map(|_| ()),
+                // Outreach is one call from the website; the Cursor CLI cannot
+                // answer it, so a Cursor id there would switch drafting off.
+                crate::llm::Engine::Cursor { .. } if stage == "outreach" => {
+                    Err(format!("{value} is a Cursor model; outreach needs a provider model (provider:model)"))
+                }
                 crate::llm::Engine::Cursor { .. } => Ok(()),
             }) {
                 return Err(ApiError(StatusCode::BAD_REQUEST, why));
@@ -899,7 +926,7 @@ async fn put_features(State(state): State<Admin>, headers: HeaderMap, Json(body)
 async fn list_accounts(State(state): State<Admin>, headers: HeaderMap, Query(q): Query<LogQuery>) -> Result<Json<Value>, ApiError> {
     require(&state, &headers).await?;
     let rows = store::list_accounts_brief(&state.db, q.limit.clamp(1, 1000)).await.map_err(internal)?;
-    Ok(Json(json!({ "accounts": rows })))
+    Ok(Json(json!({ "accounts": rows, "default_usd_per_mtoken": crate::config::sell_usd_per_mtoken() })))
 }
 
 /// One account's own list. Empty puts them back on the installation default,
@@ -916,6 +943,38 @@ async fn put_account_kinds(
     store::set_account_kinds(&state.db, id, &kinds.join(",")).await.map_err(internal)?;
     tracing::info!(operator = %who, account = id, kinds = %kinds.join(","), "account kinds updated");
     Ok(Json(json!({ "ok": true, "kinds": kinds })))
+}
+
+#[derive(Deserialize)]
+struct RateReq {
+    /// USD per million billable tokens; `null` returns the account to the
+    /// installation's rate.
+    usd_per_mtoken: Option<f64>,
+}
+
+/// What one account (a workspace, so everyone working in it) is charged per
+/// million tokens. Applies to tokens billed from now on.
+async fn put_account_rate(
+    State(state): State<Admin>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<RateReq>,
+) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    if let Some(r) = body.usd_per_mtoken {
+        // Zero would make runs free and a typo of 5000 would drain a wallet in
+        // one call; both are refused rather than saved.
+        if !r.is_finite() || r <= 0.0 || r > 1000.0 {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "the rate must be more than $0 and at most $1,000 per million tokens".into()));
+        }
+    }
+    let rate = body.usd_per_mtoken.map(|r| (r * 10_000.0).round() / 10_000.0);
+    if !store::set_sell_rate(&state.db, id, rate).await.map_err(internal)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such account".into()));
+    }
+    let effective = store::effective_sell_rate(rate);
+    tracing::info!(operator = %who, account = id, rate = ?rate, effective, "account token rate changed");
+    Ok(Json(json!({ "ok": true, "sell_usd_per_mtoken": rate, "effective_usd_per_mtoken": effective })))
 }
 
 #[derive(Deserialize)]
@@ -936,6 +995,84 @@ async fn reset_account_mfa(State(state): State<Admin>, headers: HeaderMap, Path(
     let acc = store::get_account(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
     crate::identity::disable_mfa(&acc.email, acc.account_id, &state.db).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     tracing::info!("two-factor reset for account {} by operator {who}", acc.account_id);
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---- waitlist & invitations ---------------------------------------------------
+//
+// Huntwell is invite-only (`config::open_signup`). People ask to join from the
+// sign-up page and land here; an operator invites them — or anyone else, by
+// address — and they get an email with a single-use link bound to that
+// address. Only the token's hash is stored, so the link is shown to the
+// operator once, in the response, to copy if the email does not arrive.
+
+async fn list_waitlist(State(state): State<Admin>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    require(&state, &headers).await?;
+    let rows = store::list_waitlist(&state.db, 500).await.map_err(internal)?;
+    Ok(Json(json!({ "rows": rows, "open_signup": crate::config::open_signup() })))
+}
+
+#[derive(Deserialize)]
+struct InviteReq {
+    email: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// Issue a fresh invitation to `email` — replacing any earlier link — and
+/// queue the email. Shared by "Invite someone", Approve and Resend.
+async fn send_signup_invite(state: &Admin, who: &str, email: &str, name: &str) -> Result<Json<Value>, ApiError> {
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
+    let email = email.trim().to_lowercase();
+    if email.len() < 3 || !email.contains('@') || email.contains(char::is_whitespace) || email.len() > 320 {
+        return Err(bad("a valid email address is required"));
+    }
+    let name = name.trim();
+    if name.chars().count() > 80 || name.chars().any(char::is_control) {
+        return Err(bad("the name must be under 80 characters, on one line"));
+    }
+    // Without the website's address there is nothing to link to; say so
+    // rather than email someone a link that goes nowhere.
+    let base = crate::config::get("HUNTWELL_PUBLIC_URL")
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| bad("set HUNTWELL_PUBLIC_URL for the admin so invitation links know where the website is"))?;
+    let token = store::new_invite_token();
+    let row = store::invite_to_signup(&state.db, &email, name, who, &store::sha256_hex(&token), store::SIGNUP_INVITE_DAYS)
+        .await
+        .map_err(|e| ApiError(StatusCode::CONFLICT, format!("{e:#}")))?;
+    let link = format!("{base}/signup?invite={token}");
+    let msg = crate::mail::signup_invite(&row.name, &link, store::SIGNUP_INVITE_DAYS);
+    let emailed = match store::queue_mail(&state.db, None, &row.email, "signup_invite", &msg).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("invitation for {} not queued: {e:#}", row.email);
+            false
+        }
+    };
+    tracing::info!(operator = %who, email = %row.email, "sign-up invitation sent");
+    Ok(Json(json!({ "ok": true, "row": row, "link": link, "emailed": emailed })))
+}
+
+async fn invite_signup(State(state): State<Admin>, headers: HeaderMap, Json(req): Json<InviteReq>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    send_signup_invite(&state, &who, &req.email, &req.name).await
+}
+
+/// Approve someone off the waitlist — or resend an invitation, which is the
+/// same thing: a new link, and the old one stops working.
+async fn approve_waitlist(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let row = store::get_waitlist(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such request".into()))?;
+    send_signup_invite(&state, &who, &row.email, &row.name).await
+}
+
+async fn decline_waitlist(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    if !store::decline_waitlist(&state.db, id).await.map_err(internal)? {
+        return Err(ApiError(StatusCode::CONFLICT, "only a waiting or invited request can be declined".into()));
+    }
+    tracing::info!(operator = %who, waitlist = id, "waitlist request declined");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1008,7 +1145,7 @@ async fn recent_executions(State(state): State<Admin>, headers: HeaderMap, Query
 /// estimate can only use the scrape model's rate, so a run whose stages used
 /// different models is approximate by construction.
 fn execution_money(r: &store::AdminExecutionRow) -> Value {
-    let charged = store::tokens_to_usd_micros(r.input_tokens + r.output_tokens);
+    let charged = store::tokens_to_usd_micros_at(r.input_tokens + r.output_tokens, store::effective_sell_rate(r.sell_rate));
     let (cost, basis) = if r.cost_usd_micros > 0 {
         (Some(r.cost_usd_micros), "reported")
     } else {
@@ -1156,7 +1293,18 @@ mod money_tests {
             cache_write_tokens: 0,
             cost_usd_micros: reported,
             model_scrape: model.into(),
+            sell_rate: None,
         }
+    }
+
+    #[test]
+    fn an_account_rate_prices_its_own_runs() {
+        // 1M tokens at an account's own $8/M is $8.00, whatever the default.
+        let mut r = run(900_000, 100_000, 0, 1_200_000, "composer-2.5");
+        r.sell_rate = Some(8.0);
+        let v = execution_money(&r);
+        assert_eq!(v["charged_usd_micros"], 8_000_000);
+        assert_eq!(v["profit_usd_micros"], 6_800_000);
     }
 
     #[test]

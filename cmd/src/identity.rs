@@ -71,7 +71,9 @@ pub async fn delete_user(email: &str) -> Result<()> {
 /// What a sign-in came to once the password was right.
 #[derive(Debug, Clone)]
 pub enum SignIn {
-    Done { sub: String },
+    /// The password was enough. `access_token` is for `remember_access_token`,
+    /// which the caller does only once it has checked `sub` is this account.
+    Done { sub: String, access_token: String },
     /// Present a TOTP code next. `challenge` is opaque; it comes back with it.
     MfaRequired { challenge: String },
 }
@@ -114,22 +116,49 @@ fn access_token_for(account_id: i64) -> Option<String> {
         .map(|(t, _)| t.clone())
 }
 
+/// Second-factor challenges this process handed out, by the SHA-256 of the
+/// challenge, to the account whose password earned them. The challenge a
+/// browser brings back is looked up here — it names nobody by itself. Taking
+/// the account from the request instead once let anyone with their own
+/// authenticator finish their own challenge and be handed a session for any
+/// address they typed. Five minutes, Cognito's own limit for the session.
+static PENDING_MFA: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (i64, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
+const MFA_CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn pending_mfa() -> &'static std::sync::Mutex<std::collections::HashMap<String, (i64, std::time::Instant)>> {
+    PENDING_MFA.get_or_init(Default::default)
+}
+
+fn challenge_key(challenge: &str) -> String {
+    crate::store::sha256_hex(challenge)
+}
+
 /// Sign in for real: password, then possibly a second factor.
 pub async fn sign_in(email: &str, password: &str, account_id: i64) -> Result<SignIn> {
     match crate::cognito::sign_in_full(email, password).await? {
-        crate::cognito::SignIn::Done { sub, access_token } => {
-            remember_access_token(account_id, &access_token);
-            Ok(SignIn::Done { sub })
-        }
+        crate::cognito::SignIn::Done { sub, access_token } => Ok(SignIn::Done { sub, access_token }),
         crate::cognito::SignIn::MfaRequired { session, username } => {
             // Both halves travel together; the answer needs the echoed name.
-            Ok(SignIn::MfaRequired { challenge: format!("{username}\n{session}") })
+            let challenge = format!("{username}\n{session}");
+            let mut map = pending_mfa().lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, (_, at)| at.elapsed() < MFA_CHALLENGE_TTL);
+            map.insert(challenge_key(&challenge), (account_id, std::time::Instant::now()));
+            Ok(SignIn::MfaRequired { challenge })
         }
     }
 }
 
+/// Which account a challenge was issued to, if it was issued here and is live.
+pub fn mfa_challenge_account(challenge: &str) -> Option<i64> {
+    let map = pending_mfa().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&challenge_key(challenge)).filter(|(_, at)| at.elapsed() < MFA_CHALLENGE_TTL).map(|(id, _)| *id)
+}
+
 /// Answer the second factor. Returns the subject on success.
-pub async fn answer_mfa(account_id: i64, challenge: &str, code: &str) -> Result<String> {
+/// Returns the subject and access token on success; the caller checks the
+/// subject is the account's before remembering the token or starting a session.
+pub async fn answer_mfa(challenge: &str, code: &str) -> Result<(String, String)> {
     let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     if code.len() != 6 {
         return Err(anyhow!("the code is six digits"));
@@ -137,8 +166,9 @@ pub async fn answer_mfa(account_id: i64, challenge: &str, code: &str) -> Result<
     let (username, session) = challenge.split_once('\n').ok_or_else(|| anyhow!("that sign-in took too long — start again"))?;
     match crate::cognito::respond_to_mfa(username, &code, session).await? {
         crate::cognito::SignIn::Done { sub, access_token } => {
-            remember_access_token(account_id, &access_token);
-            Ok(sub)
+            // Spent: a challenge answers once.
+            pending_mfa().lock().unwrap_or_else(|e| e.into_inner()).remove(&challenge_key(challenge));
+            Ok((sub, access_token))
         }
         crate::cognito::SignIn::MfaRequired { .. } => Err(anyhow!("that code is not right — try the next one your app shows")),
     }

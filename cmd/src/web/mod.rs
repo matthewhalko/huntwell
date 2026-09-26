@@ -6,9 +6,12 @@ pub mod auth;
 pub mod billing;
 pub mod dispatch;
 pub mod public_api;
+pub mod signing;
 pub mod download;
 pub mod runner;
 pub mod scheduler;
+pub mod seo;
+pub mod outreach;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, Request, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -178,6 +181,8 @@ async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
         .nest("/v1", public_api::router())
         .nest("/dl", download::router())
         .route("/healthz", get(|| async { "ok" }))
+        .route("/robots.txt", get(seo::robots))
+        .route("/sitemap.xml", get(seo::sitemap))
         .fallback(get(static_handler))
         .layer(middleware::from_fn_with_state(state.clone(), harden_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -220,7 +225,7 @@ async fn harden_headers(State(state): State<App>, req: Request<Body>, next: Next
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self' https://challenges.cloudflare.com https://js.stripe.com https://*.js.stripe.com; \
              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https://*.stripe.com; \
+             font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https://*.stripe.com; \
              connect-src 'self' https://api.stripe.com; \
              frame-src https://challenges.cloudflare.com https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
@@ -232,13 +237,38 @@ async fn harden_headers(State(state): State<App>, req: Request<Body>, next: Next
 }
 
 /// Serves the embedded UI, falling back to index.html for client-side routes.
-async fn static_handler(uri: Uri) -> Response {
+/// Every index.html — the home page and each client-side route — goes out with
+/// the head `seo` writes for that path.
+async fn static_handler(uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-    match Assets::get(path) {
-        Some(file) => asset_response(path, file.data.into_owned()),
+    let file_path = if path.is_empty() { "index.html" } else { path };
+    let index = |data: std::borrow::Cow<'static, [u8]>| {
+        let html = String::from_utf8_lossy(&data);
+        match seo::route(uri.path()) {
+            seo::Route::Redirect(to) => {
+                let to = match uri.query() {
+                    Some(q) => format!("{to}?{q}"),
+                    None => to,
+                };
+                (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, to)]).into_response()
+            }
+            route => {
+                let page = seo::render_index(&html, uri.path(), &seo::base_url(&headers));
+                let mut res = asset_response("index.html", page.into_bytes());
+                // Still the app — a person following a dead link lands on the
+                // site — but a 404 to a crawler, not a copy of the home page.
+                if matches!(route, seo::Route::NotFound) {
+                    *res.status_mut() = StatusCode::NOT_FOUND;
+                }
+                res
+            }
+        }
+    };
+    match Assets::get(file_path) {
+        Some(file) if file_path == "index.html" => index(file.data),
+        Some(file) => asset_response(file_path, file.data.into_owned()),
         None => match Assets::get("index.html") {
-            Some(file) => asset_response("index.html", file.data.into_owned()),
+            Some(file) => index(file.data),
             None => (
                 StatusCode::NOT_FOUND,
                 "UI bundle not built — run `npm run build` in UI/web (or ./dev.sh) and rebuild",

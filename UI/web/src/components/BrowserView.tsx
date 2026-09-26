@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { ModalBackdrop } from './ui'
 
 /// Watching the browser a run is driving.
 ///
@@ -10,7 +11,6 @@ import React, { useEffect, useRef, useState } from 'react'
 export default function BrowserView({ id, onClose }: { id: string; onClose: () => void }) {
   const [src, setSrc] = useState('')
   const [error, setError] = useState('')
-  const [paused, setPaused] = useState(false)
   // Kept so a new frame replaces the old one only once it has loaded, which is
   // what stops the view flickering white between polls.
   const objectUrl = useRef('')
@@ -39,14 +39,14 @@ export default function BrowserView({ id, onClose }: { id: string; onClose: () =
       if (live) timer = window.setTimeout(tick, 1500)
     }
 
-    if (!paused) tick()
+    tick()
     return () => {
       live = false
       if (timer) window.clearTimeout(timer)
       if (objectUrl.current) URL.revokeObjectURL(objectUrl.current)
       objectUrl.current = ''
     }
-  }, [id, paused])
+  }, [id])
 
   // Escape closes, the way every other overlay in the app does.
   useEffect(() => {
@@ -56,21 +56,16 @@ export default function BrowserView({ id, onClose }: { id: string; onClose: () =
   }, [onClose])
 
   return (
-    <div className="modal-bg" onClick={onClose}>
+    <ModalBackdrop onClick={onClose}>
       <div className="modal browser-view" onClick={(e) => e.stopPropagation()}>
         <div className="row browser-view-head">
           <div>
             <b>Live browser</b>
             <span className="muted"> — what this run is looking at right now</span>
           </div>
-          <div className="row" style={{ gap: '0.5rem' }}>
-            <button className="btn sm" onClick={() => setPaused((p) => !p)}>
-              {paused ? '▷ Resume' : '❚❚ Pause'}
-            </button>
-            <button className="btn sm" onClick={onClose}>
-              Close
-            </button>
-          </div>
+          <button className="btn sm" onClick={onClose}>
+            Close
+          </button>
         </div>
         <div className="browser-view-frame">
           {src ? (
@@ -80,10 +75,7 @@ export default function BrowserView({ id, onClose }: { id: string; onClose: () =
           )}
           {src && error && <div className="browser-view-note">{error}</div>}
         </div>
-        <div className="muted browser-view-foot">
-          View only — the run is driving. {paused ? 'Paused.' : 'Updating every couple of seconds.'}
-        </div>
       </div>
-    </div>
+    </ModalBackdrop>
   )
 }

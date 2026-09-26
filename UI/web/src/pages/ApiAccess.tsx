@@ -1,11 +1,15 @@
 import { Link } from 'react-router-dom'
 import React, { useEffect, useState } from 'react'
-import { ago, api, ApiKey, fmtDate, PlanSummary } from '../api'
-import { Badge, Copy, Empty, Field, Modal, useConfirm, useToast } from '../components/ui'
+import { ago, api, ApiKey, can, fmtDate, PlanSummary } from '../api'
+import { useAuth } from '../auth'
+import { Badge, Copy, Empty, Field, Loading, Modal, useConfirm, useToast } from '../components/ui'
+import { Picker } from '../components/Picker'
 
 export default function ApiAccess() {
-  const [keys, setKeys] = useState<ApiKey[]>([])
-  const [audit, setAudit] = useState<any[]>([])
+  const { me } = useAuth()
+  const makeKeys = can(me, 'keys')
+  const [keys, setKeys] = useState<ApiKey[] | null>(null)
+  const [audit, setAudit] = useState<any[] | null>(null)
   const [plans, setPlans] = useState<PlanSummary[]>([])
   const [creating, setCreating] = useState(false)
   const [fresh, setFresh] = useState<ApiKey | null>(null)
@@ -33,9 +37,11 @@ export default function ApiAccess() {
           <Link to="/app/api-docs" className="btn">
             API reference →
           </Link>
-          <button className="btn primary" onClick={() => setCreating(true)}>
-            + New key
-          </button>
+          {makeKeys && (
+            <button className="btn primary" onClick={() => setCreating(true)}>
+              + New key
+            </button>
+          )}
         </div>
       </div>
 
@@ -46,7 +52,9 @@ export default function ApiAccess() {
         </div>
       </div>
 
-      {keys.length === 0 ? (
+      {keys === null ? (
+        <Loading />
+      ) : keys.length === 0 ? (
         <Empty title="No keys yet">A key is shown once, at creation. Scope it to one plan, give it an expiry, pin it to an address.</Empty>
       ) : (
         <div className="card pad0 table-wrap">
@@ -125,7 +133,9 @@ export default function ApiAccess() {
       )}
 
       <h2 style={{ marginTop: '2rem' }}>Recent access</h2>
-      {audit.length === 0 ? (
+      {audit === null ? (
+        <Loading />
+      ) : audit.length === 0 ? (
         <p className="muted">No download attempts recorded.</p>
       ) : (
         <div className="card pad0 table-wrap">
@@ -169,8 +179,26 @@ export default function ApiAccess() {
       )}
       {fresh && (
         <Modal title="Your new key" onClose={() => setFresh(null)}>
-          <p className="notice">This is the only time the key is shown. Copy it now.</p>
+          <p className="notice">
+            This is the only time these are shown. Copy them now — neither can be recovered later.
+          </p>
+          <p className="muted" style={{ margin: '0.6rem 0 0.3rem' }}>
+            Key — identifies you, and travels with every request
+          </p>
           <Copy text={fresh.token} />
+          {fresh.secret && (
+            <>
+              <p className="muted" style={{ margin: '1rem 0 0.3rem' }}>
+                Secret — signs your requests, and should never leave your server
+              </p>
+              <Copy text={fresh.secret} />
+              <p className="muted" style={{ fontSize: '0.82rem', marginTop: '0.4rem' }}>
+                Send <code>X-HW-KEY</code>, <code>X-HW-TS</code>, <code>X-HW-NONCE</code> and <code>X-HW-SIGN</code> — the
+                signature covers the body too. See the{' '}
+                <Link to="/app/api-docs">API documentation</Link> for a working example.
+              </p>
+            </>
+          )}
           <p className="muted" style={{ margin: '1rem 0 0.3rem' }}>
             Download URL
           </p>
@@ -196,20 +224,17 @@ function CreateKey({ plans, onClose, onCreated }: { plans: PlanSummary[]; onClos
     }
   }
   return (
-    <Modal title="New API key" onClose={onClose}>
+    <Modal title="New API key" onClose={onClose} className="key-create">
       {err && <div className="error">{err}</div>}
       <Field label="Label">
         <input type="text" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="nightly CRM import" autoFocus />
       </Field>
       <Field label="Scope">
-        <select value={planId} onChange={(e) => setPlanId(e.target.value ? Number(e.target.value) : '')}>
-          <option value="">Every plan</option>
-          {plans.map((p) => (
-            <option key={p.PlanId} value={p.PlanId}>
-              {p.Source}
-            </option>
-          ))}
-        </select>
+        <Picker
+          value={planId === '' ? '' : String(planId)}
+          onChange={(v) => setPlanId(v ? Number(v) : '')}
+          options={[{ value: '', label: 'Every plan' }, ...plans.map((p) => ({ value: String(p.PlanId), label: p.Source }))]}
+        />
       </Field>
       <Field label="Expires in (days)" hint="0 = never">
         <input type="number" min={0} value={days} onChange={(e) => setDays(+e.target.value)} />

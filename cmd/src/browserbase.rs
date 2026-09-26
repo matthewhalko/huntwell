@@ -200,13 +200,38 @@ async fn live_view_url(key: &str, id: &str) -> Option<String> {
 /// The CDP endpoint of a session by id, for Huntwell's own live viewer.
 ///
 /// The session was created by a worker; the website serves the viewer, so it
-/// builds the endpoint from the id rather than sharing the worker's handle.
-pub fn connect_url_for(session_id: &str) -> Option<String> {
+/// asks Browserbase for that session's own `connectUrl`. Building one from the
+/// id (`wss://connect.browserbase.com?apiKey=…&sessionId=…`) is refused with a
+/// 400: sessions live on a regional host (`connect.usw2…`) behind a signed URL.
+/// That was every live view saying "the browser is not answering".
+///
+/// Cached per session while it is live — the viewer polls every couple of
+/// seconds, and the URL does not change for the session's life.
+pub async fn connect_url_for(session_id: &str) -> Option<String> {
+    const KEEP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((url, at)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(session_id) {
+        if at.elapsed() < KEEP {
+            return Some(url.clone());
+        }
+    }
     let key = api_key()?;
-    let base = crate::config::get("BROWSERBASE_CONNECT_URL")
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "wss://connect.browserbase.com".to_string());
-    Some(format!("{}?apiKey={}&sessionId={}", base.trim_end_matches('/'), key, session_id))
+    let resp = client().ok()?.get(format!("{API}/sessions/{session_id}")).header("X-BB-API-Key", key).send().await.ok()?;
+    if !resp.status().is_success() {
+        tracing::warn!(session = session_id, status = %resp.status(), "browserbase would not describe the session");
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    if v.get("status").and_then(Value::as_str).is_some_and(|s| s != "RUNNING") {
+        return None;
+    }
+    let url = v.get("connectUrl").and_then(Value::as_str)?.to_string();
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, (_, at)| at.elapsed() < KEEP);
+    map.insert(session_id.to_string(), (url.clone(), std::time::Instant::now()));
+    Some(url)
 }
 
 /// A viewing URL for a session someone owns.
@@ -352,5 +377,53 @@ mod tests {
         assert!(!selected_from(None, false));
         assert!(!selected_from(Some("local"), true));
         assert!(!selected_from(Some("chrome"), true));
+    }
+}
+
+#[cfg(test)]
+mod live_view_probe {
+    /// Holds a session open on a real page for a minute, for an end-to-end
+    /// check of the viewer through the web API: prints `SESSION <id>` and waits.
+    #[tokio::test]
+    #[ignore]
+    async fn hold_a_session_for_the_viewer() {
+        super::start(0, None).await.expect("session");
+        let id = super::session_id().unwrap();
+        let url = super::connect_url().unwrap();
+        let mut run = crate::direct::cdp::Cdp::connect(&url).await.expect("run connects");
+        run.navigate("https://example.com/", std::time::Duration::from_secs(10)).await.expect("navigate");
+        println!("SESSION {id}");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(run);
+        super::stop().await;
+    }
+
+    /// The live viewer's path against a real session, while a run holds its
+    /// own connection. Spends a few cents of Browserbase:
+    /// `cargo test --lib live_view_probe -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_second_connection_can_take_a_frame() {
+        super::start(0, None).await.expect("session");
+        let id = super::session_id().unwrap();
+        let url = super::connect_url().unwrap();
+        println!("session {id}\nrun connect url host: {}", url.split('?').next().unwrap_or(""));
+        let mut run = crate::direct::cdp::Cdp::connect(&url).await.expect("run connects");
+        run.navigate("https://example.com/", std::time::Duration::from_secs(10)).await.expect("navigate");
+        println!("run is on {}", run.url().await);
+        let viewer = super::connect_url_for(&id).await.expect("the session's own connect url");
+        for attempt in 1..=2 {
+            let t = std::time::Instant::now();
+            let jpeg = crate::direct::cdp::screenshot(&viewer).await.expect("the viewer takes a frame");
+            println!("attempt {attempt}: frame {} bytes in {:?}", jpeg.len(), t.elapsed());
+        }
+        // Via the run's own connect URL, for comparison.
+        let t = std::time::Instant::now();
+        match crate::direct::cdp::screenshot(&url).await {
+            Ok(jpeg) => println!("via run url: frame {} bytes in {:?}", jpeg.len(), t.elapsed()),
+            Err(e) => println!("via run url: FAILED in {:?}: {e:#}", t.elapsed()),
+        }
+        drop(run);
+        super::stop().await;
     }
 }

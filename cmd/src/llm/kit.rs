@@ -13,9 +13,11 @@ use serde_json::Value;
 
 use super::LlmError;
 
-/// Long: a model reading a large page can think for a while, and a timeout
-/// here throws away everything the call had done.
-const TIMEOUT: Duration = Duration::from_secs(300);
+/// Long, because a model reading a large page thinks for a while and a timeout
+/// throws away everything the call had done — but not so long that a hung
+/// request looks like a working one. Five minutes, times four attempts, meant
+/// a stage could sit for twenty with nothing on screen.
+const TIMEOUT: Duration = Duration::from_secs(150);
 
 /// In-flight calls per provider, per process. A worker VM runs several plan
 /// slots; without a cap they arrive at one provider together and all get 429.
@@ -116,6 +118,7 @@ pub async fn post_json(
 }
 
 async fn try_once(provider: &'static str, url: &str, headers: &[(&'static str, String)], body: &Value) -> Result<Value, LlmError> {
+    let started = std::time::Instant::now();
     let mut req = client().post(url).json(body);
     for (name, value) in headers {
         req = req.header(*name, value);
@@ -135,6 +138,9 @@ async fn try_once(provider: &'static str, url: &str, headers: &[(&'static str, S
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs);
     let text = resp.text().await.unwrap_or_default();
+    if started.elapsed() > Duration::from_secs(60) {
+        tracing::warn!("{provider}: that call took {:.0}s", started.elapsed().as_secs_f32());
+    }
     if status.is_success() {
         return serde_json::from_str(&text).map_err(|e| {
             tracing::error!("{provider}: unparseable reply ({e}): {}", snippet(&text));

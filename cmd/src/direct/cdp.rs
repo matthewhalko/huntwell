@@ -42,7 +42,8 @@ impl Cdp {
         let ws_url = websocket_url(endpoint).await?;
         let (socket, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
-            .with_context(|| format!("connect to the browser at {}", crate::guard::safe_for_log(&ws_url, 80)))?;
+            // Host only: the query carries a signing key or an API key.
+            .with_context(|| format!("connect to the browser at {}", crate::guard::safe_for_log(ws_url.split('?').next().unwrap_or(""), 80)))?;
         let mut cdp = Cdp { socket, next_id: AtomicU64::new(1), session: String::new() };
         cdp.attach_to_a_page().await?;
         Ok(cdp)
@@ -53,12 +54,7 @@ impl Cdp {
     /// opening another.
     async fn attach_to_a_page(&mut self) -> Result<()> {
         let targets = self.call_raw("Target.getTargets", json!({})).await?;
-        let page = targets["targetInfos"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|t| t["type"] == "page" && t["url"].as_str().is_some_and(|u| !u.starts_with("devtools://")))
-            .and_then(|t| t["targetId"].as_str().map(str::to_string));
+        let page = pick_page(targets["targetInfos"].as_array().map(Vec::as_slice).unwrap_or(&[]));
         let target_id = match page {
             Some(id) => id,
             // A browser with no page yet (a fresh session): make one.
@@ -217,6 +213,26 @@ impl Cdp {
     }
 }
 
+/// The tab worth attaching to. A browser a run has been using can hold several:
+/// the one it is reading, a blank tab from its first connect, one a site
+/// opened. Best is the one someone is already attached to (the run itself)
+/// showing a real page, then any real page, then any page at all — so the live
+/// viewer shows what the run is reading rather than whichever tab came first.
+fn pick_page(targets: &[Value]) -> Option<String> {
+    let pages: Vec<&Value> = targets
+        .iter()
+        .filter(|t| t["type"] == "page" && t["url"].as_str().is_some_and(|u| !u.starts_with("devtools://")))
+        .collect();
+    let real = |t: &&&Value| t["url"].as_str().is_some_and(|u| u.starts_with("http"));
+    let attached = |t: &&&Value| t["attached"].as_bool().unwrap_or(false);
+    pages
+        .iter()
+        .find(|t| attached(t) && real(t))
+        .or_else(|| pages.iter().find(real))
+        .or_else(|| pages.first())
+        .and_then(|t| t["targetId"].as_str().map(str::to_string))
+}
+
 /// One JPEG of whatever that browser is showing.
 ///
 /// Opens its own connection and closes it with the returned frame: the run
@@ -279,6 +295,21 @@ async fn websocket_url(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_viewer_prefers_the_tab_the_run_is_reading() {
+        let t = |id: &str, url: &str, attached: bool| json!({ "targetId": id, "type": "page", "url": url, "attached": attached });
+        let tabs = vec![
+            t("blank", "about:blank", false),
+            t("other", "https://ads.example/", false),
+            t("run", "https://listings.example/p/2", true),
+            json!({ "targetId": "dev", "type": "page", "url": "devtools://x", "attached": true }),
+        ];
+        assert_eq!(pick_page(&tabs).as_deref(), Some("run"));
+        assert_eq!(pick_page(&tabs[..2]).as_deref(), Some("other"), "a real page beats a blank one");
+        assert_eq!(pick_page(&tabs[..1]).as_deref(), Some("blank"));
+        assert_eq!(pick_page(&[]), None);
+    }
 
     #[test]
     fn only_the_keys_a_scrape_needs_are_sent() {

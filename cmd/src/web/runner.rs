@@ -21,9 +21,30 @@ pub struct ActiveRun {
 
 /// A DevTools port per account: runs of one account share a Chrome (the
 /// second adopts the first's), and two accounts never share cookies.
+///
+/// `base + account_id`, with no wrap-around while it fits: a Chrome already
+/// listening on the port is adopted as-is (`browser::start_for_run`), so two
+/// accounts on one port would share one browser and its signed-in sessions.
+/// The old `% 2000` did exactly that for accounts 2000 apart. Past the top of
+/// the port range it has to wrap; that is tens of thousands of accounts away,
+/// and runs there use Browserbase, which has no local port.
 pub fn cdp_port_for(account_id: i64) -> u16 {
     let base = crate::config::cdp_port_base() as i64;
-    (base + (account_id % 2000)).clamp(1024, 65535) as u16
+    let port = base + account_id.max(0);
+    if port <= 65535 {
+        return port as u16;
+    }
+    let span = (65535 - base).max(1);
+    (base + account_id.rem_euclid(span)) as u16
+}
+
+#[cfg(test)]
+mod port_tests {
+    #[test]
+    fn accounts_2000_apart_get_different_browsers() {
+        assert_ne!(super::cdp_port_for(17), super::cdp_port_for(2017));
+        assert_eq!(super::cdp_port_for(17), super::cdp_port_for(17));
+    }
 }
 
 /// Creates the Run row and starts the child. Refuses a second concurrent run

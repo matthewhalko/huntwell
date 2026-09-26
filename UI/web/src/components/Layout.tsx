@@ -58,6 +58,16 @@ const links = [
     ),
   },
   {
+    to: '/app/outreach',
+    label: 'Outreach',
+    ico: (
+      <Ico>
+        <path d="M22 2 11 13" />
+        <path d="M22 2 15 22l-4-9-9-4z" />
+      </Ico>
+    ),
+  },
+  {
     to: '/app/usage',
     label: 'Usage',
     ico: (

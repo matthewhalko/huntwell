@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { api, AuthConfig } from '../api'
+import { api, AuthConfig, InvitationInfo } from '../api'
 import { useAuth } from '../auth'
 import { Field } from '../components/ui'
 import { ArtBackdrop } from '../components/ArtBackdrop'
@@ -37,7 +37,7 @@ function loadTurnstile(): Promise<void> {
 /// What the sign-in and sign-up forms need before anyone is signed in. `null`
 /// until it arrives, so the forms neither render a widget the server will not
 /// check nor submit before knowing whether one is required.
-function useAuthConfig(): AuthConfig | null {
+export function useAuthConfig(): AuthConfig | null {
   const [cfg, setCfg] = useState<AuthConfig | null>(null)
   useEffect(() => {
     let live = true
@@ -126,6 +126,9 @@ export function Login() {
   const [token, setToken] = useState('')
   const [resetKey, setResetKey] = useState(0)
   const needsChallenge = !!cfg?.turnstile_site_key
+  // Sent here from a teammate's invitation while signed out: someone new
+  // creates their account from that invitation instead.
+  const joinToken = typeof loc.state?.from === 'string' ? (loc.state.from.match(/^\/join\/([^/?#]+)$/)?.[1] ?? '') : ''
   // Set when the password was right and the account wants its second factor.
   const [mfa, setMfa] = useState<{ challenge: string; email: string } | null>(null)
   const [code, setCode] = useState('')
@@ -215,32 +218,72 @@ export function Login() {
         </button>
       </form>
       <p className="muted" style={{ marginTop: '1rem' }}>
-        New here? <Link to="/signup">Create an account</Link> · <Link to="/forgot">Forgot your password?</Link>
+        New here?{' '}
+        {joinToken ? (
+          <Link to={`/signup?invite=${encodeURIComponent(joinToken)}`}>Create an account to accept your invitation</Link>
+        ) : (
+          <Link to="/signup">{cfg?.invite_only ? 'Request access' : 'Create an account'}</Link>
+        )}{' '}
+        · <Link to="/forgot">Forgot your password?</Link>
       </p>
     </Shell>
   )
 }
 
+/// Sign-up. Huntwell is invite-only unless the server says otherwise: with an
+/// invitation link (`?invite=…`) this is the account form, its address fixed
+/// to the one invited; without one it asks to join the waitlist instead.
 export function Signup() {
-  const [email, setEmail] = useState('')
-  const [name, setName] = useState('')
+  const cfg = useAuthConfig()
+  const loc = useLocation()
+  const invite = new URLSearchParams(loc.search).get('invite')?.trim() || ''
+  const [info, setInfo] = useState<InvitationInfo | null>(null)
+  const [inviteErr, setInviteErr] = useState('')
+  useEffect(() => {
+    if (!invite) return
+    let live = true
+    api
+      .get<InvitationInfo>(`/api/auth/invite/${encodeURIComponent(invite)}`)
+      .then((i) => live && setInfo(i))
+      .catch((e) => live && setInviteErr(e.message || 'This invitation has expired or has already been used'))
+    return () => {
+      live = false
+    }
+  }, [invite])
+
+  if (!cfg || (invite && !info && !inviteErr)) {
+    return (
+      <Shell title="Create your account">
+        <p className="muted">Loading…</p>
+      </Shell>
+    )
+  }
+  if (info) return <SignupForm cfg={cfg} invite={invite} info={info} />
+  if (!cfg.invite_only) return <SignupForm cfg={cfg} />
+  return <WaitlistForm cfg={cfg} inviteErr={inviteErr} />
+}
+
+function SignupForm({ cfg, invite, info }: { cfg: AuthConfig; invite?: string; info?: InvitationInfo }) {
+  const [email, setEmail] = useState(info?.email || '')
+  const [name, setName] = useState(info?.kind === 'platform' ? info.name : '')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const { refresh } = useAuth()
   const nav = useNavigate()
-  const cfg = useAuthConfig()
   const [token, setToken] = useState('')
   const [resetKey, setResetKey] = useState(0)
-  const needsChallenge = !!cfg?.turnstile_site_key
+  const needsChallenge = !!cfg.turnstile_site_key
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
     setErr('')
     try {
-      await api.post('/api/auth/signup', { email, password, display_name: name, turnstile_token: token })
+      await api.post('/api/auth/signup', { email, password, display_name: name, turnstile_token: token, invite: invite || '' })
       await refresh()
-      nav('/app', { replace: true })
+      // A teammate's invitation is accepted on its own page, which says which
+      // workspace they are joining.
+      nav(info?.kind === 'team' && invite ? `/join/${encodeURIComponent(invite)}` : '/app', { replace: true })
     } catch (e: any) {
       setErr(e.message)
       if (needsChallenge) setResetKey((k) => k + 1)
@@ -249,20 +292,31 @@ export function Signup() {
     }
   }
   return (
-    <Shell title="Create your account">
+    <Shell title={info?.kind === 'team' ? `Join ${info.workspace}` : 'Create your account'}>
+      {info && (
+        <p className="muted" style={{ marginTop: '-0.4rem' }}>
+          {info.kind === 'team' ? (
+            <>
+              You were invited to <b>{info.workspace}</b>. Create your account to accept.
+            </>
+          ) : (
+            <>You're invited. Choose a password to finish setting up your account.</>
+          )}
+        </p>
+      )}
       <form onSubmit={submit}>
         {err && <div className="error">{err}</div>}
         <Field label="Your name">
           <input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus autoComplete="name" maxLength={80} />
         </Field>
-        <Field label="Email">
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
+        <Field label="Email" hint={info ? 'The invitation is for this address.' : undefined}>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required readOnly={!!info} />
         </Field>
         <Field label="Password" hint="At least 12 characters, with upper and lower case and a digit.">
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={12} />
         </Field>
-        {cfg?.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
-        <button className="btn primary" disabled={busy || !cfg || (needsChallenge && !token)} style={{ width: '100%' }}>
+        {cfg.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
+        <button className="btn primary" disabled={busy || (needsChallenge && !token)} style={{ width: '100%' }}>
           {busy ? 'Creating…' : 'Create account'}
         </button>
       </form>
@@ -273,6 +327,82 @@ export function Signup() {
       </p>
       <p className="muted" style={{ marginTop: '0.6rem' }}>
         Already have one? <Link to="/login">Sign in</Link>
+      </p>
+    </Shell>
+  )
+}
+
+/// Invite-only: ask to be let in. The answer is the same whether or not the
+/// address is already on the list (or already has an account), so this form
+/// tells nobody anything about who uses Huntwell.
+function WaitlistForm({ cfg, inviteErr }: { cfg: AuthConfig; inviteErr: string }) {
+  const [email, setEmail] = useState('')
+  const [name, setName] = useState('')
+  const [note, setNote] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [done, setDone] = useState(false)
+  const [token, setToken] = useState('')
+  const [resetKey, setResetKey] = useState(0)
+  const needsChallenge = !!cfg.turnstile_site_key
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    setErr('')
+    try {
+      await api.post('/api/auth/waitlist', { email, name, note, turnstile_token: token })
+      setDone(true)
+    } catch (e: any) {
+      setErr(e.message)
+      if (needsChallenge) setResetKey((k) => k + 1)
+    } finally {
+      setBusy(false)
+    }
+  }
+  if (done) {
+    return (
+      <Shell title="You're on the list">
+        <p className="muted">
+          Thanks{name.trim() ? `, ${name.trim()}` : ''}. We're letting people in a few at a time. If we can make room, we'll email{' '}
+          <b>{email.trim()}</b> an invitation with a link to create your account.
+        </p>
+        <p className="muted" style={{ marginTop: '1rem' }}>
+          <Link to="/">Back to Huntwell</Link>
+        </p>
+      </Shell>
+    )
+  }
+  return (
+    <Shell title="Request access">
+      {inviteErr ? (
+        <div className="notice" style={{ margin: '0 0 0.9rem' }}>
+          That invitation link didn't work — {inviteErr.replace(/^./, (c) => c.toLowerCase())}. Ask whoever sent it for a new one, or
+          request access below.
+        </div>
+      ) : (
+        <p className="muted" style={{ marginTop: '-0.4rem' }}>
+          Huntwell is invite-only for now. Join the waitlist and we'll email you if we can make room — we can't promise everyone a
+          place.
+        </p>
+      )}
+      <form onSubmit={submit}>
+        {err && <div className="error">{err}</div>}
+        <Field label="Your name">
+          <input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus autoComplete="name" maxLength={80} />
+        </Field>
+        <Field label="Email">
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required maxLength={320} />
+        </Field>
+        <Field label="What would you use Huntwell for?" hint="Optional, but it helps us decide.">
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3} maxLength={600} />
+        </Field>
+        {cfg.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
+        <button className="btn primary" disabled={busy || (needsChallenge && !token)} style={{ width: '100%' }}>
+          {busy ? 'Sending…' : 'Join the waitlist'}
+        </button>
+      </form>
+      <p className="muted" style={{ marginTop: '0.8rem' }}>
+        Have an account? <Link to="/login">Sign in</Link>
       </p>
     </Shell>
   )

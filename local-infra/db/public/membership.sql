@@ -20,3 +20,9 @@ CREATE TABLE IF NOT EXISTS public.membership (
 	PRIMARY KEY (workspace_id, member_id)
 );
 CREATE INDEX IF NOT EXISTS membership_member_idx ON public.membership (member_id);
+
+-- Caps a guest may have beyond their role: comma-separated tokens
+-- (readonly, plans, credits, keys). Empty means the role's defaults —
+-- members can create plans and keys; admins can also buy credits. The
+-- owner has no row and can do all of it. Role still decides who invites.
+ALTER TABLE public.membership ADD COLUMN IF NOT EXISTS permissions text NOT NULL DEFAULT '';

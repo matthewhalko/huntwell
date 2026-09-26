@@ -10,6 +10,11 @@
        sips -z 192 192 favicon-512.png --out ../public/favicon.png
        sips -z 180 180 favicon-512.png --out ../public/apple-touch-icon.png
        sips -z  32  32 favicon-512.png --out ../public/favicon-32.png
+       sips -z  48  48 favicon-512.png --out ../public/favicon-48.png   # Google's result icon
+       sips -z  96  96 favicon-512.png --out ../public/favicon-96.png
+       cp favicon-512.png ../public/icon-512.png                        # manifest + JSON-LD logo
+       for n in 16 32 48; do sips -z $n $n favicon-512.png --out fav-$n.png; done
+       python3 make-ico.py fav-16.png fav-32.png fav-48.png            # ../public/favicon.ico
        cp ../public/favicon.png ../../../cmd/assets/favicon.png   # the admin's
 
      The Slack workspace icon is the same page without the tile at 1024px. -->

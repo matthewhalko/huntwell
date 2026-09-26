@@ -1,14 +1,14 @@
 import React, { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { ago, api, FieldSpec, fmtDate, Plan, Run, scheduleLabel, usd } from '../api'
-import { Badge, Empty, Modal, Spinner, StatusBadge, useConfirm, useToast } from '../components/ui'
+import { ago, api, can, FieldSpec, fmtDate, fmtTokens, Plan, Run, scheduleLabel, fmtDuration } from '../api'
+import { useAuth } from '../auth'
+import { Badge, Empty, Loading, Modal, ModalBackdrop, Spinner, StatusBadge, useConfirm, useToast } from '../components/ui'
 import { CheckIcon, ClockIcon } from '../components/icons'
 import { SearchSeeds } from '../components/SearchSeeds'
 import { ArtifactTable } from '../components/ArtifactTable'
 import { KnowledgeGraph } from '../components/KnowledgeGraph'
 import { ReportView } from '../components/ReportView'
 import { AssetGrid } from '../components/AssetGrid'
-import { planHasCustomModels, PlanModels } from '../components/PlanModels'
 import { PlanSettings } from './PlanSettings'
 import { ProspectTable } from './Prospects'
 
@@ -25,6 +25,8 @@ export function parseSchema(json: string): FieldSpec[] {
 type Tab = 'overview' | 'results' | 'graph' | 'trail' | 'edit'
 
 export default function PlanDetail() {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const { id } = useParams()
   const nav = useNavigate()
   const toast = useToast()
@@ -33,12 +35,14 @@ export default function PlanDetail() {
   const [runs, setRuns] = useState<Run[]>([])
   const loc = useLocation()
   const locState = (loc.state || {}) as { tab?: Tab; welcome?: boolean }
-  const [tab, setTab] = useState<Tab>(locState.tab || 'overview')
+  const [tab, setTab] = useState<Tab>(locState.tab === 'edit' && !write ? 'overview' : locState.tab || 'overview')
   // 'first' is the just-created welcome; 'run' is the header button. Same
   // dialog, different copy, so the first visit makes Run now the obvious next
   // step rather than a control they have to notice.
   const [runModal, setRunModal] = useState<'first' | 'run' | null>(null)
-  const [advanced, setAdvanced] = useState(false)
+  useEffect(() => {
+    if (!write && tab === 'edit') setTab('overview')
+  }, [write, tab])
 
   const load = async () => {
     try {
@@ -76,7 +80,7 @@ export default function PlanDetail() {
     nav(loc.pathname, { replace: true, state: {} })
   }, [locState.welcome, plan?.Status, plan?.PlanId, loc.pathname, nav])
 
-  if (!plan) return <p className="muted">Loading…</p>
+  if (!plan) return <Loading />
   const active = runs.find((r) => r.status === 'running' || r.status === 'queued')
 
   const save = async (p: Plan) => {
@@ -130,32 +134,26 @@ export default function PlanDetail() {
             <Link to={`/app/executions/${active.execution_id}`} className="btn">
               <StatusBadge status="running" /> Watch execution #{active.execution_id}
             </Link>
-          ) : (
+          ) : write ? (
             <button className="btn primary" onClick={() => setRunModal('run')} disabled={plan.Status !== 'ready'}>
               ▶ Run now
             </button>
+          ) : null}
+          {write && (
+            <button className="btn" onClick={() => setTab('edit')}>
+              Edit
+            </button>
           )}
-          <button
-            className={'btn' + (advanced ? ' on' : '')}
-            type="button"
-            onClick={() => setAdvanced((v) => !v)}
-            aria-expanded={advanced}
-          >
-            Advanced{planHasCustomModels(plan) && !advanced ? ' · models' : ''}
-          </button>
-          <button className="btn" onClick={() => setTab('edit')}>
-            Edit
-          </button>
-          <button className="btn danger" type="button" onClick={remove}>
-            Delete
-          </button>
+          {write && (
+            <button className="btn danger" type="button" onClick={remove}>
+              Delete
+            </button>
+          )}
         </div>
       </div>
 
-      {advanced && <PlanModels plan={plan} onSaved={setPlan} />}
-
       <div className="tabs">
-        {(['overview', 'results', 'graph', 'trail', 'edit'] as Tab[]).map((t) => (
+        {(['overview', 'results', 'graph', 'trail', ...(write ? (['edit'] as Tab[]) : [])] as Tab[]).map((t) => (
           <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>
             {t[0].toUpperCase() + t.slice(1)}
           </button>
@@ -175,9 +173,11 @@ export default function PlanDetail() {
           <p className="muted" style={{ margin: '0.4rem 0 0.9rem' }}>
             The description may be too vague, or the agent was unavailable. Edit what you're looking for, or try again.
           </p>
-          <button className="btn primary" onClick={rebuild}>
-            Try again
-          </button>
+          {write && (
+            <button className="btn primary" onClick={rebuild}>
+              Try again
+            </button>
+          )}
         </div>
       )}
       {tab === 'overview' && plan.Status === 'ready' && <Overview runs={runs} />}
@@ -213,22 +213,26 @@ export default function PlanDetail() {
 /// effort, the schedule — is on the Edit tab, where it can be changed rather
 /// than only read back.
 function Overview({ runs }: { runs: Run[] }) {
-  return <RunsTab runs={runs} />
+  return <RunsTab runs={runs} inPlan />
 }
 
-export function RunsTab({ runs }: { runs: Run[] }) {
+/// The executions table. Across plans (History) each row names its plan;
+/// inside one plan the name is already the page title, so that column gives
+/// way to when each run finished and how long it took.
+export function RunsTab({ runs, loading, inPlan }: { runs: Run[]; loading?: boolean; inPlan?: boolean }) {
   const nav = useNavigate()
+  if (loading) return <Loading />
   if (!runs.length) return <Empty title="No executions yet" />
-  const spent = runs.reduce((a, r) => a + (r.cost_usd || 0), 0)
+  const tokens = runs.reduce((a, r) => a + (r.tokens || 0), 0)
   const found = runs.reduce((a, r) => a + (r.new_prospects || 0), 0)
   return (
     <>
       <div className="run-total">
         <span>
-          <b>{usd(spent)}</b> across {runs.length} execution{runs.length === 1 ? '' : 's'}
+          <b>{fmtTokens(tokens)}</b> tokens across {runs.length} execution{runs.length === 1 ? '' : 's'}
         </span>
         <span className="muted">
-          {found} found{found > 0 ? ` · ${usd(spent / found)} each` : ' · nothing yet'}
+          {found} found{found > 0 ? ` · ${fmtTokens(Math.round(tokens / found))} each` : ' · nothing yet'}
         </span>
       </div>
       <div className="card pad0 table-wrap">
@@ -236,19 +240,21 @@ export function RunsTab({ runs }: { runs: Run[] }) {
           <thead>
             <tr>
               <th>Execution</th>
-              <th>Plan</th>
+              {!inPlan && <th>Plan</th>}
               <th>Status</th>
               <th>Started</th>
+              {inPlan && <th>Finished</th>}
+              {inPlan && <th className="num">Duration</th>}
               <th className="num">Found</th>
-              <th className="num">Cost</th>
+              <th className="num">Tokens</th>
               <th className="num">Each</th>
             </tr>
           </thead>
           <tbody>
             {runs.map((r) => {
-              // A run that spent money and came back empty is the thing worth
+              // A run that spent tokens and came back empty is the thing worth
               // spotting, so it is said in words rather than left as a dash.
-              const barren = r.status === 'succeeded' && !r.new_prospects && (r.cost_usd || 0) > 0
+              const barren = r.status === 'succeeded' && !r.new_prospects && (r.tokens || 0) > 0
               return (
                 // The whole row opens the run. The link stays inside it so
                 // middle-click and "open in new tab" still work, and so the
@@ -263,16 +269,22 @@ export function RunsTab({ runs }: { runs: Run[] }) {
                       #{r.execution_id}
                     </Link>
                   </td>
-                  <td>{r.source}</td>
+                  {!inPlan && <td>{r.source}</td>}
                   <td>
                     <StatusBadge status={r.status} />
                   </td>
                   <td>{fmtDate(r.started_at)}</td>
+                  {inPlan && <td>{r.finished_at ? fmtDate(r.finished_at) : <span className="muted">{r.status === 'queued' ? 'waiting' : 'running'}</span>}</td>}
+                  {inPlan && (
+                    <td className="num">
+                      {r.status === 'queued' ? '—' : r.finished_at ? fmtDuration(r.started_at, r.finished_at) : <span className="muted">{fmtDuration(r.started_at)}</span>}
+                    </td>
+                  )}
                   <td className="num">{r.new_prospects}</td>
-                  <td className="num">{r.cost_usd ? usd(r.cost_usd) : '—'}</td>
+                  <td className="num">{r.tokens ? fmtTokens(r.tokens) : '—'}</td>
                   <td className="num">
-                    {r.cost_per_result != null ? (
-                      usd(r.cost_per_result)
+                    {r.new_prospects > 0 && r.tokens > 0 ? (
+                      fmtTokens(Math.round(r.tokens / r.new_prospects))
                     ) : barren ? (
                       <span className="danger">nothing found</span>
                     ) : (
@@ -295,7 +307,7 @@ function TrailTab({ planId }: { planId: number }) {
   useEffect(() => {
     load()
   }, [planId])
-  if (!t) return <p className="muted">Loading…</p>
+  if (!t) return <Loading />
   return (
     <div className="stack trail">
       <div className="two">
@@ -404,7 +416,7 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
   }
   if (first) {
     return (
-      <div className="modal-bg" onClick={onClose}>
+      <ModalBackdrop onClick={onClose}>
         <div className="modal plan-ready" onClick={(e) => e.stopPropagation()}>
           <button className="iconbtn plan-ready-close" type="button" onClick={onClose} aria-label="Close">
             ✕
@@ -423,7 +435,7 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
             </button>
           </div>
         </div>
-      </div>
+      </ModalBackdrop>
     )
   }
   return (

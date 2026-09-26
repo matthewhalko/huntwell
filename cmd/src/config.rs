@@ -464,8 +464,15 @@ pub fn bind_addr() -> String {
     get_or("HUNTWELL_ADDR", "127.0.0.1:8611")
 }
 
+/// Whether anyone may create an account. Off by default: Huntwell is
+/// invite-only, and a new account needs an invitation from the admin (or a
+/// teammate's invitation to their workspace). People without one join the
+/// waitlist instead. `HUNTWELL_OPEN_SIGNUP=1` opens it.
+///
+/// The very first account on a fresh server never needs one — see
+/// `web::auth::invite_only`.
 pub fn open_signup() -> bool {
-    !matches!(get("HUNTWELL_OPEN_SIGNUP").as_deref(), Some("0") | Some("false"))
+    matches!(get("HUNTWELL_OPEN_SIGNUP").as_deref().map(str::trim), Some("1" | "true" | "on"))
 }
 
 pub fn is_dev() -> bool {

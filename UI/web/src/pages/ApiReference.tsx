@@ -12,17 +12,17 @@ import { ApiDocs } from './ApiDocs'
  */
 export default function ApiReference() {
   return (
-    <>
+    <div className="docs-page">
       <div className="page-head">
         <div>
           <h1>API reference</h1>
-          <div className="sub">Everything Huntwell does, it does through this. Create a plan, run it, read what it found.</div>
+          <div className="sub">Signed JSON over HTTPS. Create a plan, run it, read what it found — the same work the app does.</div>
         </div>
         <Link to="/app/api-access" className="btn">
           Keys
         </Link>
       </div>
       <ApiDocs />
-    </>
+    </div>
   )
 }

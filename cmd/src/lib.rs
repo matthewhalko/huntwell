@@ -35,6 +35,7 @@ pub mod mail;
 pub mod meter;
 pub mod model_catalog;
 pub mod normalize;
+pub mod outreach;
 pub mod notification;
 pub mod objstore;
 pub mod pipeline;

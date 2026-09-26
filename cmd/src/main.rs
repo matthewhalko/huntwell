@@ -13,7 +13,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use huntwell::{admin, agent, browser, browserbase, config, mcp, objstore, pipeline, store, web, worker_pool};
+use huntwell::{admin, agent, browser, browserbase, cognito, config, mcp, objstore, pipeline, store, web, worker_pool};
 
 #[derive(Parser)]
 #[command(name = "huntwell", version, about = "Hosted prospecting plans")]
@@ -404,6 +404,22 @@ async fn dispatch(cmd: Cmd) -> Result<i32> {
                     Ok(()) if objstore::is_remote() => println!("  files      ok — {where_}"),
                     Ok(()) => println!("  files      ok — {where_}"),
                     Err(e) => println!("  files      FAILED ({where_}): {e:#}"),
+                }
+            }
+            // Sign-in, asked the way the login page asks it. "Temporarily
+            // unavailable" on the site is one of these failing; this prints
+            // the pool's own words.
+            for (label, kind, on) in [
+                ("sign-in", cognito::PoolKind::Users, cognito::configured()),
+                ("operators", cognito::PoolKind::Admins, cognito::admin_configured()),
+            ] {
+                if !on {
+                    println!("  {label:<10} Cognito not configured");
+                    continue;
+                }
+                match cognito::probe_sign_in(kind).await {
+                    Ok(said) => println!("  {label:<10} ok — {said}"),
+                    Err(said) => println!("  {label:<10} FAILED — {said}"),
                 }
             }
             if browserbase::configured() {

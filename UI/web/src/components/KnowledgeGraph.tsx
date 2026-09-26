@@ -90,7 +90,7 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
   const nodesRef = useRef<Node[]>([])
   const edgesRef = useRef<Edge[]>([])
   const posRef = useRef<Map<string, Pt>>(new Map())
-  const alphaRef = useRef(1)
+  const alphaRef = useRef(0.35)
   const viewRef = useRef({ x: 0, y: 0, k: 1 })
   const dragRef = useRef<{ x: number; y: number; node: Node | null } | null>(null)
   const fittedRef = useRef(false)
@@ -139,15 +139,14 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
     const nodes: Node[] = []
     const push = (id: string, kind: Kind, label: string, sub: string, weight: number, tokens = 0) => {
       const at = seen.get(id)
-      const band = kind === 'seed' ? -220 : kind === 'query' ? -80 : kind === 'page' ? 80 : 220
       nodes.push({
         id,
         kind,
         label,
         sub,
         tokens,
-        x: at ? at.x : band + (Math.random() - 0.5) * 140,
-        y: at ? at.y : (Math.random() - 0.5) * 400,
+        x: at ? at.x : 0,
+        y: at ? at.y : 0,
         vx: 0,
         vy: 0,
         r: Math.min(18, 5 + Math.sqrt(Math.max(weight, 1)) * 2),
@@ -190,10 +189,26 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
       if (from && to && from !== to) edges.push({ from, to, weight: e.weight || 1 })
     }
 
+    // New nodes start in columns, already spaced, instead of a random cloud
+    // that the springs then fling apart. A node that was already on screen
+    // keeps the place it settled.
+    const band: Record<Kind, number> = { seed: -240, query: -80, page: 80, result: 240 }
+    for (const kind of ['seed', 'query', 'page', 'result'] as Kind[]) {
+      const group = nodes.filter((n) => n.kind === kind && !seen.has(n.id))
+      group.forEach((n, i) => {
+        n.x = band[kind]
+        n.y = (i - (group.length - 1) / 2) * 42
+      })
+    }
+
+    const first = seen.size === 0 && nodes.length > 0
     const grew = nodes.length !== nodesRef.current.length
     nodesRef.current = nodes
     edgesRef.current = edges
-    if (grew) alphaRef.current = Math.max(alphaRef.current, 0.5)
+    // A small nudge, not a restart: reheating the whole layout throws nodes
+    // that had already settled.
+    if (first) alphaRef.current = 0.28
+    else if (grew) alphaRef.current = Math.max(alphaRef.current, 0.12)
   }, [data])
 
   useEffect(() => {
@@ -219,7 +234,7 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
       const edges = edgesRef.current.filter((e) => visible.has(e.from) && visible.has(e.to))
       const byId = new Map(nodes.map((n) => [n.id, n]))
 
-      if (alphaRef.current > 0.004) {
+      if (nodes.length && alphaRef.current > 0.004) {
         const a0 = alphaRef.current
         for (let i = 0; i < nodes.length; i++) {
           const a = nodes[i]
@@ -227,9 +242,11 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
             const b = nodes[j]
             let dx = b.x - a.x
             let dy = b.y - a.y
-            const d2 = dx * dx + dy * dy || 0.01
+            const d2 = dx * dx + dy * dy || 1
             if (d2 > 90000) continue
-            const f = (900 * a0) / d2
+            // Capped: an overlapping pair used to add hundreds of pixels of
+            // velocity in a single frame and throw the picture off screen.
+            const f = Math.min(1.6, (160 * a0) / d2)
             const d = Math.sqrt(d2)
             dx /= d
             dy /= d
@@ -244,23 +261,29 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
           const b = byId.get(e.to)!
           const dx = b.x - a.x
           const dy = b.y - a.y
-          const d = Math.sqrt(dx * dx + dy * dy) || 0.01
-          const f = ((d - 130) * 0.02 * a0) / d
+          const d = Math.sqrt(dx * dx + dy * dy) || 1
+          const f = ((d - 130) * 0.012 * a0) / d
           a.vx += dx * f
           a.vy += dy * f
           b.vx -= dx * f
           b.vy -= dy * f
         }
+        const maxStep = 4
         for (const n of nodes) {
-          n.vx += -n.x * 0.0015 * a0
-          n.vy += -n.y * 0.0015 * a0
-          n.vx *= 0.86
-          n.vy *= 0.86
+          n.vx += -n.x * 0.001 * a0
+          n.vy += -n.y * 0.001 * a0
+          n.vx *= 0.8
+          n.vy *= 0.8
+          const speed = Math.hypot(n.vx, n.vy)
+          if (speed > maxStep) {
+            n.vx *= maxStep / speed
+            n.vy *= maxStep / speed
+          }
           n.x += n.vx
           n.y += n.vy
           posRef.current.set(n.id, { x: n.x, y: n.y })
         }
-        alphaRef.current *= 0.985
+        alphaRef.current *= 0.97
       }
 
       const dpr = window.devicePixelRatio || 1

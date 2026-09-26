@@ -233,7 +233,7 @@ if [[ "$SETUP_ACCOUNT" == "1" ]]; then
   read -r -p "  email: " ACCT_EMAIL
   read -r -s -p "  password (10+ chars): " ACCT_PW; echo
   if "$SERVER_BIN" account create --email "$ACCT_EMAIL" --password "$ACCT_PW"; then
-    echo "  You can now sign in; set HUNTWELL_OPEN_SIGNUP=0 in $GLOBAL to close sign-up."
+    echo "  You can now sign in; sign-up is invite-only (HUNTWELL_OPEN_SIGNUP=1 in $GLOBAL opens it)."
   else
     warn "account setup did not complete — continuing to start the stack anyway"
   fi

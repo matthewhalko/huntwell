@@ -1,12 +1,15 @@
-import React from 'react'
-import { ago, api } from '../api'
+import React, { useMemo } from 'react'
+import type { ColDef } from 'ag-grid-community'
+import { ago, api, can } from '../api'
+import { useAuth } from '../auth'
 import { Badge, useConfirm, useToast } from './ui'
+import Grid from './Grid'
 
 /**
- * The plan's starting angles, as cards a person can read.
+ * The plan's starting angles, as a table.
  *
  * The database stores each seed as a JSON bag of vars. That is how the runner
- * consumes it — not how anyone should have to look at it. A card is the seed
+ * consumes it — not how anyone should have to look at it. A row is the seed
  * as a starting place: what to try, whether it is waiting or already used,
  * and what that try found.
  */
@@ -75,12 +78,88 @@ export function seedLabel(raw: string) {
   return seedTitle(fieldsFromSeed(raw), raw)
 }
 
+type SeedGridRow = SeedRow & {
+  title: string
+  details: string
+  waiting: boolean
+  when: string
+}
+
+function toGridRow(row: SeedRow): SeedGridRow {
+  const waiting = row.status === 'pending'
+  const fields = fieldsFromSeed(row.seed_json)
+  const when = waiting
+    ? row.queued_at
+      ? `Waiting since ${ago(row.queued_at)}`
+      : 'Used on the next run'
+    : [
+        row.explored_at ? `Tried ${ago(row.explored_at)}` : '',
+        row.iteration != null && row.iteration > 0 ? `round ${row.iteration}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ') || 'Already tried'
+  return {
+    ...row,
+    title: seedTitle(fields, row.seed_json),
+    details: fields.map((f) => `${f.label} ${f.value}`).join(' · '),
+    waiting,
+    when,
+  }
+}
+
 export function SearchSeeds({ planId, rows, onChange }: { planId: number; rows: SeedRow[]; onChange: () => void }) {
+  const { me } = useAuth()
+  const write = can(me, 'plans')
   const toast = useToast()
   const confirm = useConfirm()
   const waiting = rows.filter((r) => r.status === 'pending')
   const used = rows.filter((r) => r.status !== 'pending')
-  const ordered = [...waiting, ...used]
+  const gridRows = useMemo(
+    () => [...rows.filter((r) => r.status === 'pending'), ...rows.filter((r) => r.status !== 'pending')].map(toGridRow),
+    [rows],
+  )
+
+  const columns = useMemo<ColDef<SeedGridRow>[]>(
+    () => [
+      {
+        field: 'title',
+        headerName: 'Seed',
+        flex: 1.6,
+        cellRenderer: (p: { value: string }) => <b>{p.value}</b>,
+      },
+      {
+        field: 'details',
+        headerName: 'Details',
+        flex: 2,
+        cellClass: 'muted',
+      },
+      {
+        field: 'waiting',
+        headerName: 'Status',
+        flex: 0.7,
+        cellRenderer: (p: { data?: SeedGridRow }) =>
+          p.data ? <Badge kind={p.data.waiting ? 'warn' : 'ok'}>{p.data.waiting ? 'Waiting' : 'Used'}</Badge> : null,
+      },
+      {
+        field: 'new_prospects',
+        headerName: 'Found',
+        flex: 0.7,
+        type: 'rightAligned',
+        valueGetter: (p) => (p.data && !p.data.waiting ? p.data.new_prospects : null),
+        valueFormatter: (p) => {
+          if (p.value == null) return '—'
+          return p.value > 0 ? String(p.value) : 'Nothing new'
+        },
+      },
+      {
+        field: 'when',
+        headerName: 'When',
+        flex: 1.1,
+        cellClass: 'muted',
+      },
+    ],
+    [],
+  )
 
   const clearWaiting = async () => {
     if (
@@ -107,13 +186,13 @@ export function SearchSeeds({ planId, rows, onChange }: { planId: number; rows: 
             Used seeds show what that angle found.
           </p>
         </div>
-        {waiting.length > 0 && (
+        {write && waiting.length > 0 && (
           <button className="btn sm" type="button" onClick={clearWaiting}>
             Clear waiting
           </button>
         )}
       </div>
-      {ordered.length === 0 ? (
+      {gridRows.length === 0 ? (
         <div className="card seeds-empty">
           <p>
             No search seeds yet. The first run starts from the plan itself; later runs add new angles here for the next
@@ -121,50 +200,13 @@ export function SearchSeeds({ planId, rows, onChange }: { planId: number; rows: 
           </p>
         </div>
       ) : (
-        <div className="seed-list">
-          {ordered.map((r, i) => (
-            <SeedCard key={`${r.status}-${r.queued_at}-${r.explored_at}-${i}`} row={r} />
-          ))}
-        </div>
+        <Grid
+          rows={gridRows}
+          columns={columns}
+          visibleRows={8}
+          getRowId={(r) => `${r.status}-${r.queued_at}-${r.explored_at}-${r.seed_json}`}
+        />
       )}
     </section>
-  )
-}
-
-function SeedCard({ row }: { row: SeedRow }) {
-  const waiting = row.status === 'pending'
-  const fields = fieldsFromSeed(row.seed_json)
-  const found = row.new_prospects
-  return (
-    <article className={'seed-card' + (waiting ? ' waiting' : ' used')}>
-      <div className="seed-card-top">
-        <Badge kind={waiting ? 'warn' : 'ok'}>{waiting ? 'Waiting' : 'Used'}</Badge>
-        {!waiting && found != null && (
-          <span className={'seed-found' + (found > 0 ? '' : ' none')}>{found > 0 ? `Found ${found}` : 'Nothing new'}</span>
-        )}
-      </div>
-      <h4 className="seed-title">{seedTitle(fields, row.seed_json)}</h4>
-      {fields.length > 0 && (
-        <ul className="seed-vars">
-          {fields.map((f) => (
-            <li key={f.key} className="seed-var">
-              <span className="seed-var-k">{f.label}</span> {f.value}
-            </li>
-          ))}
-        </ul>
-      )}
-      <p className="seed-foot">
-        {waiting
-          ? row.queued_at
-            ? `Waiting since ${ago(row.queued_at)} — used on the next run`
-            : 'Used on the next run'
-          : [
-              row.explored_at ? `Tried ${ago(row.explored_at)}` : '',
-              row.iteration != null && row.iteration > 0 ? `round ${row.iteration}` : '',
-            ]
-              .filter(Boolean)
-              .join(' · ') || 'Already tried'}
-      </p>
-    </article>
   )
 }

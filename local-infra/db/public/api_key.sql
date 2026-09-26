@@ -21,3 +21,19 @@ CREATE TABLE IF NOT EXISTS public.api_key (
 	UNIQUE (token_hash),
 	FOREIGN KEY (plan_id) REFERENCES public.plan(plan_id) ON DELETE CASCADE
 );
+
+-- The signing secret for this key, encrypted (web::signing). Not hashed:
+-- verifying an HMAC means computing it, which means holding the same secret
+-- the caller holds — so it has to be recoverable. The key that opens it lives
+-- in Secrets Manager, so reading this table is not enough.
+--
+-- NULL on keys made before request signing existed, which keep working as
+-- bearer tokens. A key that HAS a secret may only be used signed: accepting it
+-- as a bearer token would give away the very property signing adds.
+ALTER TABLE public.api_key ADD COLUMN IF NOT EXISTS secret_sealed text;
+
+-- Who made the key. A key acts for the whole workspace, so one made by a
+-- teammate stops working when they leave it (checked at authentication, and
+-- revoked by `store::remove_member`). NULL = made before this was recorded, or
+-- by the operator endpoint, which answers only to the workspace itself.
+ALTER TABLE public.api_key ADD COLUMN IF NOT EXISTS created_by bigint;

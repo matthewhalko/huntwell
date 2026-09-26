@@ -83,3 +83,13 @@ CREATE TABLE IF NOT EXISTS public.account (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS account_cognito_sub_idx
     ON public.account (cognito_sub) WHERE cognito_sub <> '';
+
+-- What this account is charged per million billable tokens, in USD, when an
+-- operator has set one (admin → Users). NULL = the installation's rate,
+-- HUNTWELL_SELL_USD_PER_MTOKEN. The account is the workspace: members spend
+-- at their workspace's rate.
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS sell_usd_per_mtoken double precision;
+
+-- The sign-off this person's outreach drafts end with, verbatim (name, role,
+-- phone, a link). Per person, not per workspace: everyone signs their own mail.
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS outreach_footer text NOT NULL DEFAULT '';

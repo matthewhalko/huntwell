@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -27,6 +27,7 @@ pub fn router() -> Router<App> {
     auth_routes()
         .merge(team_routes())
         .merge(super::billing::routes())
+        .merge(super::outreach::routes())
         .merge(overview_routes())
         .merge(plans_routes())
         .merge(runs_routes())
@@ -44,6 +45,7 @@ pub fn team_routes() -> Router<App> {
         .route("/team/invite", post(invite))
         .route("/team/invites/{id}", delete(revoke))
         .route("/team/members/{id}", delete(remove_member))
+        .route("/team/members/{id}/permissions", put(set_permissions))
         .route("/team/workspaces", get(workspaces))
         .route("/team/switch", post(switch_workspace))
         // Redeeming an invitation: reading it needs no membership, only the
@@ -57,6 +59,8 @@ pub fn auth_routes() -> Router<App> {
     Router::new()
         .route("/auth/config", get(auth::config))
         .route("/auth/signup", post(auth::signup))
+        .route("/auth/waitlist", post(auth::join_waitlist))
+        .route("/auth/invite/{token}", get(auth::invitation))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me).put(auth::update_me))
@@ -284,6 +288,22 @@ async fn team(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<
     })))
 }
 
+/// Whether this person may make a write of this kind in the workspace.
+pub(crate) async fn require_cap(state: &App, acc: &store::Account, cap: &str) -> Result<(), ApiError> {
+    let caps = store::workspace_caps(&state.db, acc.tenant(), acc.account_id).await?;
+    let (ok, msg) = match cap {
+        store::CAP_PLANS => (caps.plans, "you do not have permission to create or change plans"),
+        store::CAP_CREDITS => (caps.credits, "you do not have permission to buy credits"),
+        store::CAP_KEYS => (caps.keys, "you do not have permission to create API keys"),
+        _ => (false, "you do not have permission to do that"),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError(StatusCode::FORBIDDEN, msg.into()))
+    }
+}
+
 /// Only the owner and admins may change who is in a workspace.
 async fn require_admin(state: &App, acc: &store::Account) -> Result<i64, ApiError> {
     let workspace = acc.tenant();
@@ -305,6 +325,11 @@ async fn rename_workspace(State(state): State<App>, AuthUser(acc): AuthUser, Jso
     let workspace = require_admin(&state, &acc).await?;
     if body.name.chars().count() > 120 {
         return Err(bad_request("keep the workspace name under 120 characters"));
+    }
+    // It goes into invitation subjects and bodies: one line, nothing a mail
+    // header could be split on.
+    if body.name.chars().any(char::is_control) {
+        return Err(bad_request("a workspace name cannot contain line breaks or control characters"));
     }
     store::set_workspace_name(&state.db, workspace, &body.name).await?;
     Ok(Json(json!({ "workspace": store::workspace_name(&state.db, workspace).await? })))
@@ -381,6 +406,53 @@ async fn remove_member(State(state): State<App>, AuthUser(acc): AuthUser, Path(i
     Ok(Json(json!({"ok": true})))
 }
 
+#[derive(Deserialize)]
+struct PermissionsBody {
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// An admin clicks a teammate and sets what they may write, and whether they
+/// can invite. The owner cannot be edited (they have no membership row) and
+/// nobody can lock themselves out.
+async fn set_permissions(
+    State(state): State<App>,
+    AuthUser(acc): AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<PermissionsBody>,
+) -> Result<Json<Value>, ApiError> {
+    let workspace = require_admin(&state, &acc).await?;
+    if id == workspace {
+        return Err(bad_request("the workspace owner's permissions cannot be changed"));
+    }
+    if id == acc.account_id {
+        return Err(bad_request("you cannot change your own permissions"));
+    }
+    if let Some(role) = body.role.as_deref() {
+        let role = match role.trim() {
+            "admin" => "admin",
+            "member" => "member",
+            _ => return Err(bad_request("role is member or admin")),
+        };
+        if !store::set_member_role(&state.db, workspace, id, role).await? {
+            return Err(not_found("they are not on this team"));
+        }
+    }
+    let raw = store::sanitize_permissions(&body.permissions);
+    let raw = if raw.is_empty() { store::CAP_READONLY.to_string() } else { raw };
+    if !store::set_member_permissions(&state.db, workspace, id, &raw).await? {
+        return Err(not_found("they are not on this team"));
+    }
+    let member = store::list_members(&state.db, workspace)
+        .await?
+        .into_iter()
+        .find(|m| m.account_id == id)
+        .ok_or_else(|| not_found("they are not on this team"))?;
+    Ok(Json(json!({ "member": member })))
+}
+
 /// The workspaces this person can work in — their own, and any they joined.
 async fn workspaces(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
     let list = store::list_workspaces(&state.db, acc.account_id).await?;
@@ -437,6 +509,7 @@ async fn join(State(state): State<App>, AuthUser(acc): AuthUser, Path(token): Pa
 
 async fn list_plans(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Vec<Value>>, ApiError> {
     let plans = store::list_plans(&state.db, acc.tenant()).await?;
+    let rate = store::sell_rate(&state.db, acc.tenant()).await?;
     Ok(Json(
         plans
             .iter()
@@ -445,7 +518,7 @@ async fn list_plans(State(state): State<App>, AuthUser(acc): AuthUser) -> Result
                 v["prospects"] = json!(s.prospects);
                 v["executions"] = json!(s.executions);
                 v["tokens"] = json!(s.tokens);
-                v["spend_usd"] = json!(s.tokens as f64 * crate::config::sell_usd_per_mtoken() / 1e6);
+                v["spend_usd"] = json!(s.tokens as f64 * rate / 1e6);
                 v["last_execution_at"] = json!(s.last_execution_at);
                 v["last_execution_status"] = json!(s.last_execution_status);
                 v["active_execution_id"] = json!(s.active_execution_id);
@@ -573,6 +646,7 @@ pub(crate) struct NewPlanBody {
 }
 
 async fn create_plan(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<NewPlanBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let p = create_plan_from_brief(&state, acc.tenant(), body).await.map_err(|e| bad_request(format!("{e:#}")))?;
     Ok(Json(public_plan(&p)))
 }
@@ -844,6 +918,7 @@ crate::bus::publish(
 
 /// Try drafting again for a plan whose first attempt failed.
 async fn rebuild_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     agent_available()?;
     let sc = store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
     // 'queued' counts: the plan is waiting for the planning service to pick it
@@ -920,6 +995,7 @@ pub(crate) struct PlanModelsBody {
 }
 
 async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(body): Json<PlanUpdateBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let mut sc = store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
     if let Some(n) = body.name {
         sc.source = n;
@@ -959,6 +1035,7 @@ async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
 }
 
 async fn delete_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     if let Some(active) = store::active_execution_for_plan(&state.db, id).await? {
         let _ = runner::cancel(&state, acc.tenant(), active.execution_id).await;
     }
@@ -974,6 +1051,7 @@ struct FavBody {
 }
 
 async fn favorite_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(b): Json<FavBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     store::set_favorite(&state.db, acc.tenant(), id, b.favorite).await?;
     Ok(Json(json!({"ok": true})))
 }
@@ -1122,6 +1200,7 @@ pub(crate) async fn graph_payload(state: &App, workspace: i64, id: i64) -> anyho
 }
 
 async fn clear_queue(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
     let n = store::clear_pending_seeds(&state.db, id).await?;
     Ok(Json(json!({"dropped": n})))
@@ -1176,6 +1255,7 @@ struct StartRunBody {
 }
 
 async fn start_execution(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<StartRunBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let execution_id = runner::start(&state, acc.tenant(), body.plan_id, "manual", body.args)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
@@ -1188,6 +1268,7 @@ async fn get_execution(State(state): State<App>, AuthUser(acc): AuthUser, Path(i
 }
 
 async fn cancel_execution(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let run = store::get_execution(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("run not found"))?;
     let stopped = runner::cancel(&state, acc.tenant(), id).await?;
     if !stopped && matches!(run.status.as_str(), "queued" | "running") {
@@ -1322,11 +1403,13 @@ async fn list_prospects(State(state): State<App>, AuthUser(acc): AuthUser, Query
 }
 
 async fn delete_prospects(State(state): State<App>, AuthUser(acc): AuthUser, Query(q): Query<ProspectsQuery>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let n = store::delete_prospects(&state.db, acc.tenant(), q.plan_id).await?;
     Ok(Json(json!({"deleted": n})))
 }
 
 async fn delete_prospect(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     if !store::delete_prospect(&state.db, acc.tenant(), id).await? {
         return Err(not_found("prospect not found"));
     }
@@ -1413,6 +1496,7 @@ async fn execution_browser_frame(
         return Err(bad_request("that execution has no browser to watch"));
     }
     let endpoint = crate::browserbase::connect_url_for(&session)
+        .await
         .ok_or_else(|| bad_request("that browser is no longer available"))?;
     let jpeg = crate::direct::cdp::screenshot(&endpoint).await.map_err(|e| {
         // The provider's endpoint is in the error; the customer gets the fact.
@@ -1442,6 +1526,7 @@ async fn connected_logins_allowed(state: &App, account_id: i64) -> Result<(), Ap
 }
 
 async fn browser_login(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<BrowserLoginBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     connected_logins_allowed(&state, acc.tenant()).await?;
     if !crate::browserbase::configured() {
         // User-facing: the vendor behind a connected session is our business,
@@ -1472,6 +1557,7 @@ async fn browser_login(State(state): State<App>, AuthUser(acc): AuthUser, Json(b
     };
     let ls = crate::browserbase::start_login_session(&ctx, 600).await.map_err(|e| bad_request(format!("{e:#}")))?;
     let site = if body.site.trim().is_empty() { "site".to_string() } else { body.site.trim().to_string() };
+    login_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(ls.session_id.clone(), (acc.tenant(), std::time::Instant::now()));
     Ok(Json(json!({ "session_id": ls.session_id, "live_view_url": ls.live_view_url, "site": site, "url": body.url })))
 }
 
@@ -1485,9 +1571,38 @@ struct BrowserFinishBody {
 }
 
 /// Releases the login session (which saves the Context) and records the login.
+/// Login sessions this server started, by session id, to the workspace that
+/// started each. Finishing one releases it with the platform's Browserbase
+/// key, so only the workspace that started a session may end it — never
+/// another workspace's login, or a run's browser. In memory: the website is
+/// one process, and a login session lives ten minutes.
+fn login_sessions() -> &'static std::sync::Mutex<HashMap<String, (i64, std::time::Instant)>> {
+    static SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i64, std::time::Instant)>>> = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(Default::default)
+}
+
+/// Take `sid` out of the registry if `workspace` started it (and it is not
+/// stale); anything else is refused.
+fn take_login_session(sid: &str, workspace: i64) -> bool {
+    let mut map = login_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(3600));
+    match map.get(sid) {
+        Some((ws, _)) if *ws == workspace => {
+            map.remove(sid);
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn browser_login_finish(State(state): State<App>, AuthUser(acc): AuthUser, Json(body): Json<BrowserFinishBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     connected_logins_allowed(&state, acc.tenant()).await?;
-    crate::browserbase::release(&body.session_id).await;
+    let sid = body.session_id.trim();
+    if !take_login_session(sid, acc.tenant()) {
+        return Err(not_found("that login session isn't one this workspace started"));
+    }
+    crate::browserbase::release(sid).await;
     let site = if body.site.trim().is_empty() { "site" } else { body.site.trim() };
     store::record_browser_connection(&state.db, acc.tenant(), site, body.url.trim()).await?;
     Ok(Json(json!({ "ok": true })))
@@ -1532,11 +1647,13 @@ async fn list_artifacts(State(state): State<App>, AuthUser(acc): AuthUser, Query
 }
 
 async fn delete_artifacts(State(state): State<App>, AuthUser(acc): AuthUser, Query(q): Query<ProspectsQuery>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let n = store::delete_artifacts(&state.db, acc.tenant(), q.plan_id).await?;
     Ok(Json(json!({"deleted": n})))
 }
 
 async fn delete_artifact(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     if !store::delete_artifact(&state.db, acc.tenant(), id).await? {
         return Err(not_found("artifact not found"));
     }
@@ -1589,6 +1706,7 @@ async fn report_html(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
 }
 
 async fn delete_report(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     if !store::delete_report(&state.db, acc.tenant(), id).await? {
         return Err(not_found("report not found"));
     }
@@ -1609,7 +1727,11 @@ async fn download_asset(State(state): State<App>, AuthUser(acc): AuthUser, Path(
     let a = store::get_asset(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("file not found"))?;
     let bytes = crate::objstore::get(&a.object_key)
         .await
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("could not read the stored file: {e:#}")))?;
+        // 503, not 502: Cloudflare swaps a 502 for its own error page.
+        .map_err(|e| {
+            tracing::warn!("stored file unreadable: {e:#}");
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "the stored file couldn't be read just now — try again in a moment".into())
+        })?;
     let name = crate::assets::sanitize_filename(&a.filename);
     let name = if name.is_empty() { format!("file-{id}") } else { name };
     let ctype = HeaderValue::from_str(&a.content_type).unwrap_or(HeaderValue::from_static("application/octet-stream"));
@@ -1628,6 +1750,7 @@ async fn download_asset(State(state): State<App>, AuthUser(acc): AuthUser, Path(
 }
 
 async fn delete_asset(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
     let Some(key) = store::delete_asset(&state.db, acc.tenant(), id).await? else {
         return Err(not_found("file not found"));
     };
@@ -1658,11 +1781,26 @@ struct CreateKeyBody {
 }
 
 async fn create_key(State(state): State<App>, AuthUser(acc): AuthUser, Json(b): Json<CreateKeyBody>) -> Result<Json<store::ApiKeyRow>, ApiError> {
-    let key = store::create_api_key(&state.db, acc.tenant(), &b.label, b.plan_id, b.expires_in_days, &b.allow_cidr).await?;
+    require_cap(&state, &acc, store::CAP_KEYS).await?;
+    let key = store::create_api_key(&state.db, acc.tenant(), Some(acc.account_id), &b.label, b.plan_id, b.expires_in_days, &b.allow_cidr).await?;
     Ok(Json(key))
 }
 
+/// Changing a key is for its maker and the workspace's admins: a member must
+/// not be able to revoke the owner's integration or lift its address pinning.
+async fn may_manage_key(state: &App, acc: &store::Account, key_id: i64) -> Result<(), ApiError> {
+    let key = store::get_api_key(&state.db, acc.tenant(), key_id).await?.ok_or_else(|| not_found("key not found"))?;
+    if key.created_by == Some(acc.account_id) {
+        return Ok(());
+    }
+    match store::workspace_role(&state.db, acc.tenant(), acc.account_id).await?.as_deref() {
+        Some("owner") | Some("admin") => Ok(()),
+        _ => Err(ApiError(StatusCode::FORBIDDEN, "only its maker or an admin can change this key".into())),
+    }
+}
+
 async fn delete_key(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    may_manage_key(&state, &acc, id).await?;
     if !store::delete_api_key(&state.db, acc.tenant(), id).await? {
         return Err(not_found("key not found"));
     }
@@ -1670,6 +1808,7 @@ async fn delete_key(State(state): State<App>, AuthUser(acc): AuthUser, Path(id):
 }
 
 async fn revoke_key(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    may_manage_key(&state, &acc, id).await?;
     if !store::revoke_api_key(&state.db, acc.tenant(), id).await? {
         return Err(not_found("key not found"));
     }
@@ -1682,6 +1821,7 @@ struct AllowBody {
 }
 
 async fn allow_key(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(b): Json<AllowBody>) -> Result<Json<Value>, ApiError> {
+    may_manage_key(&state, &acc, id).await?;
     if !store::set_api_key_cidr(&state.db, acc.tenant(), id, &b.allow_cidr).await? {
         return Err(not_found("key not found"));
     }
@@ -1689,6 +1829,18 @@ async fn allow_key(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): 
 }
 
 async fn key_audit(State(state): State<App>, AuthUser(acc): AuthUser, Query(q): Query<HashMap<String, String>>) -> Result<Json<Vec<store::ApiAuditRow>>, ApiError> {
-    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(200);
+    let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(200).clamp(1, 2000);
     Ok(Json(store::list_api_audit(&state.db, acc.tenant(), limit).await?))
+}
+
+#[cfg(test)]
+mod login_session_tests {
+    #[test]
+    fn only_the_workspace_that_started_a_login_can_end_it() {
+        super::login_sessions().lock().unwrap().insert("sess-a".into(), (1, std::time::Instant::now()));
+        assert!(!super::take_login_session("sess-a", 2), "another workspace");
+        assert!(!super::take_login_session("sess-unknown", 1), "a session this server never started");
+        assert!(super::take_login_session("sess-a", 1));
+        assert!(!super::take_login_session("sess-a", 1), "once only");
+    }
 }

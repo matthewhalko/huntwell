@@ -61,7 +61,8 @@ impl Provider for Anthropic {
                 id: "claude-sonnet-5".into(),
                 label: "Claude Sonnet".into(),
                 family: "sonnet".into(),
-                price: Price::new(3.0, 0.30, 15.0),
+                // Sonnet 5's list price (Anthropic's model table, 2026-06).
+                price: Price::new(2.0, 0.20, 10.0),
                 context: 200_000,
                 good_for_tools: true,
             },
@@ -69,7 +70,8 @@ impl Provider for Anthropic {
                 id: "claude-opus-5".into(),
                 label: "Claude Opus".into(),
                 family: "opus".into(),
-                price: Price::new(15.0, 1.50, 75.0),
+                // Opus 5's list price (Anthropic's model table, 2026-06).
+                price: Price::new(5.0, 0.50, 25.0),
                 context: 200_000,
                 good_for_tools: true,
             },
@@ -161,10 +163,19 @@ pub fn build(req: &Request) -> Value {
         );
     }
     body.insert("messages".into(), Value::Array(messages));
-    if let Some(t) = req.temperature {
+    if let Some(t) = req.temperature.filter(|_| accepts_sampling(&req.model)) {
         body.insert("temperature".into(), json!(t));
     }
     Value::Object(body)
+}
+
+/// Whether a model still takes `temperature`. The current generation — Sonnet
+/// 5, Opus 4.7 and later, Fable, Mythos — refuses sampling parameters with a
+/// 400, so a caller's preference is dropped for them rather than failing the
+/// call. Older models (Haiku 4.5, the 4.6 family and before) accept it.
+fn accepts_sampling(model: &str) -> bool {
+    const NO_SAMPLING: [&str; 6] = ["claude-sonnet-5", "claude-opus-5", "claude-opus-4-7", "claude-opus-4-8", "claude-fable", "claude-mythos"];
+    !NO_SAMPLING.iter().any(|p| model.starts_with(p))
 }
 
 /// Whether this message is a user turn made only of tool results, and so the
@@ -213,6 +224,16 @@ pub fn parse(v: &Value) -> Result<Reply, LlmError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn temperature_is_not_sent_to_models_that_refuse_it() {
+        let mut req = Request::new("claude-sonnet-5", "sys").user("hi");
+        req.temperature = Some(0.5);
+        assert!(build(&req).get("temperature").is_none());
+        req.model = "claude-haiku-4-5".into();
+        assert_eq!(build(&req)["temperature"], json!(0.5));
+    }
+
     use super::*;
     use crate::llm::ToolDef;
 

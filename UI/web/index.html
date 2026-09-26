@@ -3,11 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>huntwell.ai - Find what you're looking for</title>
-    <!-- The logo's own glyph, rendered from brand/favicon.html (see there). -->
+    <!-- Between the markers is written per route by the server (cmd/src/web/seo.rs):
+         title, description, canonical, Open Graph, Twitter and JSON-LD. What is
+         here is only what the Vite dev server shows. -->
+    <!--seo-->
+    <title>Huntwell — AI web research that turns pages into data</title>
+    <meta name="description" content="Describe what you're looking for and Huntwell searches the web in a real browser, returning prospects, custom tables, written reports and files you can use." />
+    <!--/seo-->
+    <meta name="application-name" content="Huntwell" />
+    <meta name="apple-mobile-web-app-title" content="Huntwell" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#111113" media="(prefers-color-scheme: dark)" />
+    <meta name="format-detection" content="telephone=no" />
+    <!-- The logo's own glyph, rendered from brand/favicon.html (see there).
+         Google's search-result icon wants a square multiple of 48px on the
+         home page, and also fetches /favicon.ico on its own. -->
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet" />

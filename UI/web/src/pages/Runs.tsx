@@ -3,7 +3,7 @@ import { api, Run } from '../api'
 import { RunsTab } from './PlanDetail'
 
 export default function Runs() {
-  const [runs, setRuns] = useState<Run[]>([])
+  const [runs, setRuns] = useState<Run[] | null>(null)
   const load = () => api.get<Run[]>('/api/executions?limit=200').then(setRuns)
   useEffect(() => {
     load()
@@ -18,7 +18,7 @@ export default function Runs() {
           <div className="sub">Every execution, across all your search plans.</div>
         </div>
       </div>
-      <RunsTab runs={runs} />
+      <RunsTab runs={runs || []} loading={runs === null} />
     </>
   )
 }
