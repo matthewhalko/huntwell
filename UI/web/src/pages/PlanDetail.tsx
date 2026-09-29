@@ -10,6 +10,8 @@ import { KnowledgeGraph } from '../components/KnowledgeGraph'
 import { ReportView } from '../components/ReportView'
 import { AssetGrid } from '../components/AssetGrid'
 import { PlanSettings } from './PlanSettings'
+import { SlackSettings } from '../components/SlackSettings'
+import { PlanOutreachSettings } from '../components/PlanOutreachSettings'
 import { ProspectTable } from './Prospects'
 
 // Parse a plan's custom-artifact column schema (tolerant of malformed JSON).
@@ -203,6 +205,8 @@ export default function PlanDetail() {
           }}
         />
       )}
+      {tab === 'edit' && <PlanOutreachSettings planId={plan.PlanId} canWrite={write} />}
+      {tab === 'edit' && <SlackSettings planId={plan.PlanId} canWrite={write} />}
 
       {runModal && <RunModal plan={plan} first={runModal === 'first'} onClose={() => setRunModal(null)} />}
     </>
@@ -393,7 +397,18 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
   const nav = useNavigate()
   const toast = useToast()
   const [target, setTarget] = useState(plan.TargetProspects)
+  // Empty = no limit beyond the workspace's credits.
+  const [maxTokens, setMaxTokens] = useState('')
+  const [rate, setRate] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (first) return
+    api
+      .get<{ usd_per_mtoken?: number }>('/api/usage')
+      .then((u) => setRate(u.usd_per_mtoken ?? null))
+      .catch(() => {})
+  }, [first])
+  const limit = Math.max(0, Math.floor(Number(maxTokens.replace(/[,_\s]/g, '')) || 0))
   useEffect(() => {
     if (!first) return
     const fn = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -403,7 +418,11 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
   const start = async () => {
     setBusy(true)
     try {
-      const r = await api.post<{ execution_id: number }>('/api/executions', { plan_id: plan.PlanId, target: target || undefined })
+      const r = await api.post<{ execution_id: number }>('/api/executions', {
+        plan_id: plan.PlanId,
+        target: target || undefined,
+        max_tokens: limit || undefined,
+      })
       nav(`/app/executions/${r.execution_id}`)
     } catch (e: any) {
       const msg = e.message || 'Could not start that run'
@@ -440,10 +459,27 @@ function RunModal({ plan, first, onClose }: { plan: Plan; first?: boolean; onClo
   }
   return (
     <Modal title={`Run "${plan.Source}"`} onClose={onClose}>
-      <div className="field">
-        <label>Target results</label>
-        <input type="number" min={0} max={500} value={target} onChange={(e) => setTarget(+e.target.value)} />
+      <div className="run-limits">
+        <div className="field">
+          <label htmlFor="run-target">Target results</label>
+          <input id="run-target" type="number" min={0} max={500} value={target} onChange={(e) => setTarget(+e.target.value)} />
+        </div>
+        <div className="field">
+          <label htmlFor="run-max-tokens">Max tokens</label>
+          <input
+            id="run-max-tokens"
+            inputMode="numeric"
+            placeholder="No limit"
+            value={maxTokens}
+            onChange={(e) => setMaxTokens(e.target.value.replace(/[^0-9,_ ]/g, ''))}
+          />
+        </div>
       </div>
+      <p className="muted sm run-limit-note">
+        {limit > 0
+          ? `Stops once it has spent ${limit.toLocaleString()} tokens${rate ? ` (about $${((limit * rate) / 1e6).toFixed(2)})` : ''} and keeps what it found.`
+          : 'No limit: it runs until it reaches the target or your credits run out.'}
+      </p>
       <p className="muted">Anything already stored is skipped, so a repeat run only brings back what is new.</p>
       <div className="row" style={{ justifyContent: 'flex-end' }}>
         <button className="btn ghost" type="button" onClick={onClose}>

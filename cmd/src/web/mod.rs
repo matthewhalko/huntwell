@@ -173,6 +173,8 @@ async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
         scheduler::spawn(state.clone());
     }
     api::listen_metered_runs(state.clone());
+    // Local dispatch: start runs that wait for room, as room opens.
+    runner::spawn_local_queue(state.clone());
 
     let app = Router::new()
         .nest("/api", api::router())

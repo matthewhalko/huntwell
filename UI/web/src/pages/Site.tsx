@@ -1,7 +1,6 @@
 import React from 'react'
 import { Link } from 'react-router-dom'
 import { SitePage, useCta } from '../components/Site'
-import { ApiDocs } from './ApiDocs'
 
 // The public site's inner pages. Every claim here maps to something the app
 // actually does — plan kinds, schedules, the watch skip, signed keys, the
@@ -140,7 +139,7 @@ export function Product() {
           Search the web the way a <span className="grad-text">person would</span>, at the scale of a machine.
         </>
       }
-      lede="Huntwell turns a sentence into a search plan, runs it in a real browser, and hands back structured data you can use — a list, a table, a report or a folder of files."
+      lede="Type what you want. Huntwell goes and gets it."
     >
       <Section title="How it works" lede="Six steps, and you only do the first two.">
         <ol className="site-steps">
@@ -247,156 +246,69 @@ export function UseCases() {
 
 // ---- Pricing -----------------------------------------------------------------
 
+const PRICING_POINTS: Card[] = [
+  {
+    title: 'Browsing spends tokens',
+    body: 'Every run opens pages in a real browser, reads them and fills in your fields. That work is measured in tokens — the same unit language models use for input and output.',
+    icon: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </>
+    ),
+  },
+  {
+    title: 'You pay for what you use',
+    body: 'There is no seat fee and no plan tier. Buy prepaid credits for your workspace; each run debits them as it spends tokens. A quiet run costs less than a deep one.',
+    icon: (
+      <>
+        <path d="M12 2v20" />
+        <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+      </>
+    ),
+  },
+  {
+    title: 'Cap any run',
+    body: 'Set a token limit before you start. The run stops there, keeps what it found, and never spends past your credits.',
+    icon: (
+      <>
+        <path d="M4 12h16" />
+        <path d="M12 4v16" />
+        <circle cx="12" cy="12" r="9" />
+      </>
+    ),
+  },
+  {
+    title: 'See the cost',
+    body: 'Every execution shows the tokens it used and what that came to, so you can tell a cheap search from an expensive one.',
+    icon: (
+      <>
+        <path d="M3 3v18h18" />
+        <path d="M7 14l4-4 3 3 5-6" />
+      </>
+    ),
+  },
+]
+
 export function Pricing() {
   return (
     <SitePage
       eyebrow="Pricing"
       title={
         <>
-          Pay for the searching, <span className="grad-text">not the seats</span>.
+          Pay for the pages it <span className="grad-text">reads</span>, not a monthly seat.
         </>
       }
-      lede="Huntwell is prepaid and pay-as-you-go. You buy credits, and each run draws them down by the work it actually does."
+      lede="Huntwell charges by the tokens a run spends while browsing and filling results. Use more, pay more; use less, pay less."
     >
-      <div className="site-price">
-        <div className="site-price-card">
-          <span className="site-eyebrow">Credits</span>
-          <div className="site-price-big">
-            $5<span> to </span>$500
-          </div>
-          <p>Top up whenever you like, in whole dollars, from the Usage page in the app.</p>
-          <ul className="site-list">
-            <li>No subscription and no per-seat fee — invite your whole team</li>
-            <li>A run is charged for the AI work it does, and nothing when it is idle</li>
-            <li>Every run shows what it cost, and what each new result cost</li>
-            <li>A scheduled run that finds nothing new is skipped instead of repeated</li>
-          </ul>
-          <CtaRow />
-        </div>
-      </div>
-      <Section title="Questions people ask">
-        <div className="site-faq">
-          <div>
-            <h3>What decides the cost of a run?</h3>
-            <p>
-              How much reading it has to do. A plan's effort setting sets how many pages a search may open; a narrow brief on
-              a few sites costs little, a broad one across many sites costs more. You set the effort before it runs.
-            </p>
-          </div>
-          <div>
-            <h3>Do I need a card?</h3>
-            <p>Yes — a card on file and credits in the account are needed to start a run. Payments are handled by Stripe.</p>
-          </div>
-          <div>
-            <h3>What happens when credits run out?</h3>
-            <p>New runs will not start until you top up. Nothing is charged to your card without you buying credits.</p>
-          </div>
-          <div>
-            <h3>Is there a free trial?</h3>
-            <p>
-              Huntwell is invite-only right now. Request access, and we will be in touch about getting you started.
-            </p>
-          </div>
-        </div>
+      <Section title="How billing works" lede="One meter, tied to the work the browser actually does.">
+        <Cards items={PRICING_POINTS} />
       </Section>
-    </SitePage>
-  )
-}
-
-// ---- Developers --------------------------------------------------------------
-
-export function Developers() {
-  return (
-    <SitePage
-      eyebrow="Developers"
-      title={
-        <>
-          Everything in Huntwell, <span className="grad-text">over an API</span>.
-        </>
-      }
-      lede="Create plans, start runs, and read what they found from your own code. The same workspace, the same results — no scraping infrastructure of your own."
-    >
-      <Section title="How it fits together">
-        <Cards
-          items={[
-            {
-              title: 'Signed requests',
-              body: 'Every call is signed with HMAC-SHA256 using a key and a secret. The secret never travels, and a signature is only good for 30 seconds.',
-            },
-            {
-              title: 'Keys you can narrow',
-              body: 'Pin a key to one plan, give it an expiry, or restrict it to your servers’ addresses. Every use is recorded in an audit log.',
-            },
-            {
-              title: 'Built for syncing',
-              body: 'Prospects come back with a cursor, so a client that keeps its own copy asks only for what is new since last time.',
-            },
-          ]}
-        />
-      </Section>
-      <Section title="API reference" lede="Keys are created in the app under API access. The examples below use a placeholder key.">
-        <div className="site-docs">
-          <ApiDocs />
-        </div>
-      </Section>
-    </SitePage>
-  )
-}
-
-// ---- Security ------------------------------------------------------------------
-
-export function Security() {
-  return (
-    <SitePage
-      eyebrow="Security"
-      title={
-        <>
-          Your data stays <span className="grad-text">yours</span>.
-        </>
-      }
-      lede="Huntwell reads the open web on your behalf. What it finds, and who can see it, is kept to your workspace — and the pages it reads never get to tell it what to do."
-    >
-      <Section title="Accounts">
-        <Cards
-          items={[
-            { title: 'Managed sign-in', body: 'Passwords are held by AWS Cognito, not in our database. Huntwell never stores them.' },
-            { title: 'Two-factor authentication', body: 'Add an authenticator app to your account; sign-in then needs the code as well as the password.' },
-            { title: 'Verified addresses', body: 'An account works only once its email address is confirmed, and team invitations are bound to the address they were sent to.' },
-          ]}
-        />
-      </Section>
-      <Section title="Workspaces">
-        <Cards
-          items={[
-            { title: 'Isolated by default', body: 'Every plan, run and result belongs to one workspace, and every request is checked against it.' },
-            { title: 'Teams by invitation', body: 'Only people an admin invites can join a workspace. Owners and admins manage the team; leaving it ends access, including API keys.' },
-            { title: 'Payments through Stripe', body: 'Card details go straight to Stripe. Huntwell never sees a card number.' },
-          ]}
-        />
-      </Section>
-      <Section title="The browsing itself">
-        <Cards
-          items={[
-            { title: 'A browser per run', body: 'Each run gets its own isolated cloud browser, released when the run ends.' },
-            {
-              title: 'Pages cannot give orders',
-              body: 'Text on a page is treated as data, never as instructions. The agent has browser tools only — no shell, no files — and attempts to redirect it are flagged in the run log.',
-            },
-            {
-              title: 'Sites with rules',
-              body: 'Platforms whose terms forbid automated collection are off limits unless your workspace confirms it has the right to collect there.',
-            },
-          ]}
-        />
-      </Section>
-      <Section title="The API">
-        <Cards
-          items={[
-            { title: 'No bearer tokens', body: 'API calls are signed, not sent with a password-like token, so a key seen in a log is not enough to use it.' },
-            { title: 'Narrow keys', body: 'Keys can be pinned to one plan, limited to your addresses, and given an expiry. Revoke one and it stops at once.' },
-            { title: 'Audit log', body: 'Every API call, and every refused one, is recorded for your workspace to review.' },
-          ]}
-        />
+      <Section
+        title="Ready when you are"
+        lede="Add a card, buy credits, and the next run draws from them. Unused credits stay in the workspace."
+      >
+        <CtaRow />
       </Section>
     </SitePage>
   )

@@ -285,23 +285,23 @@ pub fn signup_invite(name: &str, link: &str, valid_days: i64) -> Email {
     }
 }
 
-/// Sent once, when someone first asks to be let in. Says what happens next
-/// and promises nothing: they may not be approved.
+/// Sent once, when someone first asks to be let in. Says we will email them
+/// for access, and that there is nothing else to do.
 pub fn waitlist_received(name: &str) -> Email {
     let hello = if name.trim().is_empty() { "Thanks".to_string() } else { format!("Thanks, {}", name.trim()) };
     let body = format!(
         "{}{}{}",
         h1("You're on the list"),
         p(&format!("{hello} — we've got your request to join Huntwell.")),
-        p("Huntwell is invite-only while we grow. We read every request, and if we can make room for you we'll email this address a link to create your account. There's nothing else you need to do."),
+        p("Huntwell is invite-only. We will email this address for access. There's nothing else you need to do."),
     );
     Email {
         subject: "You're on the Huntwell waitlist".into(),
         html: layout("We've got your request to join Huntwell.", &body),
         text: format!(
             "{hello} — we've got your request to join Huntwell.\n\n\
-             Huntwell is invite-only while we grow. We read every request, and if we can make room for you\n\
-             we'll email this address a link to create your account. There's nothing else you need to do.\n"
+             Huntwell is invite-only. We will email this address for access.\n\
+             There's nothing else you need to do.\n"
         ),
     }
 }
@@ -397,6 +397,63 @@ pub fn new_records(plan: &str, noun: &str, found: i64, total: i64, samples: &[St
              You get this because alerts are on for this plan. Turn them off on the plan itself.\n"
         ),
     }
+}
+
+/// Sent when credit lands in a workspace's wallet: a card purchase, or free
+/// credit an operator added (`granted`, with the operator's note if any).
+/// Amount and new balance up top; the link goes to Usage & billing.
+pub fn credits_added(usd: f64, balance_usd: f64, granted: bool, note: &str, link: Option<&str>) -> Email {
+    let amount = money(usd);
+    let balance = money(balance_usd);
+    let headline = if granted { format!("{amount} in free credit added") } else { format!("{amount} in credit added") };
+    let lead = if granted {
+        format!("We've added {amount} of credit to your Huntwell account, free of charge. Your balance is now {balance}.")
+    } else {
+        format!("Your purchase of {amount} in credit went through. Your balance is now {balance}.")
+    };
+    let note = note.trim();
+    let note_html = if note.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div style="margin:0 0 14px;padding:12px 14px;border-left:3px solid {RULE};background:{PAPER};font-family:{FONT};font-size:14px;line-height:1.55;color:{INK};">{}</div>"#,
+            esc(note).replace('\n', "<br>")
+        )
+    };
+    let after = "Credit is spent as your searches and drafts run, at your account's per-token rate.";
+    let body = format!(
+        "{}{}{}{}{}{}",
+        h1(&headline),
+        p(&lead),
+        note_html,
+        p(after),
+        link.map(|l| button("See usage & billing", l)).unwrap_or_default(),
+        link.map(fallback).unwrap_or_default(),
+    );
+    Email {
+        subject: headline.clone(),
+        html: layout(&format!("Your balance is now {balance}."), &body),
+        text: format!(
+            "{headline}\n\n{lead}\n{}\n{after}\n{}",
+            if note.is_empty() { String::new() } else { format!("\n{note}\n") },
+            link.map(|l| format!("\nUsage & billing:\n{l}\n")).unwrap_or_default(),
+        ),
+    }
+}
+
+/// `$1,234.50` — cents always shown, so $100 reads as $100.00.
+fn money(usd: f64) -> String {
+    let cents = (usd * 100.0).round() as i64;
+    let (whole, frac) = (cents.abs() / 100, cents.abs() % 100);
+    let digits = whole.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{}${grouped}.{frac:02}", if cents < 0 { "-" } else { "" })
 }
 
 /// Resend's API key (`re_…`). `HUNTWELL_MAIL_API_KEY` is the older name for
@@ -496,6 +553,20 @@ pub async fn send_keyed(to: &str, email: &Email, idempotency_key: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_emails_say_how_much_and_the_new_balance() {
+        let m = credits_added(100.0, 112.5, true, "Welcome aboard <b>Ana</b>\nEnjoy", Some("https://huntwell.test/app/usage"));
+        assert_eq!(m.subject, "$100.00 in free credit added");
+        assert!(m.text.contains("Your balance is now $112.50.") && m.text.contains("free of charge"));
+        // The operator's note is escaped, and keeps its line breaks.
+        assert!(m.html.contains("Welcome aboard &lt;b&gt;Ana&lt;/b&gt;<br>Enjoy"), "{}", m.html);
+        assert!(m.html.contains("https://huntwell.test/app/usage"));
+        let bought = credits_added(1250.0, 1250.0, false, "", None);
+        assert_eq!(bought.subject, "$1,250.00 in credit added");
+        assert!(bought.text.contains("Your purchase of $1,250.00"));
+        assert!(!bought.html.contains("See usage"), "no link without a public URL");
+    }
 
     /// Both parts carry the link, because either one may be what gets read.
     /// Writes each message to target/mail-samples/ so it can be opened in a

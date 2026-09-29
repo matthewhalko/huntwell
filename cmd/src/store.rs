@@ -1144,6 +1144,102 @@ pub async fn signup_invite(db: &Db, token_hash: &str) -> Result<Option<(String, 
     Ok(row.map(|r| (r.get(0), r.get(1))))
 }
 
+/// What deleting an account came to.
+#[derive(Debug)]
+pub enum Purge {
+    NotFound,
+    /// Runs still queued or going; deleting under them would leave a process
+    /// writing rows for an account that no longer exists.
+    Busy(i64),
+    Done {
+        email: String,
+        plans: i64,
+        /// Asset bytes in the object store — the caller removes them once the
+        /// rows are gone, since a store call cannot join the transaction.
+        object_keys: Vec<String>,
+    },
+}
+
+/// Delete an account and everything it owns, in one transaction. Unrecoverable.
+///
+/// Most tables do not cascade from `account` (they key on `plan_id`, or carry
+/// `account_id` as provenance), so each is named here. The workspace goes too:
+/// teammates lose access to it, and whatever this person made or joined in
+/// other workspaces is detached — their memberships and the API keys they made
+/// there are removed, drafts they wrote there stay with that workspace.
+pub async fn purge_account(db: &Db, account_id: i64) -> Result<Purge> {
+    let mut tx = db.begin().await?;
+    let Some(email) = sqlx::query_scalar::<_, String>(r#"SELECT email FROM account WHERE account_id=$1 FOR UPDATE"#)
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(Purge::NotFound);
+    };
+    let busy: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM execution WHERE account_id=$1 AND status IN ('queued','running')"#)
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if busy > 0 {
+        return Ok(Purge::Busy(busy));
+    }
+    let object_keys: Vec<String> = sqlx::query_scalar(r#"SELECT DISTINCT object_key FROM asset WHERE account_id=$1 AND object_key <> ''"#)
+        .bind(account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let plans: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM plan WHERE account_id=$1"#).bind(account_id).fetch_one(&mut *tx).await?;
+
+    // In order: rows that reference executions or plans without a foreign key
+    // first, then the plans (which cascade to runs, results, files, logs and
+    // the search's memory), then everything else keyed on the account.
+    const STEPS: &[&str] = &[
+        r#"DELETE FROM route_log WHERE execution_id IN (SELECT execution_id FROM execution WHERE account_id=$1)"#,
+        r#"UPDATE account SET active_workspace_id=NULL WHERE active_workspace_id=$1"#,
+        r#"DELETE FROM membership WHERE workspace_id=$1 OR member_id=$1"#,
+        r#"DELETE FROM invite WHERE workspace_id=$1"#,
+        r#"DELETE FROM api_key WHERE account_id=$1 OR created_by=$1"#,
+        r#"DELETE FROM api_audit WHERE account_id=$1"#,
+        r#"UPDATE outreach_version SET created_by=NULL WHERE created_by=$1 AND account_id<>$1"#,
+        r#"DELETE FROM outreach_version WHERE account_id=$1"#,
+        r#"DELETE FROM outreach WHERE account_id=$1"#,
+        r#"DELETE FROM outreach_profile WHERE account_id=$1"#,
+        r#"DELETE FROM plan WHERE account_id=$1"#,
+        // Belt and braces: anything still carrying the account's id after its
+        // plans went.
+        r#"DELETE FROM execution WHERE account_id=$1"#,
+        r#"DELETE FROM prospect WHERE account_id=$1"#,
+        r#"DELETE FROM artifact WHERE account_id=$1"#,
+        r#"DELETE FROM report WHERE account_id=$1"#,
+        r#"DELETE FROM asset WHERE account_id=$1"#,
+        r#"DELETE FROM watched_page WHERE account_id=$1"#,
+        r#"DELETE FROM slack_outbox WHERE account_id=$1"#,
+        r#"DELETE FROM account_browser WHERE account_id=$1"#,
+        r#"DELETE FROM account_usage WHERE account_id=$1"#,
+        r#"DELETE FROM billing_event WHERE account_id=$1"#,
+        r#"DELETE FROM credit_purchase WHERE account_id=$1"#,
+        r#"DELETE FROM mail_outbox WHERE account_id=$1"#,
+        r#"DELETE FROM session WHERE account_id=$1"#,
+        r#"DELETE FROM account WHERE account_id=$1"#,
+    ];
+    for sql in STEPS {
+        sqlx::query(sql).bind(account_id).execute(&mut *tx).await.with_context(|| format!("purging account {account_id}: {sql}"))?;
+    }
+    // Their place on the waitlist, by account and by address, so the address
+    // could ask again rather than show as already joined.
+    sqlx::query(r#"DELETE FROM waitlist WHERE account_id=$1 OR lower(email)=lower($2)"#)
+        .bind(account_id)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Purge::Done { email, plans, object_keys })
+}
+
+/// Remove one waitlist request that never became an account.
+pub async fn delete_waitlist(db: &Db, waitlist_id: i64) -> Result<bool> {
+    Ok(sqlx::query(r#"DELETE FROM waitlist WHERE waitlist_id=$1"#).bind(waitlist_id).execute(db).await?.rows_affected() > 0)
+}
+
 /// The invitation was used: the account exists. The token goes with it, so the
 /// link is dead from here on.
 pub async fn mark_waitlist_joined(db: &Db, email: &str, account_id: i64) -> Result<()> {
@@ -1391,6 +1487,11 @@ pub struct SourceConfig {
     /// For 'artifacts' plans: JSON array of {key,label,type,role} column specs.
     #[serde(rename = "FieldsSchemaJson", default)]
     pub fields_schema_json: String,
+    /// The columns are the person's own (see `plan.custom_columns`). Set
+    /// through `set_custom_columns`, never by `save_plan`, so no edit clears it.
+    #[serde(rename = "CustomColumns", default)]
+    #[sqlx(default)]
+    pub custom_columns: bool,
     /// For 'report' and 'assets' plans: what the run is about (one company,
     /// person or topic). Unused by the row kinds.
     #[serde(rename = "Subject", default)]
@@ -1574,6 +1675,26 @@ impl SourceConfig {
 ///
 /// Deliberately an exhaustive match: a kind that gains a requirement fails
 /// loudly here instead of silently falling through to the prospects rules.
+impl SourceConfig {
+    /// Whether the plan's columns are the ones the person typed — flagged, or
+    /// (for plans made before the flag) carrying the link that only typed
+    /// columns ever get.
+    pub fn has_custom_columns(&self) -> bool {
+        self.custom_columns || crate::artifact::parse_schema(&self.fields_schema_json).iter().any(|f| f.is_internal())
+    }
+}
+
+/// Mark a plan's columns as the person's own.
+pub async fn set_custom_columns(db: &Db, account_id: i64, plan_id: i64, on: bool) -> Result<()> {
+    sqlx::query(r#"UPDATE plan SET custom_columns=$3 WHERE account_id=$1 AND plan_id=$2"#)
+        .bind(account_id)
+        .bind(plan_id)
+        .bind(on)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub fn plan_ready(sc: &SourceConfig) -> Result<(), String> {
     if sc.scrape_prompt.trim().is_empty() {
         return Err("a scrape prompt is required".into());
@@ -1627,7 +1748,7 @@ const PLAN_COLS: &str = r#"plan_id,account_id,source,description,plan_type,kind,
 source_key_tmpl,name_tmpl,title_tmpl,company_tmpl,industry_tmpl,email_tmpl,email_status_tmpl,phone_tmpl,
 website_tmpl,linkedin_tmpl,location_tmpl,notes_tmpl,estimated_value_tmpl,min_value,learn,iterations,max_no_progress,known_limit,
 target_prospects,effort,draft_status,free_agent,favorite,model,model_scrape,model_enrich,model_planner,seed_vars_json,allow_hosts,sites,alert_email,schedule_enabled,schedule_time,
-schedule_days,next_run_at,last_scheduled_at,updated_at"#;
+schedule_days,next_run_at,last_scheduled_at,updated_at,custom_columns"#;
 
 /// A plan plus the counts the plans grid shows.
 #[derive(Debug, Clone, Serialize)]
@@ -1829,6 +1950,240 @@ pub async fn mark_mail_failed(db: &Db, mail_id: i64, err: &str, retry_in: Option
     .execute(db)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Slack: a plan's webhook settings and the posts owed for its runs
+// ---------------------------------------------------------------------------
+
+/// A plan's Slack settings. `webhook` is sealed; only `slack::open_webhook`
+/// reads it, and only the hint derived from it ever reaches a browser.
+#[derive(Debug, Clone, Default)]
+pub struct PlanSlack {
+    pub webhook: String,
+    pub enabled: bool,
+    pub layout: String,
+    pub limit: i32,
+    pub last_error: String,
+    pub last_at: Option<DateTime<Utc>>,
+}
+
+pub async fn get_plan_slack(db: &Db, account_id: i64, plan_id: i64) -> Result<Option<PlanSlack>> {
+    let row = sqlx::query(
+        r#"SELECT slack_webhook, slack_enabled, slack_layout, slack_limit, slack_last_error, slack_last_at
+           FROM plan WHERE account_id=$1 AND plan_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| PlanSlack {
+        webhook: r.get("slack_webhook"),
+        enabled: r.get("slack_enabled"),
+        layout: r.get("slack_layout"),
+        limit: r.get("slack_limit"),
+        last_error: r.get("slack_last_error"),
+        last_at: r.get("slack_last_at"),
+    }))
+}
+
+/// Save a plan's Slack settings. A new webhook clears the last delivery's
+/// error: it was about the old one.
+pub async fn set_plan_slack(db: &Db, account_id: i64, plan_id: i64, s: &PlanSlack, webhook_changed: bool) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE plan SET slack_webhook=$3, slack_enabled=$4, slack_layout=$5, slack_limit=$6,
+                  slack_last_error = CASE WHEN $7 THEN '' ELSE slack_last_error END,
+                  slack_last_at    = CASE WHEN $7 THEN NULL ELSE slack_last_at END,
+                  updated_at=now()
+           WHERE account_id=$1 AND plan_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(&s.webhook)
+    .bind(s.enabled)
+    .bind(&s.layout)
+    .bind(s.limit)
+    .bind(webhook_changed)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// How the latest delivery to a plan's channel went ("" = it worked).
+pub async fn record_slack_result(db: &Db, account_id: i64, plan_id: i64, err: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE plan SET slack_last_error=$3, slack_last_at=now() WHERE account_id=$1 AND plan_id=$2"#)
+        .bind(account_id)
+        .bind(plan_id)
+        .bind(err.chars().take(300).collect::<String>())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Owe a Slack post for a run's new rows — only when the plan has Slack on and
+/// a webhook set, decided in the same statement so a run never needs to know
+/// anything about the settings.
+pub async fn queue_slack_post(db: &Db, account_id: i64, plan_id: i64, execution_id: i64, since: DateTime<Utc>) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        r#"INSERT INTO slack_outbox (account_id, plan_id, execution_id, since)
+           SELECT account_id, plan_id, $3, $4 FROM plan
+           WHERE account_id=$1 AND plan_id=$2 AND slack_enabled AND slack_webhook <> ''
+           RETURNING slack_id"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(execution_id)
+    .bind(since)
+    .fetch_optional(db)
+    .await?)
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackPost {
+    pub slack_id: i64,
+    pub account_id: i64,
+    pub plan_id: i64,
+    pub since: DateTime<Utc>,
+    /// The end of the window: when the run queued it.
+    pub until: DateTime<Utc>,
+    pub parts_sent: i32,
+    pub attempts: i32,
+}
+
+/// Claim the next Slack post owed and due — the same lease-as-retry as
+/// `claim_due_mail`, and like it, across every tenant.
+pub async fn claim_due_slack(db: &Db, retry_after_seconds: i64) -> Result<Option<SlackPost>> {
+    let row = sqlx::query(
+        r#"UPDATE slack_outbox
+           SET attempts = attempts + 1,
+               next_attempt_at = now() + make_interval(secs => $1::double precision)
+           WHERE slack_id = (
+               SELECT slack_id FROM slack_outbox
+               WHERE sent_at IS NULL AND next_attempt_at <= now()
+               ORDER BY next_attempt_at
+               LIMIT 1
+               FOR UPDATE SKIP LOCKED
+           )
+           RETURNING slack_id, account_id, plan_id, since, created_at, parts_sent, attempts"#,
+    )
+    .bind(retry_after_seconds as f64)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| SlackPost {
+        slack_id: r.get("slack_id"),
+        account_id: r.get("account_id"),
+        plan_id: r.get("plan_id"),
+        since: r.get("since"),
+        until: r.get("created_at"),
+        parts_sent: r.get("parts_sent"),
+        attempts: r.get("attempts"),
+    }))
+}
+
+pub async fn mark_slack_parts(db: &Db, slack_id: i64, parts_sent: i32) -> Result<()> {
+    sqlx::query(r#"UPDATE slack_outbox SET parts_sent=$2 WHERE slack_id=$1"#)
+        .bind(slack_id)
+        .bind(parts_sent)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn mark_slack_sent(db: &Db, slack_id: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE slack_outbox SET sent_at=now(), last_error='' WHERE slack_id=$1"#)
+        .bind(slack_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// As `mark_mail_failed`: `None` gives up.
+pub async fn mark_slack_failed(db: &Db, slack_id: i64, err: &str, retry_in: Option<i64>) -> Result<()> {
+    let secs = retry_in.unwrap_or(86_400 * 365) as f64;
+    sqlx::query(
+        r#"UPDATE slack_outbox
+           SET last_error=$2, next_attempt_at = now() + make_interval(secs => $3::double precision)
+           WHERE slack_id=$1"#,
+    )
+    .bind(slack_id)
+    .bind(err.chars().take(500).collect::<String>())
+    .bind(secs)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// A plan's prospects first seen in `[since, until]`, oldest first.
+pub async fn prospects_found_between(
+    db: &Db,
+    account_id: i64,
+    plan_id: i64,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<ProspectRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {PROSPECT_COLS} FROM prospect pr JOIN plan p ON p.plan_id = pr.plan_id
+           WHERE pr.account_id=$1 AND pr.plan_id=$2 AND pr.first_seen_utc >= $3 AND pr.first_seen_utc <= $4
+           ORDER BY pr.prospect_id LIMIT $5"#
+    ))
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(since)
+    .bind(until)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(ProspectRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+/// A plan's artifacts first seen in `[since, until]`, oldest first.
+pub async fn artifacts_found_between(
+    db: &Db,
+    account_id: i64,
+    plan_id: i64,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<ArtifactRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {ARTIFACT_COLS} FROM artifact a JOIN plan p ON p.plan_id = a.plan_id
+           WHERE a.account_id=$1 AND a.plan_id=$2 AND a.first_seen_utc >= $3 AND a.first_seen_utc <= $4
+           ORDER BY a.artifact_id LIMIT $5"#
+    ))
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(since)
+    .bind(until)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(ArtifactRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Titles of the reports or files a plan first saw in `[since, until]`.
+pub async fn titles_found_between(
+    db: &Db,
+    account_id: i64,
+    plan_id: i64,
+    kind: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let sql = match kind {
+        "report" => r#"SELECT title FROM report WHERE account_id=$1 AND plan_id=$2 AND first_seen_utc >= $3 AND first_seen_utc <= $4 ORDER BY report_id LIMIT $5"#,
+        "assets" => r#"SELECT title FROM asset WHERE account_id=$1 AND plan_id=$2 AND first_seen_utc >= $3 AND first_seen_utc <= $4 ORDER BY asset_id LIMIT $5"#,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(sqlx::query_scalar(sql)
+        .bind(account_id)
+        .bind(plan_id)
+        .bind(since)
+        .bind(until)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(db)
+        .await?)
 }
 
 pub fn public_draft_status(status: &str) -> String {
@@ -2787,6 +3142,43 @@ pub async fn list_results(db: &Db, account_id: i64, f: &ResultsFilter) -> Result
             })
         })
         .collect();
+    // A table row's detail is its fields — less the internal ones (the link a
+    // plan with typed columns carries for identity), which are not output
+    // columns. The row's link is already `url`.
+    let mut out = out;
+    let plan_ids: Vec<i64> = out.iter().filter(|r| r["kind"] == "artifact").filter_map(|r| r["plan_id"].as_i64()).collect();
+    if !plan_ids.is_empty() {
+        let schemas: Vec<(i64, String, bool)> = sqlx::query_as(
+            r#"SELECT plan_id, fields_schema_json, custom_columns FROM plan WHERE account_id=$1 AND plan_id = ANY($2)"#,
+        )
+        .bind(account_id)
+        .bind(&plan_ids)
+        .fetch_all(db)
+        .await?;
+        // Per plan: the internal keys to drop, and — for a plan whose columns
+        // the person typed — the only keys to keep (theirs, and when it was seen).
+        let rules: HashMap<i64, (Vec<String>, Option<Vec<String>>)> = schemas
+            .into_iter()
+            .map(|(id, json, custom)| {
+                let schema = crate::artifact::parse_schema(&json);
+                let custom = custom || schema.iter().any(|f| f.is_internal());
+                let internal = schema.iter().filter(|f| f.is_internal()).map(|f| f.key.clone()).collect();
+                let keep = custom.then(|| crate::artifact::output_columns(&schema).into_iter().map(|f| f.key).collect());
+                (id, (internal, keep))
+            })
+            .collect();
+        for r in out.iter_mut().filter(|r| r["kind"] == "artifact") {
+            let Some((internal, keep)) = r["plan_id"].as_i64().and_then(|id| rules.get(&id)).cloned() else { continue };
+            if let Some(d) = r.get_mut("detail").and_then(Value::as_object_mut) {
+                for k in internal {
+                    d.remove(&k);
+                }
+                if let Some(keep) = keep {
+                    d.retain(|k, _| keep.contains(k) || k == "First seen");
+                }
+            }
+        }
+    }
     let total: i64 = sqlx::query_scalar(&format!("{cte} SELECT count(*) FROM r {filter}"))
         .bind(account_id)
         .bind(f.plan_id)
@@ -3468,20 +3860,6 @@ pub async fn active_execution_for_plan(db: &Db, plan_id: i64) -> Result<Option<E
            WHERE r.plan_id=$1 AND r.status IN ('queued','running') ORDER BY r.execution_id DESC LIMIT 1"#
     ))
     .bind(plan_id)
-    .fetch_optional(db)
-    .await?;
-    row.map(|r| ExecutionRecord::from_row(&r).map_err(Into::into)).transpose()
-}
-
-/// Only one execution may spend a workspace's wallet at a time. This avoids
-/// two agent processes both having an in-flight, not-yet-reported token slice
-/// when the last credits are consumed.
-pub async fn active_execution_for_account(db: &Db, account_id: i64) -> Result<Option<ExecutionRecord>> {
-    let row = sqlx::query(&format!(
-        r#"SELECT {EXECUTION_COLS} FROM execution r JOIN plan p ON p.plan_id=r.plan_id
-           WHERE r.account_id=$1 AND r.status IN ('queued','running') ORDER BY r.execution_id DESC LIMIT 1"#
-    ))
-    .bind(account_id)
     .fetch_optional(db)
     .await?;
     row.map(|r| ExecutionRecord::from_row(&r).map_err(Into::into)).transpose()
@@ -4361,19 +4739,41 @@ pub async fn grant_dev_credits_if_empty(db: &Db, account_id: i64, usd_micros: i6
 /// transaction. A retry sees the unique payment_ref and cannot credit twice;
 /// a crash cannot leave a recorded purchase whose credits were never added.
 pub async fn apply_credit_purchase(db: &Db, account_id: i64, usd_micros: i64, payment_ref: &str) -> Result<bool> {
+    apply_credit(db, account_id, usd_micros, payment_ref, "purchase", "", "").await
+}
+
+/// Free credit an operator adds by hand. The same wallet path as a purchase
+/// (debt is repaid first), recorded as a grant so it is never read as revenue.
+pub async fn apply_credit_grant(db: &Db, account_id: i64, usd_micros: i64, note: &str, operator: &str) -> Result<bool> {
+    let mut id = [0u8; 12];
+    {
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut id);
+    }
+    let payment_ref = format!("grant_{}", id.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    apply_credit(db, account_id, usd_micros, &payment_ref, "grant", note, operator).await
+}
+
+/// Add credit once per `payment_ref`: `false` means that reference was
+/// already applied (a retried request or a repeated webhook), and nothing
+/// changed — the caller must not announce it again.
+async fn apply_credit(db: &Db, account_id: i64, usd_micros: i64, payment_ref: &str, kind: &str, note: &str, by: &str) -> Result<bool> {
     if usd_micros <= 0 {
         bail!("credit purchase must be positive");
     }
     ensure_usage(db, account_id).await?;
     let mut tx = db.begin().await?;
     let inserted = sqlx::query(
-        r#"INSERT INTO credit_purchase (account_id, usd_micros, payment_ref, status)
-           VALUES ($1,$2,$3,'succeeded')
+        r#"INSERT INTO credit_purchase (account_id, usd_micros, payment_ref, status, kind, note, granted_by)
+           VALUES ($1,$2,$3,'succeeded',$4,$5,$6)
            ON CONFLICT (payment_ref) DO NOTHING"#,
     )
     .bind(account_id)
     .bind(usd_micros)
     .bind(payment_ref)
+    .bind(kind)
+    .bind(note)
+    .bind(by)
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -5033,7 +5433,9 @@ pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"SELECT a.account_id, a.email, a.display_name, a.enabled_kinds, a.connected_logins, a.created_at,
                   (a.mfa_enabled_at IS NOT NULL) AS mfa_enabled, a.sell_usd_per_mtoken,
-                  (SELECT count(*) FROM plan p WHERE p.account_id = a.account_id) AS plans
+                  (SELECT count(*) FROM plan p WHERE p.account_id = a.account_id) AS plans,
+                  coalesce((SELECT u.credit_usd_micros FROM account_usage u WHERE u.account_id = a.account_id), 0) AS credit_micros,
+                  coalesce((SELECT sum(c.usd_micros) FROM credit_purchase c WHERE c.account_id = a.account_id AND c.kind='grant'), 0)::bigint AS granted_micros
            FROM account a ORDER BY a.account_id DESC LIMIT $1"#,
     )
     .bind(limit.clamp(1, 500))
@@ -5052,6 +5454,9 @@ pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
                 // Its own rate, or null when it pays the installation's.
                 "sell_usd_per_mtoken": r.get::<Option<f64>, _>("sell_usd_per_mtoken"),
                 "plans": r.get::<i64, _>("plans"),
+                // Spendable credit now, and how much of all credit ever added was free.
+                "credits_usd": r.get::<i64, _>("credit_micros") as f64 / 1e6,
+                "granted_usd": r.get::<i64, _>("granted_micros") as f64 / 1e6,
                 "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
             })
         })
@@ -5207,6 +5612,33 @@ pub async fn request_execution_cancel(db: &Db, execution_id: i64) -> Result<()> 
 }
 
 /// Queued runs the placement loop has not yet routed to a slot.
+/// Runs waiting in local dispatch, oldest first: (execution, plan, account).
+/// Internal to the runner — never answers a request.
+/// Results a plan stored since `since` — what a run found, when it ended
+/// before it could count them itself.
+pub async fn count_found_since(db: &Db, plan_id: i64, since: DateTime<Utc>) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"SELECT (SELECT count(*) FROM prospect WHERE plan_id=$1 AND first_seen_utc >= $2)
+                + (SELECT count(*) FROM artifact WHERE plan_id=$1 AND first_seen_utc >= $2)
+                + (SELECT count(*) FROM report   WHERE plan_id=$1 AND first_seen_utc >= $2)
+                + (SELECT count(*) FROM asset    WHERE plan_id=$1 AND first_seen_utc >= $2)"#,
+    )
+    .bind(plan_id)
+    .bind(since)
+    .fetch_one(db)
+    .await?)
+}
+
+pub async fn queued_local_executions(db: &Db, limit: i64) -> Result<Vec<(i64, i64, i64)>> {
+    Ok(sqlx::query_as(
+        r#"SELECT execution_id, plan_id, account_id FROM execution
+           WHERE status='queued' AND host_id IS NULL ORDER BY execution_id LIMIT $1"#,
+    )
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?)
+}
+
 pub async fn unplaced_queued_executions(db: &Db, limit: i64) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
         r#"SELECT execution_id FROM execution WHERE status='queued' AND host_id IS NULL ORDER BY execution_id LIMIT $1"#,
@@ -5368,6 +5800,202 @@ pub async fn set_outreach_profile(db: &Db, account_id: i64, product: &str, rules
     Ok(())
 }
 
+/// A plan's own outreach design. Used only while `custom` is on; the text is
+/// kept when it is switched off, so turning it back on loses nothing.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct PlanOutreach {
+    pub custom: bool,
+    /// With `custom` off: the saved profile this plan uses, if any.
+    #[serde(default)]
+    pub design_id: Option<i64>,
+    /// Who this campaign is for and the angle to take.
+    pub brief: String,
+    /// Replaces the workspace's product description when set.
+    pub product: String,
+    /// Added to the workspace's rules; these win where they differ.
+    pub rules: String,
+}
+
+/// A campaign as the drafter sees it: a saved profile, or a plan's own
+/// design. Exactly one of `plan_id` / `design_id` is set — the one a draft
+/// is pinned to.
+#[derive(Debug, Clone, Default)]
+pub struct Campaign {
+    pub plan_id: Option<i64>,
+    pub design_id: Option<i64>,
+    pub name: String,
+    pub design: PlanOutreach,
+}
+
+/// A saved outreach profile, not tied to any plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutreachDesign {
+    pub design_id: i64,
+    pub name: String,
+    pub brief: String,
+    pub product: String,
+    pub rules: String,
+    /// Plans using it as their outreach.
+    pub plans: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn list_outreach_designs(db: &Db, account_id: i64) -> Result<Vec<OutreachDesign>> {
+    let rows = sqlx::query(
+        r#"SELECT d.design_id, d.name, d.brief, d.product, d.rules, d.updated_at,
+                  (SELECT count(*) FROM plan p WHERE p.account_id=d.account_id AND p.outreach_design_id=d.design_id AND NOT p.outreach_custom) AS plans
+           FROM outreach_design d WHERE d.account_id=$1 ORDER BY lower(d.name)"#,
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| OutreachDesign {
+            design_id: r.get("design_id"),
+            name: r.get("name"),
+            brief: r.get("brief"),
+            product: r.get("product"),
+            rules: r.get("rules"),
+            plans: r.get("plans"),
+            updated_at: r.get("updated_at"),
+        })
+        .collect())
+}
+
+/// Whether a design is this workspace's.
+pub async fn outreach_design_exists(db: &Db, account_id: i64, design_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(r#"SELECT design_id FROM outreach_design WHERE account_id=$1 AND design_id=$2"#)
+        .bind(account_id)
+        .bind(design_id)
+        .fetch_optional(db)
+        .await?
+        .is_some())
+}
+
+/// Create (`design_id` None) or update a saved profile. `Ok(None)` when the
+/// one to update is not this workspace's. A name already taken is an error
+/// the caller turns into a message.
+pub async fn save_outreach_design(
+    db: &Db,
+    account_id: i64,
+    design_id: Option<i64>,
+    name: &str,
+    d: &PlanOutreach,
+    by: i64,
+) -> Result<Option<i64>> {
+    let q = match design_id {
+        None => sqlx::query_scalar::<_, i64>(
+            r#"INSERT INTO outreach_design (account_id, name, brief, product, rules, created_by)
+               VALUES ($1,$3,$4,$5,$6,$7) RETURNING design_id"#,
+        ),
+        Some(_) => sqlx::query_scalar::<_, i64>(
+            r#"UPDATE outreach_design SET name=$3, brief=$4, product=$5, rules=$6, updated_at=now()
+               WHERE account_id=$1 AND design_id=$2 RETURNING design_id"#,
+        ),
+    };
+    Ok(q.bind(account_id)
+        .bind(design_id.unwrap_or(0))
+        .bind(name)
+        .bind(&d.brief)
+        .bind(&d.product)
+        .bind(&d.rules)
+        .bind(by)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// Delete a saved profile. Plans that used it fall back to the workspace's
+/// settings; drafts written with it keep their text.
+pub async fn delete_outreach_design(db: &Db, account_id: i64, design_id: i64) -> Result<bool> {
+    Ok(sqlx::query(r#"DELETE FROM outreach_design WHERE account_id=$1 AND design_id=$2"#)
+        .bind(account_id)
+        .bind(design_id)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+pub async fn get_plan_outreach(db: &Db, account_id: i64, plan_id: i64) -> Result<Option<PlanOutreach>> {
+    let row = sqlx::query(
+        r#"SELECT outreach_custom, outreach_brief, outreach_product, outreach_rules, outreach_design_id FROM plan WHERE account_id=$1 AND plan_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| PlanOutreach { custom: r.get(0), brief: r.get(1), product: r.get(2), rules: r.get(3), design_id: r.get(4) }))
+}
+
+pub async fn set_plan_outreach(db: &Db, account_id: i64, plan_id: i64, o: &PlanOutreach) -> Result<bool> {
+    Ok(sqlx::query(
+        r#"UPDATE plan SET outreach_custom=$3, outreach_brief=$4, outreach_product=$5, outreach_rules=$6, outreach_design_id=$7, updated_at=now()
+           WHERE account_id=$1 AND plan_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(o.custom)
+    .bind(&o.brief)
+    .bind(&o.product)
+    .bind(&o.rules)
+    .bind(o.design_id)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// The design a draft is written to: a saved profile picked for it, else its
+/// plan's own design, else the saved profile that plan uses. `None` means the
+/// workspace's settings alone. Everything is looked up within the workspace,
+/// so an id from elsewhere resolves to nothing.
+pub async fn outreach_campaign(db: &Db, account_id: i64, design_id: Option<i64>, plan_id: Option<i64>) -> Result<Option<Campaign>> {
+    let from_design = |r: sqlx::postgres::PgRow| Campaign {
+        plan_id: None,
+        design_id: Some(r.get(0)),
+        name: r.get(1),
+        design: PlanOutreach { custom: true, design_id: None, brief: r.get(2), product: r.get(3), rules: r.get(4) },
+    };
+    const DESIGN: &str = r#"SELECT design_id, name, brief, product, rules FROM outreach_design WHERE account_id=$1 AND design_id=$2"#;
+    if let Some(id) = design_id {
+        return Ok(sqlx::query(DESIGN).bind(account_id).bind(id).fetch_optional(db).await?.map(from_design));
+    }
+    let Some(plan_id) = plan_id else { return Ok(None) };
+    let Some(r) = sqlx::query(
+        r#"SELECT source, outreach_custom, outreach_brief, outreach_product, outreach_rules, outreach_design_id
+           FROM plan WHERE account_id=$1 AND plan_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .fetch_optional(db)
+    .await?
+    else {
+        return Ok(None);
+    };
+    if r.get::<bool, _>(1) {
+        return Ok(Some(Campaign {
+            plan_id: Some(plan_id),
+            design_id: None,
+            name: r.get(0),
+            design: PlanOutreach { custom: true, design_id: None, brief: r.get(2), product: r.get(3), rules: r.get(4) },
+        }));
+    }
+    match r.get::<Option<i64>, _>(5) {
+        Some(id) => Ok(sqlx::query(DESIGN).bind(account_id).bind(id).fetch_optional(db).await?.map(from_design)),
+        None => Ok(None),
+    }
+}
+
+/// Plans in a workspace with their own outreach on — what a hand-entered
+/// draft can be written for.
+pub async fn outreach_campaigns(db: &Db, account_id: i64) -> Result<Vec<(i64, String)>> {
+    Ok(sqlx::query_as(r#"SELECT plan_id, source FROM plan WHERE account_id=$1 AND outreach_custom ORDER BY lower(source)"#)
+        .bind(account_id)
+        .fetch_all(db)
+        .await?)
+}
+
 /// A person's own sign-off. Theirs, whichever workspace they draft in.
 pub async fn get_outreach_footer(db: &Db, person: i64) -> Result<String> {
     let f: Option<String> = sqlx::query_scalar(r#"SELECT outreach_footer FROM account WHERE account_id=$1"#)
@@ -5404,11 +6032,20 @@ pub struct OutreachRow {
     pub updated_at: DateTime<Utc>,
     /// Who drafted it, for a team's list.
     pub created_by_name: String,
+    /// The plan whose own outreach design it was written with, if any.
+    pub plan_id: Option<i64>,
+    /// The saved profile it was written with, if any.
+    pub design_id: Option<i64>,
+    /// What it was written for: the profile's name, or the plan's.
+    pub campaign: Option<String>,
 }
 
 const OUTREACH_COLS: &str = r#"o.outreach_id, o.created_by, o.prospect_id, o.recipient_name, o.recipient_email,
 o.recipient_title, o.recipient_company, o.recipient_notes, o.subject, o.body, o.footer, o.version,
-o.created_at, o.updated_at, coalesce(nullif(a.display_name,''), a.email, '') AS created_by_name"#;
+o.created_at, o.updated_at, coalesce(nullif(a.display_name,''), a.email, '') AS created_by_name, o.plan_id,
+o.design_id,
+coalesce((SELECT d.name FROM outreach_design d WHERE d.design_id=o.design_id AND d.account_id=o.account_id),
+         (SELECT p.source FROM plan p WHERE p.plan_id=o.plan_id AND p.account_id=o.account_id AND p.outreach_custom)) AS campaign"#;
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct OutreachVersionRow {
@@ -5453,6 +6090,7 @@ pub async fn create_outreach(
     account_id: i64,
     by: i64,
     prospect_id: Option<i64>,
+    campaign: Option<&Campaign>,
     to: &Recipient,
     footer: &str,
     text: &OutreachText<'_>,
@@ -5460,8 +6098,8 @@ pub async fn create_outreach(
     let mut tx = db.begin().await?;
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO outreach (account_id, created_by, prospect_id, recipient_name, recipient_email, recipient_title,
-                                 recipient_company, recipient_notes, subject, body, footer)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING outreach_id"#,
+                                 recipient_company, recipient_notes, subject, body, footer, plan_id, design_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING outreach_id"#,
     )
     .bind(account_id)
     .bind(by)
@@ -5474,6 +6112,8 @@ pub async fn create_outreach(
     .bind(text.subject)
     .bind(text.body)
     .bind(footer)
+    .bind(campaign.and_then(|c| c.plan_id))
+    .bind(campaign.and_then(|c| c.design_id))
     .fetch_one(&mut *tx)
     .await?;
     insert_outreach_version(&mut tx, account_id, id, 1, by, text).await?;
@@ -5761,5 +6401,172 @@ mod kind_permission_tests {
         assert_eq!(DEFAULT_KINDS, ["prospects", "artifacts"]);
         assert!(!DEFAULT_KINDS.contains(&"report"));
         assert!(!DEFAULT_KINDS.contains(&"assets"));
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    /// Against the dev database: free credit lands in the wallet as a grant,
+    /// the owner is emailed once, and a repeated payment is neither credited
+    /// nor announced twice.
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn credit_is_added_once_and_announced_once() {
+        let db = connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let email = format!("credit-{}@local.test", chrono::Utc::now().timestamp_nanos_opt().unwrap());
+        let a: i64 = sqlx::query_scalar("INSERT INTO account (email) VALUES ($1) RETURNING account_id").bind(&email).fetch_one(&db).await.unwrap();
+
+        assert!(apply_credit_grant(&db, a, 100_000_000, "Welcome aboard", "ops@huntwell.test").await.unwrap());
+        crate::web::billing::announce_credit(&db, a, 100_000_000, true, "Welcome aboard").await;
+        let (kind, note, by): (String, String, String) =
+            sqlx::query_as("SELECT kind, note, granted_by FROM credit_purchase WHERE account_id=$1").bind(a).fetch_one(&db).await.unwrap();
+        assert_eq!((kind.as_str(), note.as_str(), by.as_str()), ("grant", "Welcome aboard", "ops@huntwell.test"));
+        assert_eq!(ensure_usage(&db, a).await.unwrap().credits_usd, 100.0);
+
+        // A purchase, then the same payment again (a retry, a repeated webhook).
+        assert!(apply_credit_purchase(&db, a, 25_000_000, &format!("pi_test_{a}")).await.unwrap());
+        assert!(!apply_credit_purchase(&db, a, 25_000_000, &format!("pi_test_{a}")).await.unwrap());
+        assert_eq!(ensure_usage(&db, a).await.unwrap().credits_usd, 125.0);
+
+        let mail: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT to_address, kind, subject FROM mail_outbox WHERE account_id=$1").bind(a).fetch_all(&db).await.unwrap();
+        assert_eq!(mail, vec![(email.clone(), "credit_grant".into(), "$100.00 in free credit added".into())]);
+        purge_account(&db, a).await.unwrap();
+    }
+
+    /// Against the dev database: which design a draft is written to.
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn a_draft_is_written_to_the_right_design() {
+        let db = connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let tag = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let acct = |e: String| {
+            let db = db.clone();
+            async move { sqlx::query_scalar::<_, i64>("INSERT INTO account (email) VALUES ($1) RETURNING account_id").bind(e).fetch_one(&db).await.unwrap() }
+        };
+        let (ws, other) = (acct(format!("c-{tag}@local.test")).await, acct(format!("c-o-{tag}@local.test")).await);
+        let plan = |a: i64, name: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("INSERT INTO plan (account_id, source) VALUES ($1,$2) RETURNING plan_id").bind(a).bind(name).fetch_one(&db).await.unwrap()
+            }
+        };
+        let (plain, own, linked) = (plan(ws, "plain").await, plan(ws, "own").await, plan(ws, "linked").await);
+        let d = PlanOutreach { custom: true, design_id: None, brief: "renovated".into(), product: String::new(), rules: String::new() };
+        let design = save_outreach_design(&db, ws, None, "Renovated", &d, ws).await.unwrap().unwrap();
+        let theirs = save_outreach_design(&db, other, None, "Theirs", &d, other).await.unwrap().unwrap();
+        set_plan_outreach(&db, ws, own, &PlanOutreach { custom: true, design_id: None, brief: "own brief".into(), ..Default::default() }).await.unwrap();
+        set_plan_outreach(&db, ws, linked, &PlanOutreach { custom: false, design_id: Some(design), ..Default::default() }).await.unwrap();
+
+        let c = |d: Option<i64>, p: Option<i64>| {
+            let db = db.clone();
+            async move { outreach_campaign(&db, ws, d, p).await.unwrap().map(|c| (c.name, c.plan_id, c.design_id)) }
+        };
+        assert_eq!(c(None, None).await, None);
+        assert_eq!(c(None, Some(plain)).await, None, "a plan with nothing set uses the workspace's settings");
+        assert_eq!(c(None, Some(own)).await, Some(("own".into(), Some(own), None)));
+        assert_eq!(c(None, Some(linked)).await, Some(("Renovated".into(), None, Some(design))), "a plan using a profile");
+        assert_eq!(c(Some(design), Some(own)).await, Some(("Renovated".into(), None, Some(design))), "a picked profile wins over the plan");
+        assert_eq!(c(Some(theirs), None).await, None, "another workspace's profile is invisible");
+        // Deleting a profile sends the plan that used it back to the workspace's settings.
+        assert!(delete_outreach_design(&db, ws, design).await.unwrap());
+        assert_eq!(c(None, Some(linked)).await, None);
+
+        for a in [ws, other] {
+            purge_account(&db, a).await.unwrap();
+        }
+    }
+
+    /// Against the dev database (`./local-infra/start.sh`): a deleted account
+    /// leaves no row anywhere, and nobody else's data goes with it.
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn deleting_an_account_leaves_nothing_behind() {
+        let db = connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let tag = format!("purge-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap());
+        let mk = |who: &str| format!("{who}-{tag}@local.test");
+        let q = |sql: &'static str| sqlx::query(sql);
+        let id = |email: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("INSERT INTO account (email) VALUES ($1) RETURNING account_id").bind(email).fetch_one(&db).await.unwrap()
+            }
+        };
+        let (gone, mate, other) = (id(mk("gone")).await, id(mk("mate")).await, id(mk("other")).await);
+
+        // Everything the account can own, plus its ties to other workspaces.
+        for (sql, a) in [
+            ("INSERT INTO plan (account_id, source) VALUES ($1, 'p')", gone),
+            ("INSERT INTO plan (account_id, source) VALUES ($1, 'p')", other),
+            ("INSERT INTO account_browser (account_id) VALUES ($1)", gone),
+            ("INSERT INTO account_usage (account_id) VALUES ($1)", gone),
+            ("INSERT INTO billing_event (account_id, event_id, event_type) VALUES ($1, 'evt_'||$1, 't')", gone),
+            ("INSERT INTO credit_purchase (account_id, payment_ref, usd_micros) VALUES ($1, 'pi_'||$1, 1)", gone),
+            ("INSERT INTO session (account_id, token_hash, expires_at) VALUES ($1, md5($1::text)||md5($1::text), now())", gone),
+            ("INSERT INTO mail_outbox (account_id, to_address, subject, html, text) VALUES ($1, 'x', 's', 'h', 't')", gone),
+            ("INSERT INTO outreach_profile (account_id) VALUES ($1)", gone),
+            ("INSERT INTO api_audit (account_id) VALUES ($1)", gone),
+            ("INSERT INTO api_key (account_id, token_hash) VALUES ($1, md5('k'||$1)||md5('k'||$1))", gone),
+        ] {
+            sqlx::query(sql).bind(a).execute(&db).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let plan: i64 = sqlx::query_scalar("SELECT plan_id FROM plan WHERE account_id=$1").bind(gone).fetch_one(&db).await.unwrap();
+        let exe: i64 = sqlx::query_scalar("INSERT INTO execution (account_id, plan_id, status) VALUES ($1,$2,'succeeded') RETURNING execution_id")
+            .bind(gone).bind(plan).fetch_one(&db).await.unwrap();
+        q("INSERT INTO route_log (execution_id, event) VALUES ($1, 'routed')").bind(exe).execute(&db).await.unwrap();
+        q("INSERT INTO prospect (account_id, plan_id, source_key, name) VALUES ($1,$2,'k','n')").bind(gone).bind(plan).execute(&db).await.unwrap();
+        q("INSERT INTO asset (account_id, plan_id, source_key, object_key) VALUES ($1,$2,'k','acct/file.pdf')").bind(gone).bind(plan).execute(&db).await.unwrap();
+        q("INSERT INTO watched_page (account_id, plan_id, url, url_key) VALUES ($1,$2,'u','u')").bind(gone).bind(plan).execute(&db).await.unwrap();
+        q("INSERT INTO slack_outbox (account_id, plan_id, since) VALUES ($1,$2,now())").bind(gone).bind(plan).execute(&db).await.unwrap();
+        let o: i64 = sqlx::query_scalar("INSERT INTO outreach (account_id, created_by) VALUES ($1,$1) RETURNING outreach_id").bind(gone).fetch_one(&db).await.unwrap();
+        q("INSERT INTO outreach_version (account_id, outreach_id, version, created_by) VALUES ($1,$2,1,$1)").bind(gone).bind(o).execute(&db).await.unwrap();
+        // A teammate in the deleted workspace, working in it right now.
+        q("INSERT INTO membership (workspace_id, member_id) VALUES ($1,$2)").bind(gone).bind(mate).execute(&db).await.unwrap();
+        q("UPDATE account SET active_workspace_id=$1 WHERE account_id=$2").bind(gone).bind(mate).execute(&db).await.unwrap();
+        q("INSERT INTO invite (workspace_id, email, invited_by_id, token) VALUES ($1,'x@y.z',$1,'t'||$1)").bind(gone).execute(&db).await.unwrap();
+        // The deleted person as a member of someone else's workspace, with a key they made there.
+        q("INSERT INTO membership (workspace_id, member_id) VALUES ($1,$2)").bind(other).bind(gone).execute(&db).await.unwrap();
+        q("INSERT INTO api_key (account_id, token_hash, created_by) VALUES ($1, md5('o'||$1)||md5('o'||$1), $2)").bind(other).bind(gone).execute(&db).await.unwrap();
+        q("INSERT INTO waitlist (email, account_id, status) VALUES ($1,$2,'joined')").bind(mk("gone")).bind(gone).execute(&db).await.unwrap();
+
+        // A run in progress blocks it.
+        q("UPDATE execution SET status='running' WHERE execution_id=$1").bind(exe).execute(&db).await.unwrap();
+        assert!(matches!(purge_account(&db, gone).await.unwrap(), Purge::Busy(1)));
+        q("UPDATE execution SET status='succeeded' WHERE execution_id=$1").bind(exe).execute(&db).await.unwrap();
+
+        match purge_account(&db, gone).await.unwrap() {
+            Purge::Done { plans, object_keys, .. } => {
+                assert_eq!(plans, 1);
+                assert_eq!(object_keys, vec!["acct/file.pdf".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(purge_account(&db, gone).await.unwrap(), Purge::NotFound));
+
+        // Nothing anywhere still points at it.
+        let cols: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT table_name::text, column_name::text FROM information_schema.columns
+               WHERE table_schema='public' AND column_name IN ('account_id','workspace_id','member_id','created_by','active_workspace_id')"#,
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        for (t, c) in cols {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t} WHERE {c}::bigint = $1")).bind(gone).fetch_one(&db).await.unwrap();
+            assert_eq!(n, 0, "{t}.{c} still has rows for the deleted account");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM route_log WHERE execution_id=$1").bind(exe).fetch_one(&db).await.unwrap();
+        assert_eq!(n, 0);
+        // The teammate is fine, just back in their own workspace; the other workspace keeps its plan.
+        let ws: Option<i64> = sqlx::query_scalar("SELECT active_workspace_id FROM account WHERE account_id=$1").bind(mate).fetch_one(&db).await.unwrap();
+        assert_eq!(ws, None);
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM plan WHERE account_id=$1").bind(other).fetch_one(&db).await.unwrap();
+        assert_eq!(n, 1);
+
+        for a in [mate, other] {
+            purge_account(&db, a).await.unwrap();
+        }
     }
 }

@@ -317,7 +317,7 @@ pub async fn signup(
     if invitation.is_none() && invite_only(&state).await? {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "Huntwell is invite-only right now — request an invitation and we'll email you if we can make room".into(),
+            "Huntwell is invite-only. Join the waitlist, and we will email you for access.".into(),
         ));
     }
     validate_signup(&body.email, &body.password).map_err(|e| bad_request(e.to_string()))?;

@@ -19,13 +19,13 @@ use crate::store::{self, Db};
 const BACKOFF_MINUTES: [i64; 5] = [1, 5, 30, 120, 360];
 /// After this many failures the message is left in the table, unsent, with its
 /// last error — visible to anyone looking, retried by nobody.
-const MAX_ATTEMPTS: i32 = 8;
+pub(crate) const MAX_ATTEMPTS: i32 = 8;
 
 /// How long a claimed message is invisible before another attempt. Long enough
 /// that a slow provider call is not treated as a crash.
-const CLAIM_LEASE_SECONDS: i64 = 300;
+pub(crate) const CLAIM_LEASE_SECONDS: i64 = 300;
 
-fn backoff_seconds(attempts: i32) -> i64 {
+pub(crate) fn backoff_seconds(attempts: i32) -> i64 {
     let i = (attempts.max(1) as usize - 1).min(BACKOFF_MINUTES.len() - 1);
     BACKOFF_MINUTES[i] * 60
 }
@@ -80,6 +80,8 @@ pub async fn serve(db: Db) -> Result<()> {
     tracing::info!("notification service ready");
     loop {
         tick.tick().await;
+        // Slack posts owed for runs' new results; see `slack`.
+        crate::slack::drain(&db).await;
         loop {
             let mail = match store::claim_due_mail(&db, CLAIM_LEASE_SECONDS).await {
                 Ok(Some(m)) => m,

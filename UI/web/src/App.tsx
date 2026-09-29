@@ -18,7 +18,7 @@ import ApiReference from './pages/ApiReference'
 import Settings from './pages/Settings'
 import Join from './pages/Join'
 import { Privacy, Terms } from './pages/Legal'
-import { Developers, Pricing, Product, Security, UseCases } from './pages/Site'
+import { Pricing, Product, UseCases } from './pages/Site'
 import { RouteMeta } from './components/Site'
 
 function RequireAuth({ children }: { children: React.ReactElement }) {
@@ -61,8 +61,6 @@ export default function App() {
       <Route path="/product" element={<Product />} />
       <Route path="/use-cases" element={<UseCases />} />
       <Route path="/pricing" element={<Pricing />} />
-      <Route path="/developers" element={<Developers />} />
-      <Route path="/security" element={<Security />} />
       <Route path="/terms" element={<Terms />} />
       <Route path="/privacy" element={<Privacy />} />
       <Route

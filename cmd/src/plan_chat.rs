@@ -486,19 +486,81 @@ pub fn turn(req: &PlanChatRequest) -> Result<PlanChatResponse> {
 }
 
 fn suggest_plan_name(icp: &str) -> String {
-    let first = icp
-        .split(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
-        .next()
-        .unwrap_or(icp)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let name: String = first.chars().take(60).collect();
-    if name.is_empty() {
-        "New plan".into()
-    } else {
-        name
+    title_from_brief(icp)
+}
+
+/// Phrases a brief opens with that say nothing about what is being found.
+/// Longest first, so "i'm searching for" goes before "searching for".
+const LEAD_INS: &[&str] = &[
+    "i would like to find", "i would like a list of", "i'm searching for", "i am searching for", "we're searching for",
+    "i'm looking for", "i am looking for", "we're looking for", "we are looking for", "i want to find", "i need to find",
+    "help me find", "can you find", "could you find", "please find", "i want a list of", "i need a list of",
+    "give me a list of", "get me a list of", "make me a list of", "a list of", "list of", "looking for", "searching for",
+    "search for", "find me", "get me", "give me", "show me", "i want", "i need", "we need", "find", "search", "list",
+    "research", "collect", "gather", "compile", "all the", "all", "some", "any", "the",
+];
+
+/// Words a title does not end on — what is left when a sentence is cut short
+/// ("small liquor stores in the").
+const DANGLING: &[&str] = &["in", "the", "of", "for", "at", "on", "a", "an", "and", "or", "to", "near", "with", "from", "by", "around", "that", "who", "which"];
+
+/// `words` with any lead-ins taken off the front, repeatedly ("I'm looking for
+/// all the …"). A brief that is nothing but a lead-in leaves nothing.
+fn without_lead_ins(mut words: Vec<&str>) -> Vec<&str> {
+    loop {
+        let lower = words.join(" ").to_lowercase().replace('’', "'");
+        let Some(lead) = LEAD_INS.iter().find(|l| lower == **l || lower.starts_with(&format!("{l} "))) else { break };
+        let n = lead.split_whitespace().count().min(words.len());
+        words.drain(..n);
+        if words.is_empty() {
+            break;
+        }
     }
+    words
+}
+
+/// A short title for a plan, from its brief: the thing being found, without
+/// the "I'm searching for…" in front of it or a clause trailing off behind it.
+/// "I'm searching for small liquor stores in the ." → "Small liquor stores".
+/// What a plan is called when the drafting model gives no usable name.
+pub fn title_from_brief(brief: &str) -> String {
+    let first = brief.split(|c: char| matches!(c, '.' | '!' | '?' | ';' | ':' | '\n')).find(|s| !s.trim().is_empty()).unwrap_or("");
+    let mut words = without_lead_ins(first.split_whitespace().collect());
+    words.truncate(8);
+    while words.last().is_some_and(|w| DANGLING.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase().as_str())) {
+        words.pop();
+    }
+    let mut title: String = words.join(" ").trim_matches(|c: char| c.is_ascii_punctuation() && c != ')').to_string();
+    if title.chars().count() > 60 {
+        let cut: String = title.chars().take(60).collect();
+        title = cut.rsplit_once(' ').map(|(a, _)| a.to_string()).unwrap_or(cut);
+    }
+    let mut chars = title.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => "New plan".into(),
+    }
+}
+
+/// Whether a name the drafting model wrote is a title rather than the start
+/// of the brief handed back. Refused: empty, long, opening with a lead-in, or
+/// a verbatim prefix of the brief of five words or more.
+pub fn usable_title(name: &str, brief: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 70 {
+        return false;
+    }
+    let lower = name.to_lowercase().replace('’', "'");
+    let opens_with_lead_in = LEAD_INS
+        .iter()
+        .filter(|l| l.split_whitespace().count() > 1 || matches!(**l, "find" | "search" | "list"))
+        .any(|l| lower.starts_with(&format!("{l} ")));
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    // Echoed as written, or with its lead-in taken off.
+    let bare = without_lead_ins(brief.split_whitespace().collect()).join(" ");
+    let echoed = name.split_whitespace().count() >= 5
+        && (squash(brief).starts_with(&squash(name)) || squash(&bare).starts_with(&squash(name)));
+    !opens_with_lead_in && !echoed
 }
 
 /// One-shot: turn a short ICP description + wizard answers into a full plan
@@ -575,7 +637,9 @@ Design the plan:
   EXACTLY the FieldsSchemaJson keys. Be specific about good sources and paging.
 - "EnrichPrompt" (optional): how to open one item's url and fill columns left empty.
   Never change the key column. A VIN belongs in its own field, not as listing_id.
-- "Source": a short human-readable plan name.
+- "Source": the plan's title — 2 to 6 words naming what is being found, in
+  sentence case, e.g. "Small liquor stores in Austin" or "Used Land Cruisers under $40k".
+  Never the opening words of the description, and never "Find…", "Search for…" or "I'm looking for…".
 - "SeedVarsJSON": a JSON object string of starting vars the ScrapePrompt references
   (e.g. a city or a max price).
 
@@ -612,7 +676,7 @@ Respond with ONLY a fenced ```json``` object (no other prose):
     sc.learn = req.learn;
     sc.iterations = base.iterations;
     sc.target_prospects = base.target_prospects;
-    if sc.source.trim().is_empty() {
+    if !usable_title(&sc.source, icp) {
         sc.source = suggest_plan_name(icp);
     }
     if sc.scrape_prompt.trim().is_empty() {
@@ -676,7 +740,9 @@ Design the plan:
     let prompt = format!(
         r#"You are authoring a Huntwell search plan from a short description.
 {task}
-- "Source": a short human-readable plan name.
+- "Source": the plan's title — 2 to 6 words naming what is being found, in
+  sentence case, e.g. "Small liquor stores in Austin" or "Used Land Cruisers under $40k".
+  Never the opening words of the description, and never "Find…", "Search for…" or "I'm looking for…".
 - "SeedVarsJSON": a JSON object string of any starting vars the ScrapePrompt references
   (often just {{}}).
 
@@ -702,8 +768,10 @@ Respond with ONLY a fenced ```json``` object (no other prose):
         // The agent skipped it: the brief itself is the best fallback.
         sc.subject = icp.chars().take(300).collect::<String>().trim().to_string();
     }
-    if sc.source.trim().is_empty() {
-        sc.source = sc.subject.chars().take(120).collect();
+    if !usable_title(&sc.source, icp) {
+        // The subject is often a whole sentence; a title is made from it.
+        let from = if sc.subject.trim().is_empty() { icp } else { sc.subject.as_str() };
+        sc.source = title_from_brief(from);
     }
     if sc.scrape_prompt.trim().is_empty() {
         bail!("the agent did not produce a research prompt");
@@ -910,7 +978,10 @@ Wizard preferences (honor these; fill anything missing):
 
 
 {also_author}
-  - Source: short human-readable plan name (keep wizard Source if already set)
+  - Source: the plan's title — keep the wizard Source if one is set; otherwise
+    2 to 6 words naming who is being found, in sentence case, e.g. "Hotel GMs on
+    the Oregon coast". Never the opening words of the description, and never
+    "Find…", "Search for…" or "I'm looking for…".
   - SeedVarsJSON: JSON object string with sensible starting vars for this ICP
     (e.g. country/city/segment keys the scrape prompt references)
   - Field templates mapped to the JSON keys you invent in ScrapePrompt
@@ -943,8 +1014,9 @@ marketing script, not a stub."#
     if sc.scrape_prompt.trim().is_empty() {
         bail!("agent returned an empty ScrapePrompt");
     }
-    if sc.source.trim().is_empty() {
-        // Fallback name from ICP if the model omitted Source.
+    if !usable_title(&sc.source, icp) {
+        // Fallback name from the brief if the model omitted Source, or only
+        // handed back the start of the brief.
         sc.source = suggest_plan_name(icp);
     }
     // Wizard choices win for these knobs. The audience especially: the whole
@@ -1407,6 +1479,38 @@ mod tests {
         // "never a home address" is a business rule; asking for one is not.
         assert!(!business.contains("personal_email"));
         assert!(!business.contains("person_key"));
+    }
+
+    #[test]
+    fn a_title_is_what_is_being_found_not_the_start_of_the_brief() {
+        for (brief, want) in [
+            ("I'm searching for small liquor stores in the .", "Small liquor stores"),
+            ("I’m looking for independent coffee roasters in Portland and who runs them", "Independent coffee roasters in Portland and who runs"),
+            ("Find me all the used Land Cruisers under $40k in Texas", "Used Land Cruisers under $40k in Texas"),
+            ("can you find hotel GMs on the Oregon coast?", "Hotel GMs on the Oregon coast"),
+            ("A list of remote React jobs posted this week", "Remote React jobs posted this week"),
+            ("search for tenders", "Tenders"),
+            ("Dentists in Boise", "Dentists in Boise"),
+            ("I need to find", "New plan"),
+        ] {
+            let got = title_from_brief(brief);
+            assert_eq!(got, want, "{brief}");
+            assert!(got.chars().count() <= 60);
+        }
+    }
+
+    #[test]
+    fn the_start_of_the_brief_handed_back_is_not_a_title() {
+        let brief = "I'm searching for small liquor stores in the Austin area that sell craft beer";
+        assert!(!usable_title("I'm searching for small liquor stores", brief), "echoed with its lead-in");
+        assert!(!usable_title("small liquor stores in the Austin", brief), "a five-word prefix of the brief");
+        assert!(!usable_title("Find small liquor stores", brief));
+        assert!(!usable_title("", brief));
+        assert!(!usable_title(&"x ".repeat(40), brief), "too long");
+        assert!(usable_title("Small liquor stores in Austin", brief));
+        assert!(usable_title("Austin craft beer shops", brief));
+        // A short brief that is itself a fine title can be used as one.
+        assert!(usable_title("Dentists in Boise", "Dentists in Boise"));
     }
 
     #[test]

@@ -85,8 +85,10 @@ pub fn router(state: Admin) -> Router {
             .route("/admin/api/waitlist/invite", post(invite_signup))
             .route("/admin/api/waitlist/{id}/approve", post(approve_waitlist))
             .route("/admin/api/waitlist/{id}/decline", post(decline_waitlist))
+            .route("/admin/api/waitlist/{id}", axum::routing::delete(delete_waitlist))
             .route("/admin/api/accounts/{id}/kinds", axum::routing::put(put_account_kinds))
             .route("/admin/api/accounts/{id}/rate", axum::routing::put(put_account_rate))
+            .route("/admin/api/accounts/{id}/credits", post(grant_credits))
             .route("/admin/api/executions", get(recent_executions))
             .route("/admin/api/executions/{id}/log", get(execution_log))
             .route("/admin/api/route-log", get(route_log))
@@ -1074,6 +1076,96 @@ async fn decline_waitlist(State(state): State<Admin>, headers: HeaderMap, Path(i
     }
     tracing::info!(operator = %who, waitlist = id, "waitlist request declined");
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteReq {
+    /// The address, typed by the operator. Checked here as well as in the
+    /// page, so a stray request cannot delete anyone.
+    confirm: String,
+}
+
+/// Delete a waitlist request — and, when it became an account, that account
+/// and everything in it: plans, results, runs, files, keys, outreach, credits,
+/// billing records and the sign-in itself. Unrecoverable.
+async fn delete_waitlist(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>, Json(req): Json<DeleteReq>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let row = store::get_waitlist(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such request".into()))?;
+    if !req.confirm.trim().eq_ignore_ascii_case(row.email.trim()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "type the email address exactly to confirm".into()));
+    }
+    let Some(account_id) = row.account_id else {
+        store::delete_waitlist(&state.db, id).await.map_err(internal)?;
+        tracing::warn!(operator = %who, waitlist = id, email = %row.email, "waitlist request deleted");
+        return Ok(Json(json!({ "ok": true, "account_deleted": false })));
+    };
+    match store::purge_account(&state.db, account_id).await.map_err(internal)? {
+        store::Purge::NotFound => {
+            // The account went some other way; the request is all that is left.
+            store::delete_waitlist(&state.db, id).await.map_err(internal)?;
+            Ok(Json(json!({ "ok": true, "account_deleted": false })))
+        }
+        store::Purge::Busy(n) => Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("they have {n} run(s) queued or running — cancel those (or wait for them to finish), then delete"),
+        )),
+        store::Purge::Done { email, plans, object_keys } => {
+            // After the commit: the rows are gone either way, and a file or a
+            // sign-in left behind is logged rather than undoing the delete.
+            let mut files_left = 0;
+            for key in &object_keys {
+                if let Err(e) = crate::objstore::delete(key).await {
+                    files_left += 1;
+                    tracing::warn!(account_id, key, "stored file not removed: {e:#}");
+                }
+            }
+            let identity_removed = match crate::identity::delete_user(&email).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(account_id, "sign-in not removed from the user pool: {e:#}");
+                    false
+                }
+            };
+            tracing::warn!(operator = %who, account_id, email = %email, plans, files = object_keys.len(), "account deleted with all its data");
+            Ok(Json(json!({
+                "ok": true,
+                "account_deleted": true,
+                "plans": plans,
+                "files": object_keys.len(),
+                "files_left": files_left,
+                "identity_removed": identity_removed,
+            })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GrantReq {
+    usd: f64,
+    /// Shown to them in the email, as a note from Huntwell.
+    #[serde(default)]
+    note: String,
+}
+
+/// Add free credit to an account's wallet, and email its owner. Recorded as a
+/// grant (`credit_purchase.kind`), never as a payment.
+async fn grant_credits(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>, Json(req): Json<GrantReq>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
+    if !req.usd.is_finite() || req.usd < 0.01 || req.usd > 10_000.0 {
+        return Err(bad("the amount is between $0.01 and $10,000"));
+    }
+    let note = req.note.trim();
+    if note.chars().count() > 500 {
+        return Err(bad("keep the note under 500 characters"));
+    }
+    store::get_account(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
+    let micros = (req.usd * 100.0).round() as i64 * 10_000;
+    store::apply_credit_grant(&state.db, id, micros, note, &who).await.map_err(internal)?;
+    crate::web::billing::announce_credit(&state.db, id, micros, true, note).await;
+    let usage = store::ensure_usage(&state.db, id).await.map_err(internal)?;
+    tracing::warn!(operator = %who, account = id, usd = micros as f64 / 1e6, "free credit added");
+    Ok(Json(json!({ "ok": true, "credits_usd": usage.credits_usd })))
 }
 
 async fn put_account_connected_logins(

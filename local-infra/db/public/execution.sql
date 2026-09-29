@@ -45,11 +45,14 @@ CREATE TABLE IF NOT EXISTS public.execution (
 );
 CREATE INDEX IF NOT EXISTS execution_account_started_idx ON public.execution (account_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS execution_active_idx ON public.execution (plan_id) WHERE status IN ('queued','running');
--- One prepaid wallet cannot safely fund two in-flight agent processes: each
--- can have a token slice the provider has not reported yet. Kept in Postgres
--- as well as the runner so the website and scheduler cannot race.
-CREATE UNIQUE INDEX IF NOT EXISTS execution_one_active_per_account_idx
-	ON public.execution (account_id) WHERE status IN ('queued','running');
+-- A workspace may run many plans at once (2026-09-26); the wallet stays safe
+-- because every debit is atomic and capped at what it holds. What must not
+-- happen is the same plan twice at once, so that is what Postgres enforces —
+-- the website and the scheduler cannot race past it. The old one-per-account
+-- rule is dropped where it still exists.
+DROP INDEX IF EXISTS public.execution_one_active_per_account_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS execution_one_active_per_plan_idx
+	ON public.execution (plan_id) WHERE status IN ('queued','running');
 -- A slot's claim query: assigned to me, still unclaimed.
 CREATE INDEX IF NOT EXISTS execution_pool_claim_idx ON public.execution (host_id, slot_name)
 	WHERE status = 'queued' AND claimed_at IS NULL;

@@ -1,5 +1,5 @@
 import React from 'react'
-import { Modal } from './ui'
+import { CopyHover, Modal } from './ui'
 
 /// The result detail dialog — a person, an artifact row, or any result on the
 /// cross-plan Results page — so a click reads the same everywhere.
@@ -21,25 +21,12 @@ export function ResultDialog({
 }) {
   return (
     <Modal title={title} onClose={onClose} className="result-dialog">
-      <table>
+      <table className="result-fields">
         <tbody>
           {fields
             .filter(([, v]) => v !== null && v !== undefined && v !== '')
             .map(([k, v]) => (
-              <tr key={k}>
-                <td className="muted" style={{ width: 110 }}>
-                  {k}
-                </td>
-                <td style={{ wordBreak: 'break-word' }}>
-                  {typeof v === 'string' && /^https?:\/\//.test(v) ? (
-                    <a href={v} target="_blank" rel="noreferrer">
-                      {v}
-                    </a>
-                  ) : (
-                    v
-                  )}
-                </td>
-              </tr>
+              <FieldRow key={k} label={k} value={v} />
             ))}
         </tbody>
       </table>
@@ -60,5 +47,30 @@ export function ResultDialog({
         </button>
       </div>
     </Modal>
+  )
+}
+
+/// One labelled value. Hovering the row shows a copy icon beside the value; it
+/// copies the value as it reads on screen (a link's address, a formatted
+/// price), so what lands on the clipboard is what the person was looking at.
+function FieldRow({ label, value }: { label: string; value: React.ReactNode }) {
+  const cell = React.useRef<HTMLTableCellElement>(null)
+  const isLink = typeof value === 'string' && /^https?:\/\//.test(value)
+  return (
+    <tr className="result-field">
+      <td className="muted" style={{ width: 110 }}>
+        {label}
+      </td>
+      <td ref={cell} className="copyable" style={{ wordBreak: 'break-word' }}>
+        {isLink ? (
+          <a href={value as string} target="_blank" rel="noreferrer">
+            {value}
+          </a>
+        ) : (
+          value
+        )}
+        <CopyHover what={label} text={() => (typeof value === 'string' || typeof value === 'number' ? String(value) : cell.current?.innerText || '')} />
+      </td>
+    </tr>
   )
 }

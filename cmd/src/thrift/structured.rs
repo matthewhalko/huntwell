@@ -300,7 +300,7 @@ mod tests {
       ]}</script></head></html>"#;
 
     fn spec(key: &str, label: &str, ftype: &str, role: &str) -> FieldSpec {
-        FieldSpec { key: key.into(), label: label.into(), ftype: ftype.into(), role: role.into(), min: None, max: None }
+        FieldSpec { key: key.into(), label: label.into(), ftype: ftype.into(), role: role.into(), min: None, max: None, internal: false }
     }
 
     #[test]

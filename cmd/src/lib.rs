@@ -46,6 +46,7 @@ pub mod report;
 pub mod prospect;
 pub mod sandbox;
 pub mod setup;
+pub mod slack;
 pub mod store;
 pub mod qr;
 pub mod svc;

@@ -37,9 +37,21 @@ pub struct FieldSpec {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Collected and used — for the row's identity and its link — but not
+    /// one of the plan's output columns. The link `columns_to_schema` adds
+    /// when the person's own columns have none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
 }
 
 impl FieldSpec {
+    /// Not an output column: marked internal, or the link `columns_to_schema`
+    /// appended before the mark existed — always exactly key `url`, label
+    /// `Link` (a column someone typed as "Link" is keyed `link`).
+    pub fn is_internal(&self) -> bool {
+        self.internal || (self.key == "url" && self.label == "Link" && self.typed("url") && self.role == "url")
+    }
+
     fn is(&self, role: &str) -> bool {
         self.role.eq_ignore_ascii_case(role)
     }
@@ -368,6 +380,11 @@ fn guess_type(name: &str) -> &'static str {
 /// text column becomes the title, and the link doubles as the key (a source URL
 /// is unique per item almost by definition). Anything missing is added, so a
 /// plan built from one column still runs.
+/// The columns a plan outputs: its schema without the internal ones.
+pub fn output_columns(schema: &[FieldSpec]) -> Vec<FieldSpec> {
+    schema.iter().filter(|f| !f.is_internal()).cloned().collect()
+}
+
 pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
     let mut out: Vec<FieldSpec> = Vec::new();
     for c in cols {
@@ -375,7 +392,7 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
         if key.is_empty() || out.iter().any(|f| f.key == key) {
             continue;
         }
-        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new(), min: None, max: None });
+        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new(), min: None, max: None, internal: false });
     }
     if out.is_empty() {
         return out;
@@ -386,7 +403,9 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
     let url_key = match out.iter().find(|f| f.typed("url")) {
         Some(f) => f.key.clone(),
         None => {
-            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new(), min: None, max: None });
+            // Not asked for, so not an output column: it carries the row's
+            // identity and link, and the table, CSV and API leave it out.
+            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new(), min: None, max: None, internal: true });
             "url".into()
         }
     };
@@ -408,6 +427,33 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
 #[cfg(test)]
 mod column_tests {
     use super::*;
+
+    #[test]
+    fn typed_columns_are_the_only_output_columns() {
+        let schema = columns_to_schema(&cols(&["Store name", "Owner", "Phone"]));
+        // A link is added for identity — and marked internal, so it is not an output column.
+        assert!(schema.iter().any(|f| f.key == "url" && f.is_internal()));
+        let shown: Vec<String> = output_columns(&schema).into_iter().map(|f| f.label).collect();
+        assert_eq!(shown, ["Store name", "Owner", "Phone"]);
+        // The link still does its job: it is what rows are told apart by.
+        assert_eq!(ArtifactMapping::new(schema).key_field(), "url");
+    }
+
+    #[test]
+    fn a_link_the_person_typed_is_theirs_and_shown() {
+        let schema = columns_to_schema(&cols(&["Store name", "Website"]));
+        assert!(schema.iter().all(|f| !f.is_internal()), "{schema:?}");
+        assert_eq!(output_columns(&schema).len(), 2);
+        let schema = columns_to_schema(&cols(&["Store name", "Link"]));
+        assert!(schema.iter().all(|f| !f.is_internal()), "a column typed as Link is keyed `link`, not the internal one");
+    }
+
+    #[test]
+    fn plans_made_before_the_mark_are_recognised() {
+        // Stored before `internal` existed: the appended link had exactly this shape.
+        let legacy = parse_schema(r#"[{"key":"store_name","label":"Store name","type":"text","role":"title"},{"key":"url","label":"Link","type":"url","role":"url"}]"#);
+        assert_eq!(output_columns(&legacy).len(), 1);
+    }
 
     fn cols(names: &[&str]) -> Vec<ColumnRequest> {
         names.iter().map(|n| ColumnRequest { name: (*n).into(), prompt: String::new() }).collect()

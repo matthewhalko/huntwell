@@ -8,6 +8,10 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
  * Everything about a plan a person owns: what to call it, what they asked for,
  * how many results to aim for, and when it should run itself.
  *
+ * Changing what it looks for rebuilds it: saved with "Rebuild" on, the planner
+ * recreates the plan from the new description exactly as it did when the plan
+ * was made — optionally with a new title too.
+ *
  * What is deliberately absent: the scrape, enrich and planner prompts, the
  * field mapping and the dedupe key. Those are drafted by the agent, live only
  * on the server, and are never sent to a browser — so there is nothing here to
@@ -24,6 +28,15 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
   const [days, setDays] = useState(plan.ScheduleDays)
   const [alert, setAlert] = useState(!!plan.AlertEmail)
   const [busy, setBusy] = useState(false)
+  const described = description.trim() !== (plan.Description || '').trim()
+  const renamed = name.trim() !== (plan.Source || '').trim()
+  // Rebuilding follows the description: on as soon as it changes, and the
+  // person can still turn it off (or on, to rebuild an unchanged plan).
+  const [rebuildChoice, setRebuildChoice] = useState<boolean | null>(null)
+  const rebuild = rebuildChoice ?? described
+  const [retitleChoice, setRetitle] = useState(false)
+  // A name typed here is theirs; asking for a new one would overwrite it.
+  const retitle = rebuild && retitleChoice && !renamed
 
   const daySet = new Set(
     days
@@ -68,9 +81,11 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
         schedule_time: time,
         schedule_days: days,
         alert_email: alert,
+        rebuild,
+        retitle,
       })
       onSaved(saved)
-      toast('Saved')
+      toast(rebuild ? 'Saved — rebuilding the plan from your description' : 'Saved')
     } catch (err: any) {
       toast(err.message || 'Could not save', true)
     } finally {
@@ -86,6 +101,23 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
       <Field label="What this plan looks for" hint="In your own words. Huntwell works out how to find it.">
         <textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} maxLength={600} />
       </Field>
+      <div className="rebuild-box">
+        <label className="check">
+          <input type="checkbox" checked={rebuild} onChange={(e) => setRebuildChoice(e.target.checked)} /> Rebuild the plan from this
+          description
+        </label>
+        <p className="muted sm">
+          {rebuild
+            ? 'Huntwell recreates the plan from scratch, the same way it did when you made it: what it finds, the columns and how it searches. Your target, effort, schedule and alerts stay as set. Results already found are kept.'
+            : 'Off: only the settings on this page change; the plan searches the way it already does.'}
+        </p>
+        {rebuild && (
+          <label className="check" title={renamed ? 'You changed the name above, so it is kept' : undefined}>
+            <input type="checkbox" checked={retitle} disabled={renamed} onChange={(e) => setRetitle(e.target.checked)} /> Also give it a new
+            title{renamed ? ' (you changed the name, so yours is kept)' : ''}
+          </label>
+        )}
+      </div>
       <Field label="Target results each run" hint="0 means keep going until the search runs dry.">
         <input type="number" min={0} max={500} value={target} onChange={(e) => setTarget(+e.target.value)} style={{ width: 140 }} />
       </Field>
@@ -149,7 +181,7 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
 
       <hr />
       <button className="btn primary" type="submit" disabled={busy || !name.trim()}>
-        {busy ? 'Saving…' : 'Save changes'}
+        {busy ? 'Saving…' : rebuild ? 'Save and rebuild' : 'Save changes'}
       </button>
     </form>
   )

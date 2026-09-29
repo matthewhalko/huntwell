@@ -237,6 +237,20 @@ export const EFFORTS: { value: Effort; label: string; hint: string }[] = [
 /// A plan as its owner sees it: what they asked for, what it collects, when it
 /// runs. The prompts, field mapping and dedupe key that make it work are
 /// drafted server-side and never sent to the browser.
+/** `GET /api/plans/{id}/slack`. The webhook itself never comes back — only a hint of it. */
+export interface PlanSlack {
+  enabled: boolean
+  configured: boolean
+  hint: string
+  /** 'auto': rows up to `limit` in one post, else a summary and a link. 'all': every row. */
+  layout: 'auto' | 'all'
+  limit: number
+  /** Why the last post failed for good; "" when it went through. */
+  last_error: string
+  last_at: string | null
+  max_limit: number
+}
+
 export interface Plan {
   PlanId: number
   Source: string
@@ -478,6 +492,12 @@ export interface Outreach {
   version: number
   created_at: string
   updated_at: string
+  /** The plan whose own outreach it was written to, if any. */
+  plan_id?: number | null
+  /** The saved profile it was written with, if any. */
+  design_id?: number | null
+  /** What it was written for: the profile's or the plan's name; null = the workspace's settings. */
+  campaign?: string | null
 }
 
 export interface OutreachVersion {
@@ -497,6 +517,33 @@ export interface OutreachProfile {
   footer: string
   /** Whether this server can draft at all. */
   ready: boolean
+  /** Plans with their own outreach on — a hand-entered draft can be written to one. */
+  campaigns?: { plan_id: number; name: string }[]
+  /** Saved profiles — any draft can be written with one. */
+  designs?: { design_id: number; name: string }[]
+}
+
+/** A saved outreach profile: belongs to no plan; picked for a draft, or used by a plan. */
+export interface OutreachDesign {
+  design_id: number
+  name: string
+  brief: string
+  product: string
+  rules: string
+  /** Plans using it as their outreach. */
+  plans: number
+  updated_at: string
+}
+
+/** `GET /api/plans/{id}/outreach`: a plan's own outreach design, and the workspace's it falls back to. */
+export interface PlanOutreach {
+  custom: boolean
+  /** With `custom` off: the saved profile the plan uses, if any. */
+  design_id: number | null
+  brief: string
+  product: string
+  rules: string
+  workspace: { product: string; rules: string }
 }
 
 /** The recipient as one address line: `Ana Ruiz <ana@x.com>`, or whichever half is known. */

@@ -1,36 +1,89 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { SearchIcon } from './icons'
+import { CopyIcon, SearchIcon, TickIcon } from './icons'
 
 // ---- toasts ----
+//
+// One call everywhere — `toast(text)`, or `toast(text, true)` for a failure —
+// rendered as a card: an icon that says which it is, the message, a close
+// button, and a thin bar for how long it has left. Hovering holds it, so a long
+// message can be read to the end. Successes are announced politely to a screen
+// reader; failures as alerts.
 
 interface Toast {
   id: number
   text: string
   bad?: boolean
 }
+
+const TOAST_MS = 3500
+const TOAST_BAD_MS = 6500
+
 const ToastCtx = createContext<(text: string, bad?: boolean) => void>(() => {})
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([])
   const push = useCallback((text: string, bad?: boolean) => {
     const id = Date.now() + Math.random()
-    setToasts((t) => [...t, { id, text, bad }])
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), bad ? 6000 : 3500)
+    // The same message twice in a row replaces the first rather than stacking.
+    setToasts((t) => [...t.filter((x) => !(x.text === text && !!x.bad === !!bad)), { id, text, bad }].slice(-4))
   }, [])
+  const drop = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), [])
   return (
     <ToastCtx.Provider value={push}>
       {children}
-      <div className="toast-wrap">
-        {toasts.map((t) => (
-          <div key={t.id} className={'toast' + (t.bad ? ' bad' : '')}>
-            {t.text}
-          </div>
-        ))}
-      </div>
+      {createPortal(
+        <div className="toast-wrap">
+          {toasts.map((t) => (
+            <ToastCard key={t.id} toast={t} onDone={() => drop(t.id)} />
+          ))}
+        </div>,
+        document.body,
+      )}
     </ToastCtx.Provider>
   )
 }
+
+function ToastCard({ toast, onDone }: { toast: Toast; onDone: () => void }) {
+  const life = toast.bad ? TOAST_BAD_MS : TOAST_MS
+  const [leaving, setLeaving] = useState(false)
+  const [paused, setPaused] = useState(false)
+  // Time left, kept across pauses: hovering stops the clock, leaving restarts it.
+  const left = useRef(life)
+  const started = useRef(Date.now())
+  const close = useCallback(() => {
+    setLeaving(true)
+    setTimeout(onDone, 180)
+  }, [onDone])
+  useEffect(() => {
+    if (paused || leaving) return
+    started.current = Date.now()
+    const t = setTimeout(close, left.current)
+    return () => {
+      clearTimeout(t)
+      left.current = Math.max(0, left.current - (Date.now() - started.current))
+    }
+  }, [paused, leaving, close])
+  return (
+    <div
+      className={'toast' + (toast.bad ? ' bad' : ' ok') + (leaving ? ' leaving' : '')}
+      role={toast.bad ? 'alert' : 'status'}
+      aria-live={toast.bad ? 'assertive' : 'polite'}
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+    >
+      <span className="toast-ico" aria-hidden>
+        {toast.bad ? '!' : <TickIcon size={15} />}
+      </span>
+      <span className="toast-text">{toast.text}</span>
+      <button type="button" className="toast-x" aria-label="Dismiss" onClick={close}>
+        ✕
+      </button>
+      <span className="toast-life" style={{ animationDuration: `${life}ms`, animationPlayState: paused ? 'paused' : 'running' }} />
+    </div>
+  )
+}
+
 export function useToast() {
   return useContext(ToastCtx)
 }
@@ -94,8 +147,23 @@ export function ModalBackdrop({
   className?: string
   onClick?: () => void
 }) {
+  // Close only on a real click on the backdrop: pressed *and* released on it.
+  // A drag that starts inside the dialog — selecting text in an input, say —
+  // and ends outside it still fires `click` on the backdrop (the nearest
+  // common ancestor), which used to close the dialog mid-selection.
+  const pressedHere = useRef(false)
   return createPortal(
-    <div className={'modal-bg' + (className ? ' ' + className : '')} onClick={onClick}>
+    <div
+      className={'modal-bg' + (className ? ' ' + className : '')}
+      onPointerDown={(e) => {
+        pressedHere.current = e.target === e.currentTarget
+      }}
+      onClick={(e) => {
+        const real = pressedHere.current && e.target === e.currentTarget
+        pressedHere.current = false
+        if (real) onClick?.()
+      }}
+    >
       {children}
     </div>,
     document.body,
@@ -191,6 +259,44 @@ export function BuildingPhrase({ text }: { text: string }) {
     <span key={text} className="ask-building" aria-live="polite">
       {text}
     </span>
+  )
+}
+
+/// A copy icon for whatever it sits beside, shown when that thing is hovered
+/// (always, on a touch screen). Put it inside an element with the `copyable`
+/// class. `text` is copied, or — when it is a function — what it returns at
+/// click time (handy for reading an element's own text). It becomes a tick
+/// for a moment once copied, and says so in a toast.
+export function CopyHover({ text, what, className = '' }: { text: string | (() => string); what: string; className?: string }) {
+  const toast = useToast()
+  const [done, setDone] = useState(false)
+  useEffect(() => {
+    if (!done) return
+    const t = setTimeout(() => setDone(false), 1500)
+    return () => clearTimeout(t)
+  }, [done])
+  if (typeof text === 'string' && !text.trim()) return null
+  return (
+    <button
+      type="button"
+      className={'copy-hover' + (done ? ' done' : '') + (className ? ' ' + className : '')}
+      aria-label={`Copy ${what.toLowerCase()}`}
+      title={`Copy ${what.toLowerCase()}`}
+      onClick={async (e) => {
+        e.stopPropagation()
+        const value = (typeof text === 'function' ? text() : text).trim()
+        if (!value) return
+        try {
+          await navigator.clipboard.writeText(value)
+          setDone(true)
+          toast(`${what} copied`)
+        } catch {
+          toast('Copy failed — your browser blocked the clipboard', true)
+        }
+      }}
+    >
+      {done ? <TickIcon size={15} /> : <CopyIcon size={15} />}
+    </button>
   )
 }
 

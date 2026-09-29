@@ -143,19 +143,26 @@ fn write_row(out: &mut String, fields: &[&str]) {
 }
 
 /// CSV of custom artifacts. Columns come from the plan's field schema (label or
-/// key), plus Url / SourceKey / FirstSeen. Values are projected from FieldsJson
-/// by key. Reuses the same formula-defusing and quoting as prospects.
-pub fn artifacts_csv(rows: &[crate::store::ArtifactRow], schema: &[crate::artifact::FieldSpec]) -> String {
+/// key), never its internal columns. A plan whose columns the person typed
+/// (`exact`) gets exactly those; one the planner designed also gets Url /
+/// SourceKey / FirstSeen. Values are projected from FieldsJson by key. Reuses
+/// the same formula-defusing and quoting as prospects.
+pub fn artifacts_csv(rows: &[crate::store::ArtifactRow], schema: &[crate::artifact::FieldSpec], exact: bool) -> String {
+    let schema = crate::artifact::output_columns(schema);
     let mut out = String::new();
     let mut header: Vec<String> =
         schema.iter().map(|f| if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() }).collect();
-    header.extend(["Url".to_string(), "SourceKey".to_string(), "FirstSeen".to_string()]);
+    if !exact {
+        header.extend(["Url".to_string(), "SourceKey".to_string(), "FirstSeen".to_string()]);
+    }
     write_row(&mut out, &header.iter().map(String::as_str).collect::<Vec<_>>());
     for r in rows {
         let mut cells: Vec<String> = schema.iter().map(|f| json_cell(&r.fields, &f.key)).collect();
-        cells.push(r.url.clone());
-        cells.push(r.source_key.clone());
-        cells.push(r.first_seen_utc.to_rfc3339());
+        if !exact {
+            cells.push(r.url.clone());
+            cells.push(r.source_key.clone());
+            cells.push(r.first_seen_utc.to_rfc3339());
+        }
         write_row(&mut out, &cells.iter().map(String::as_str).collect::<Vec<_>>());
     }
     out
@@ -173,6 +180,19 @@ fn json_cell(fields: &serde_json::Value, key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_typed_columns_plan_exports_exactly_its_columns() {
+        let schema = crate::artifact::columns_to_schema(&[
+            crate::artifact::ColumnRequest { name: "Store name".into(), prompt: String::new() },
+            crate::artifact::ColumnRequest { name: "Phone".into(), prompt: String::new() },
+        ]);
+        let exact = artifacts_csv(&[], &schema, true);
+        assert_eq!(exact.lines().next().unwrap(), "Store name,Phone");
+        // A planner-designed plan keeps the provenance columns — still without the internal link.
+        let designed = artifacts_csv(&[], &schema, false);
+        assert_eq!(designed.lines().next().unwrap(), "Store name,Phone,Url,SourceKey,FirstSeen");
+    }
+
     use super::*;
 
     #[test]

@@ -99,6 +99,8 @@ pub fn plans_routes() -> Router<App> {
         .route("/models", get(list_models))
         .route("/plans/{id}", get(get_plan).put(update_plan).delete(delete_plan))
         .route("/plans/{id}/favorite", post(favorite_plan))
+        .route("/plans/{id}/slack", get(get_plan_slack).put(put_plan_slack))
+        .route("/plans/{id}/slack/test", post(test_plan_slack))
         .route("/plans/{id}/rebuild", post(rebuild_plan))
         .route("/plans/{id}/trail", get(plan_trail))
         .route("/plans/{id}/graph", get(plan_graph))
@@ -220,7 +222,11 @@ async fn overview(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<J
 /// meter the UI shows and the cap the run dispatcher enforces.
 async fn usage(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
     let u = store::ensure_usage(&state.db, acc.tenant()).await?;
-    Ok(Json(serde_json::to_value(u).unwrap_or_else(|_| json!({}))))
+    let mut v = serde_json::to_value(u).unwrap_or_else(|_| json!({}));
+    // What a million billable tokens costs this workspace, so a token figure
+    // (a run's limit, say) can be shown in dollars too.
+    v["usd_per_mtoken"] = json!(store::sell_rate(&state.db, acc.tenant()).await?);
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -533,6 +539,104 @@ async fn get_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): P
     Ok(Json(public_plan(&plan)))
 }
 
+// ---- Slack --------------------------------------------------------------------
+
+/// A plan's Slack settings as the browser sees them: never the webhook itself,
+/// only a hint to recognise it by.
+fn public_slack(s: &store::PlanSlack) -> Value {
+    json!({
+        "enabled": s.enabled,
+        "configured": !s.webhook.is_empty(),
+        "hint": crate::slack::hint(&s.webhook),
+        "layout": s.layout,
+        "limit": s.limit,
+        "last_error": s.last_error,
+        "last_at": s.last_at.map(|t| t.to_rfc3339()),
+        "max_limit": crate::slack::MAX_LIMIT,
+    })
+}
+
+async fn get_plan_slack(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let s = store::get_plan_slack(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+    Ok(Json(public_slack(&s)))
+}
+
+#[derive(Deserialize)]
+struct SlackBody {
+    /// A new webhook URL; "" removes the saved one; absent keeps it.
+    #[serde(default)]
+    webhook: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    layout: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+fn seal_webhook(raw: &str) -> Result<String, ApiError> {
+    let url = crate::slack::validate_webhook(raw).map_err(bad_request)?;
+    crate::slack::seal_webhook(&url).ok_or_else(|| {
+        tracing::error!("cannot seal a Slack webhook: neither HUNTWELL_API_SIGNING_KEY nor HUNTWELL_SESSION_SECRET is set");
+        bad_request("Slack can't be set up on this server right now")
+    })
+}
+
+async fn put_plan_slack(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(body): Json<SlackBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
+    let mut s = store::get_plan_slack(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+    let mut changed = false;
+    if let Some(w) = body.webhook {
+        s.webhook = if w.trim().is_empty() { String::new() } else { seal_webhook(&w)? };
+        changed = true;
+    }
+    if let Some(l) = body.layout {
+        if !crate::slack::LAYOUTS.contains(&l.as_str()) {
+            return Err(bad_request("layout is 'auto' or 'all'"));
+        }
+        s.layout = l;
+    }
+    if let Some(n) = body.limit {
+        s.limit = n.clamp(1, crate::slack::MAX_LIMIT as i64) as i32;
+    }
+    if let Some(on) = body.enabled {
+        s.enabled = on;
+    }
+    if s.enabled && s.webhook.is_empty() {
+        return Err(bad_request("paste a Slack webhook URL to turn this on"));
+    }
+    store::set_plan_slack(&state.db, acc.tenant(), id, &s, changed).await?;
+    let s = store::get_plan_slack(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+    Ok(Json(public_slack(&s)))
+}
+
+#[derive(Deserialize)]
+struct SlackTestBody {
+    /// Test this URL instead of the saved one — so it can be checked before
+    /// it is saved.
+    #[serde(default)]
+    webhook: Option<String>,
+}
+
+/// Post a "connected" message to the channel, and say plainly if Slack refused.
+async fn test_plan_slack(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(body): Json<SlackTestBody>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
+    let plan = store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+    let url = match body.webhook.filter(|w| !w.trim().is_empty()) {
+        Some(w) => crate::slack::validate_webhook(&w).map_err(bad_request)?,
+        None => {
+            let s = store::get_plan_slack(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+            if s.webhook.is_empty() {
+                return Err(bad_request("paste a Slack webhook URL first"));
+            }
+            crate::slack::open_webhook(&s.webhook).ok_or_else(|| bad_request("the saved webhook can't be read on this server — paste it again"))?
+        }
+    };
+    let msg = crate::slack::test_message(&plan.source, crate::slack::plan_link(id).as_deref());
+    crate::slack::send(&url, &msg).await.map_err(|e| bad_request(e.message()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 fn validate_plan(sc: &mut SourceConfig) -> Result<(), ApiError> {
     sc.source = sc.source.trim().to_string();
     if sc.source.is_empty() {
@@ -705,12 +809,21 @@ pub(crate) async fn create_plan_from_brief(state: &App, workspace: i64, body: Ne
     apply_effort(&mut sc, body.effort.as_deref().unwrap_or("normal"));
     sc.draft_status = "drafting".into();
     let id = store::save_plan(&state.db, workspace, &sc).await?;
+    // Typed columns are the plan's output columns from now on: nothing added
+    // to them, and a rebuild keeps them.
+    if kind == "artifacts" && !columns.is_empty() {
+        store::set_custom_columns(&state.db, workspace, id, true).await?;
+    }
 
     let req = plan_chat::PlanDraftRequest {
         icp: brief,
         plan_type: String::new(),
         kind,
-        source: sc.source.clone(),
+        // A name the user typed is theirs, and the drafter keeps it. The
+        // stand-in an unnamed plan carries while it drafts is not a name —
+        // handed over, the model kept it, and plans were titled with the
+        // opening words of their brief. So it is left out: the model writes one.
+        source: if named_by_user { sc.source.clone() } else { String::new() },
         source_key_tmpl: String::new(),
         seed_vars_json: String::new(),
         learn: sc.learn,
@@ -766,8 +879,9 @@ async fn unique_name(state: &App, account_id: i64, wanted: &str, brief: &str) ->
     if !wanted.is_empty() {
         return Ok(wanted.chars().take(120).collect());
     }
-    let base: String = brief.split_whitespace().take(8).collect::<Vec<_>>().join(" ").chars().take(100).collect();
-    let base = if base.is_empty() { "New search".to_string() } else { base };
+    // Shown while the plan drafts, and kept if drafting gives no better one:
+    // the thing being found, not the first eight words of the brief.
+    let base = plan_chat::title_from_brief(brief);
     let taken: Vec<String> = store::list_plans(&state.db, account_id)
         .await?
         .into_iter()
@@ -939,8 +1053,9 @@ async fn rebuild_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id
         iterations: sc.iterations as i64,
         target_prospects: sc.target_prospects as i64,
         // A rebuild keeps the columns this plan already has: they are the
-        // shape of the rows already stored against it.
-        columns: crate::artifact::parse_schema(&sc.fields_schema_json)
+        // shape of the rows already stored against it. Internal ones are the
+        // app's, not columns to hand back as if the person had asked for them.
+        columns: crate::artifact::output_columns(&crate::artifact::parse_schema(&sc.fields_schema_json))
             .into_iter()
             .map(|f| crate::artifact::ColumnRequest {
                 name: if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() },
@@ -980,6 +1095,15 @@ struct PlanUpdateBody {
     alert_email: Option<bool>,
     #[serde(default)]
     models: Option<PlanModelsBody>,
+    /// Recreate the plan from its description, as if it were new: the
+    /// planner decides again what kind of plan it is and writes everything
+    /// behind it. What the person set (target, effort, schedule, alerts, name)
+    /// is kept.
+    #[serde(default)]
+    rebuild: bool,
+    /// With `rebuild`: let the planner write a new title too.
+    #[serde(default)]
+    retitle: bool,
 }
 
 /// Per-stage model ids. Absent keeps the value the plan already has; "" is
@@ -1027,11 +1151,71 @@ async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
     if let Some(models) = &body.models {
         apply_plan_models(&mut sc, models).map_err(bad_request)?;
     }
+    if body.rebuild {
+        agent_available()?;
+        if store::draft_in_progress(&sc.draft_status) {
+            return Err(bad_request("this plan is already being built — wait for it to finish, then save again"));
+        }
+        if sc.description.trim().is_empty() {
+            return Err(bad_request("describe what this plan looks for before rebuilding it"));
+        }
+    }
     validate_plan(&mut sc)?;
     store::save_plan(&state.db, acc.tenant(), &sc).await?;
     store::refresh_schedule(&state.db, id).await?;
+    if body.rebuild {
+        rebuild_from_description(&state, acc.tenant(), &sc, body.retitle).await?;
+    }
     let plan = store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
     Ok(Json(public_plan(&plan)))
+}
+
+/// Recreate a plan from its (possibly new) description — the same drafting a
+/// new plan gets. Nothing about the old plan's machinery is carried over: the
+/// kind is decided again from the brief, the columns and the search are
+/// written afresh. The queued next searches were planned for the old brief,
+/// so they go; results already found stay.
+async fn rebuild_from_description(state: &App, workspace: i64, sc: &SourceConfig, retitle: bool) -> Result<(), ApiError> {
+    let id = sc.plan_id;
+    // What this workspace may build — plus what this plan already is, so a
+    // plan whose kind was since switched off can still be rebuilt as itself.
+    let mut allowed = store::allowed_kinds(&state.db, workspace).await;
+    let current = sc.kind_of().as_str().to_string();
+    if !allowed.contains(&current) {
+        allowed.push(current);
+    }
+    store::clear_pending_seeds(&state.db, id).await?;
+    store::set_draft_status(&state.db, workspace, id, "drafting").await?;
+    let req = plan_chat::PlanDraftRequest {
+        icp: sc.description.clone(),
+        plan_type: String::new(),
+        kind: "auto".into(),
+        // A new title is asked for by leaving the name out; otherwise the
+        // plan keeps the one it has.
+        source: if retitle { String::new() } else { sc.source.clone() },
+        source_key_tmpl: String::new(),
+        seed_vars_json: String::new(),
+        learn: sc.learn,
+        iterations: sc.iterations as i64,
+        target_prospects: sc.target_prospects as i64,
+        // Columns the person typed are theirs through a rebuild too; the
+        // planner designs new ones only for a plan whose columns it chose.
+        columns: if sc.has_custom_columns() {
+            crate::artifact::output_columns(&crate::artifact::parse_schema(&sc.fields_schema_json))
+                .into_iter()
+                .map(|f| crate::artifact::ColumnRequest {
+                    name: if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() },
+                    prompt: String::new(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        sites: sc.sites.clone(),
+        allowed,
+    };
+    spawn_draft(state.clone(), workspace, id, req, retitle);
+    Ok(())
 }
 
 async fn delete_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
@@ -1638,7 +1822,10 @@ async fn list_artifacts(State(state): State<App>, AuthUser(acc): AuthUser, Query
     // belong to the results, not to the plan the UI shows.
     let columns = match f.plan_id {
         Some(id) => match store::get_plan(&state.db, acc.tenant(), id).await? {
-            Some(p) => serde_json::to_value(crate::artifact::parse_schema(&p.fields_schema_json)).unwrap_or(Value::Null),
+            // The output columns only: an internal column (the link a plan
+            // with typed columns keeps for identity) is not shown.
+            Some(p) => serde_json::to_value(crate::artifact::output_columns(&crate::artifact::parse_schema(&p.fields_schema_json)))
+                .unwrap_or(Value::Null),
             None => Value::Null,
         },
         None => Value::Null,
@@ -1665,7 +1852,7 @@ async fn artifacts_csv(State(state): State<App>, AuthUser(acc): AuthUser, Query(
     let plan = store::get_plan(&state.db, acc.tenant(), plan_id).await?.ok_or_else(|| not_found("plan not found"))?;
     let schema = crate::artifact::parse_schema(&plan.fields_schema_json);
     let rows = store::export_artifacts(&state.db, acc.tenant(), Some(plan_id)).await?;
-    let text = csv::artifacts_csv(&rows, &schema);
+    let text = csv::artifacts_csv(&rows, &schema, plan.has_custom_columns());
     Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8")),

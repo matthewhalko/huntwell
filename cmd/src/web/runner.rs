@@ -47,9 +47,38 @@ mod port_tests {
     }
 }
 
-/// Creates the Run row and starts the child. Refuses a second concurrent run
-/// for the account so only one process can have unreported spend against the
-/// prepaid wallet.
+/// How many runs this server executes at once in local dispatch (no worker
+/// pool). More wait, queued, and start as others finish.
+fn local_max_runs() -> usize {
+    crate::config::get("HUNTWELL_LOCAL_MAX_RUNS").and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(4)
+}
+
+/// Whether an account's runs share one browser on this machine. A local
+/// Chrome is one profile per account (its cookies and logins), which two runs
+/// cannot drive at once — so they take turns. Browserbase gives every run its
+/// own browser, and an account's runs go side by side.
+fn runs_share_a_browser() -> bool {
+    !crate::browserbase::configured()
+}
+
+/// Whether a local run for `account_id` may start now, given what is running.
+async fn local_room_for(state: &App, account_id: i64) -> bool {
+    let active = state.active.lock().await;
+    active.len() < local_max_runs() && !(runs_share_a_browser() && active.values().any(|a| a.account_id == account_id))
+}
+
+/// Creates the Run row and starts it — or queues it when there is no room.
+///
+/// An account may run many plans at once; only the same plan twice is
+/// refused. Room is the pool's slots (pool dispatch: the run waits `queued`
+/// until the placement loop finds a free slot) or this server's own limit
+/// (local dispatch: `local_max_runs`, and one run at a time per account when
+/// runs share a local browser). A queued run starts by itself when room opens.
+///
+/// Credits stay safe with several runs at once: every debit is atomic and
+/// capped at what the wallet holds (`store::charge_account_usage`), and each
+/// run stops itself when the wallet empties. What concurrency can add is at
+/// most one unbilled agent turn per running plan — never a charge past zero.
 pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, args: RunArgs) -> Result<i64> {
     let _gate = state.start_gate.lock().await;
     let plan = store::get_plan(&state.db, account_id, plan_id)
@@ -60,12 +89,6 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     }
     if let Some(active) = store::active_execution_for_plan(&state.db, plan_id).await? {
         anyhow::bail!("plan is already running (run #{})", active.execution_id);
-    }
-    if let Some(active) = store::active_execution_for_account(&state.db, account_id).await? {
-        anyhow::bail!(
-            "another plan is already running against this account's credits (run #{})",
-            active.execution_id
-        );
     }
     // A run costs money to execute, so it needs someone to bill and prepaid
     // credits to spend. Checked here — the single point every run passes
@@ -84,7 +107,13 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     }
     let cdp = cdp_port_for(account_id);
     let args_json = serde_json::to_value(&args)?;
-    let execution_id = store::create_execution(&state.db, account_id, plan_id, trigger, &args_json, cdp).await?;
+    // Postgres holds the one-run-per-plan rule too; losing that race reads
+    // the same as the check above rather than as a database error.
+    let execution_id = match store::create_execution(&state.db, account_id, plan_id, trigger, &args_json, cdp).await {
+        Ok(id) => id,
+        Err(e) if format!("{e:#}").contains("execution_one_active_per_plan_idx") => anyhow::bail!("plan is already running"),
+        Err(e) => return Err(e),
+    };
     // Published here, before the dispatch branches, so every mode announces a
     // queued run identically — a listener should not have to know whether this
     // deployment forks a child or waits for a worker slot.
@@ -104,6 +133,67 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
         return Ok(execution_id);
     }
 
+    if !local_room_for(state, account_id).await {
+        let why = if runs_share_a_browser() && state.active.lock().await.values().any(|a| a.account_id == account_id) {
+            "queued — waits for this workspace's other run to finish (they share one browser on this server)"
+        } else {
+            "queued — waiting for a free slot"
+        };
+        let _ = store::append_execution_log(&state.db, execution_id, "stdout", why).await;
+        tracing::info!(execution_id, plan_id, account_id, "run queued locally");
+        return Ok(execution_id);
+    }
+    launch(state, execution_id, plan_id, account_id).await?;
+    Ok(execution_id)
+}
+
+/// Wakes the local queue: a run finished, so there may be room.
+static QUEUE_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The local queue's one worker: starts waiting runs when a run finishes, and
+/// every 15s besides (and once at startup, for runs queued before a restart).
+/// Pool dispatch has no local queue — the admin's placement loop is its twin.
+pub fn spawn_local_queue(state: App) {
+    if super::dispatch::mode() == super::dispatch::Mode::Pool {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            drain_local_queue(&state).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(15), QUEUE_WAKE.notified()).await;
+        }
+    });
+}
+
+/// Start queued local runs while there is room, oldest first.
+async fn drain_local_queue(state: &App) {
+    if super::dispatch::mode() == super::dispatch::Mode::Pool {
+        return;
+    }
+    let _gate = state.start_gate.lock().await;
+    let queued = match store::queued_local_executions(&state.db, 50).await {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!("read the local run queue: {e:#}");
+            return;
+        }
+    };
+    for (execution_id, plan_id, account_id) in queued {
+        if state.active.lock().await.len() >= local_max_runs() {
+            break;
+        }
+        if !local_room_for(state, account_id).await {
+            continue; // this account's turn comes when its other run ends
+        }
+        let _ = store::append_execution_log(&state.db, execution_id, "stdout", "a slot opened — starting").await;
+        if let Err(e) = launch(state, execution_id, plan_id, account_id).await {
+            tracing::warn!(execution_id, "could not start a queued run: {e:#}");
+        }
+    }
+}
+
+/// Spawn the run process for an execution that is ready to go.
+async fn launch(state: &App, execution_id: i64, plan_id: i64, account_id: i64) -> Result<()> {
     let exe = std::env::current_exe().context("locate own executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg("run")
@@ -166,8 +256,10 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
         let _ = store::finish_execution(&state.db, execution_id, status_str, code).await;
         let _ = state.log_tx.send(LogEvent { execution_id, seq: -1 });
         tracing::info!(execution_id, status = status_str, "run finished");
+        // Room just opened: wake the queue so whatever was waiting starts.
+        QUEUE_WAKE.notify_one();
     });
-    Ok(execution_id)
+    Ok(())
 }
 
 async fn tail<R: tokio::io::AsyncRead + Unpin>(state: &App, execution_id: i64, stream: &str, reader: R) {
@@ -201,7 +293,17 @@ pub async fn cancel(state: &App, account_id: i64, execution_id: i64) -> Result<b
         return Ok(true);
     }
     let entry = state.active.lock().await.remove(&execution_id);
-    let Some(active) = entry else { return Ok(false) };
+    let Some(active) = entry else {
+        // Not running here: it may be waiting in the local queue, which is
+        // cancelled by marking it — it then never starts.
+        let Some(run) = store::get_execution(&state.db, account_id, execution_id).await? else { return Ok(false) };
+        if run.status != "queued" {
+            return Ok(false);
+        }
+        store::finish_execution(&state.db, execution_id, "cancelled", Some(130)).await?;
+        let _ = store::append_execution_log(&state.db, execution_id, "stderr", "execution cancelled before it started").await;
+        return Ok(true);
+    };
     if active.account_id != account_id {
         // Not theirs — put it back and pretend it does not exist.
         state.active.lock().await.insert(execution_id, active);

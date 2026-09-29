@@ -223,8 +223,9 @@ export function Login() {
           <Link to={`/signup?invite=${encodeURIComponent(joinToken)}`}>Create an account to accept your invitation</Link>
         ) : (
           <Link to="/signup">{cfg?.invite_only ? 'Request access' : 'Create an account'}</Link>
-        )}{' '}
-        · <Link to="/forgot">Forgot your password?</Link>
+        )}
+        <br />
+        <Link to="/forgot">Forgot your password?</Link>
       </p>
     </Shell>
   )
@@ -363,8 +364,7 @@ function WaitlistForm({ cfg, inviteErr }: { cfg: AuthConfig; inviteErr: string }
     return (
       <Shell title="You're on the list">
         <p className="muted">
-          Thanks{name.trim() ? `, ${name.trim()}` : ''}. We're letting people in a few at a time. If we can make room, we'll email{' '}
-          <b>{email.trim()}</b> an invitation with a link to create your account.
+          Thanks{name.trim() ? `, ${name.trim()}` : ''}. We will email <b>{email.trim()}</b> for access.
         </p>
         <p className="muted" style={{ marginTop: '1rem' }}>
           <Link to="/">Back to Huntwell</Link>
@@ -381,8 +381,7 @@ function WaitlistForm({ cfg, inviteErr }: { cfg: AuthConfig; inviteErr: string }
         </div>
       ) : (
         <p className="muted" style={{ marginTop: '-0.4rem' }}>
-          Huntwell is invite-only for now. Join the waitlist and we'll email you if we can make room — we can't promise everyone a
-          place.
+          Huntwell is invite-only. Join the waitlist, and we will email you for access.
         </p>
       )}
       <form onSubmit={submit}>
@@ -398,7 +397,7 @@ function WaitlistForm({ cfg, inviteErr }: { cfg: AuthConfig; inviteErr: string }
         </Field>
         {cfg.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
         <button className="btn primary" disabled={busy || (needsChallenge && !token)} style={{ width: '100%' }}>
-          {busy ? 'Sending…' : 'Join the waitlist'}
+          {busy ? 'Sending…' : 'Request access'}
         </button>
       </form>
       <p className="muted" style={{ marginTop: '0.8rem' }}>

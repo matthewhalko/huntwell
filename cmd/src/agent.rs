@@ -494,12 +494,32 @@ pub fn trip_credits() {
     CREDITS_EXHAUSTED.store(true, Ordering::Relaxed);
 }
 
+/// Set when the run reached the token limit it was started with. It stops the
+/// agent the same way running out of credits does — every kill path watches
+/// `credits_exhausted` — but the run ends as a success with what it found.
+static BUDGET_REACHED: AtomicBool = AtomicBool::new(false);
+
+pub fn trip_budget() {
+    BUDGET_REACHED.store(true, Ordering::Relaxed);
+    CREDITS_EXHAUSTED.store(true, Ordering::Relaxed);
+}
+
+pub fn budget_reached() -> bool {
+    BUDGET_REACHED.load(Ordering::Relaxed)
+}
+
 pub fn credits_exhausted() -> bool {
     CREDITS_EXHAUSTED.load(Ordering::Relaxed)
 }
 
+/// Held by tests that trip or read the process-wide stop flags, so they do not
+/// see each other's state when the suite runs in parallel.
+#[cfg(test)]
+pub(crate) static STOP_FLAGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn reset_credits_trip() {
     CREDITS_EXHAUSTED.store(false, Ordering::Relaxed);
+    BUDGET_REACHED.store(false, Ordering::Relaxed);
 }
 
 /// Start of one `agent -p` call: the next `result` is a new cumulative total.
@@ -1567,6 +1587,7 @@ mod tests {
 
     #[test]
     fn a_credits_trip_stays_until_reset() {
+        let _lock = STOP_FLAGS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_credits_trip();
         assert!(!credits_exhausted());
         trip_credits();

@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import type { ColDef } from 'ag-grid-community'
 import {
   api,
   can,
   fmtDate,
   Outreach as Draft,
+  OutreachDesign,
   OutreachProfile,
   OutreachVersion,
   outreachBody,
@@ -14,8 +15,8 @@ import {
 } from '../api'
 import { useAuth } from '../auth'
 import Grid, { useNarrow } from '../components/Grid'
-import { Empty, Field, Loading, Modal, useConfirm, useToast } from '../components/ui'
-import { CopyIcon, TickIcon } from '../components/icons'
+import { CopyHover, Empty, Field, Loading, Modal, useConfirm, useToast } from '../components/ui'
+import { CopyIcon } from '../components/icons'
 
 /// Copy to the clipboard and say so — or say why not. True when it worked.
 function useCopy() {
@@ -32,44 +33,45 @@ function useCopy() {
   }
 }
 
-/// A copy icon that sits at the edge of the part it copies and shows when that
-/// part is hovered (always, on a touch screen). It becomes a tick for a moment
-/// once copied, so the click is seen without looking away to a toast.
-function CopyHover({ text, what }: { text: string; what: string }) {
-  const copy = useCopy()
-  const [done, setDone] = useState(false)
-  useEffect(() => {
-    if (!done) return
-    const t = setTimeout(() => setDone(false), 1500)
-    return () => clearTimeout(t)
-  }, [done])
-  if (!text.trim()) return null
-  return (
-    <button
-      type="button"
-      className={'copy-hover' + (done ? ' done' : '')}
-      aria-label={`Copy ${what.toLowerCase()}`}
-      title={`Copy ${what.toLowerCase()}`}
-      onClick={async (e) => {
-        e.stopPropagation()
-        if (await copy(text, what)) setDone(true)
-      }}
-    >
-      {done ? <TickIcon size={15} /> : <CopyIcon size={15} />}
-    </button>
-  )
-}
-
 /// Start a draft to a prospect and open it. Shared with the person dialog on
 /// the Results pages, so both go through the same checks and the same page.
+///
+/// `picker` is a menu of the workspace's saved profiles (nothing when it has
+/// none), to render beside the button: the default writes with the prospect's
+/// plan's outreach; a profile applies to anyone.
 export function useDraftOutreach() {
   const nav = useNavigate()
   const toast = useToast()
   const [busy, setBusy] = useState(false)
+  const [designs, setDesigns] = useState<{ design_id: number; name: string }[]>([])
+  const [designId, setDesignId] = useState<number | ''>('')
+  useEffect(() => {
+    api
+      .get<{ designs: OutreachDesign[] }>('/api/outreach/designs')
+      .then((r) => setDesigns(r.designs))
+      .catch(() => setDesigns([]))
+  }, [])
+  const picker =
+    designs.length > 0 ? (
+      <select
+        className="sm outreach-pick"
+        value={designId}
+        onChange={(e) => setDesignId(e.target.value ? +e.target.value : '')}
+        aria-label="Write it with"
+        title="Write it with"
+      >
+        <option value="">Its plan's outreach</option>
+        {designs.map((d) => (
+          <option key={d.design_id} value={d.design_id}>
+            {d.name}
+          </option>
+        ))}
+      </select>
+    ) : null
   const start = async (prospectId: number) => {
     setBusy(true)
     try {
-      const r = await api.post<{ outreach: Draft }>('/api/outreach', { prospect_id: prospectId })
+      const r = await api.post<{ outreach: Draft }>('/api/outreach', { prospect_id: prospectId, ...(designId ? { design_id: designId } : {}) })
       nav(`/app/outreach?open=${r.outreach.outreach_id}`)
     } catch (e: any) {
       toast(e.message, true)
@@ -77,7 +79,7 @@ export function useDraftOutreach() {
       setBusy(false)
     }
   }
-  return { start, busy }
+  return { start, busy, picker }
 }
 
 export default function Outreach() {
@@ -89,6 +91,8 @@ export default function Outreach() {
   const [showNew, setShowNew] = useState(false)
   const [params, setParams] = useSearchParams()
   const openId = Number(params.get('open')) || null
+  const tab = params.get('tab') === 'profiles' ? 'profiles' : 'drafts'
+  const [newFor, setNewFor] = useState<number | ''>('')
   const load = () => api.get<{ items: Draft[] }>('/api/outreach').then((r) => setItems(r.items))
   useEffect(() => {
     load()
@@ -108,6 +112,7 @@ export default function Outreach() {
         cellRenderer: (p: { value: string }) => <b>{p.value}</b>,
       },
       { field: 'recipient_company', headerName: 'Company', flex: 1.2, hide: narrow },
+      { field: 'campaign', headerName: 'Written for', flex: 1, hide: narrow, valueFormatter: (p) => p.value || '—' },
       { field: 'subject', headerName: 'Subject', flex: 2 },
       { field: 'created_by_name', headerName: 'By', flex: 0.8, hide: narrow },
       {
@@ -134,11 +139,27 @@ export default function Outreach() {
             Settings
           </button>
           {write && (
-            <button className="btn primary" onClick={() => setShowNew(true)} disabled={profile?.ready === false}>
+            <button
+              className="btn primary"
+              onClick={() => {
+                setNewFor('')
+                setShowNew(true)
+              }}
+              disabled={profile?.ready === false}
+            >
               + New draft
             </button>
           )}
         </div>
+      </div>
+
+      <div className="tabs">
+        <button className={tab === 'drafts' ? 'active' : ''} onClick={() => setParams({})}>
+          Drafts
+        </button>
+        <button className={tab === 'profiles' ? 'active' : ''} onClick={() => setParams({ tab: 'profiles' })}>
+          Profiles
+        </button>
       </div>
 
       {profile && !profile.ready && (
@@ -146,6 +167,18 @@ export default function Outreach() {
           Drafting isn't switched on for this server yet.
         </div>
       )}
+      {tab === 'profiles' ? (
+        <ProfilesTab
+          write={write}
+          ready={profile?.ready !== false}
+          onChanged={() => api.get<OutreachProfile>('/api/outreach/profile').then(setProfile)}
+          onDraft={(id) => {
+            setNewFor(id)
+            setShowNew(true)
+          }}
+        />
+      ) : (
+        <>
       {unset && profile?.ready && (
         <div className="card outreach-start">
           <div>
@@ -176,6 +209,8 @@ export default function Outreach() {
           onRowClick={(r) => setParams({ open: String(r.outreach_id) })}
         />
       )}
+        </>
+      )}
 
       {showSettings && profile && (
         <SettingsDialog
@@ -190,6 +225,9 @@ export default function Outreach() {
       )}
       {showNew && (
         <NewDraftDialog
+          campaigns={profile?.campaigns || []}
+          designs={profile?.designs || []}
+          initialDesign={newFor}
           onClose={() => setShowNew(false)}
           onCreated={(o) => {
             setShowNew(false)
@@ -243,6 +281,10 @@ function SettingsDialog({
   }
   return (
     <Modal title="Outreach settings" onClose={onClose} className="outreach-dialog">
+      <p className="muted" style={{ marginTop: 0 }}>
+        The workspace's default for every draft. A plan can tailor its own — who the campaign is for, the angle, its own rules — under the
+        plan's <b>Edit</b> tab.
+      </p>
       <Field label="What you sell" hint="Your product, what it does and who it's for. Shared with your team.">
         <textarea
           rows={6}
@@ -287,16 +329,34 @@ function SettingsDialog({
   )
 }
 
-function NewDraftDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (o: Draft) => void }) {
+function NewDraftDialog({
+  campaigns,
+  designs,
+  initialDesign,
+  onClose,
+  onCreated,
+}: {
+  campaigns: { plan_id: number; name: string }[]
+  designs: { design_id: number; name: string }[]
+  initialDesign: number | ''
+  onClose: () => void
+  onCreated: (o: Draft) => void
+}) {
   const toast = useToast()
   const [r, setR] = useState({ name: '', email: '', title: '', company: '', notes: '' })
+  // "d:12" a saved profile, "p:7" a plan's own outreach, "" the workspace's.
+  const [forWhat, setForWhat] = useState(initialDesign ? `d:${initialDesign}` : '')
   const [busy, setBusy] = useState(false)
   const set = (k: keyof typeof r) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => setR({ ...r, [k]: e.target.value })
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
     try {
-      const res = await api.post<{ outreach: Draft }>('/api/outreach', { recipient: r })
+      const [kind, id] = forWhat.split(':')
+      const res = await api.post<{ outreach: Draft }>('/api/outreach', {
+        recipient: r,
+        ...(kind === 'd' ? { design_id: +id } : kind === 'p' ? { plan_id: +id } : {}),
+      })
       onCreated(res.outreach)
     } catch (err: any) {
       toast(err.message, true)
@@ -324,6 +384,31 @@ function NewDraftDialog({ onClose, onCreated }: { onClose: () => void; onCreated
         <Field label="What you know about them" hint="Optional. Anything that would make the email specific to them.">
           <textarea rows={3} value={r.notes} onChange={set('notes')} maxLength={2000} />
         </Field>
+        {(designs.length > 0 || campaigns.length > 0) && (
+          <Field label="Write it with" hint="A saved profile, or a plan's own outreach: who it's for, the angle and its rules.">
+            <select value={forWhat} onChange={(e) => setForWhat(e.target.value)}>
+              <option value="">Workspace outreach settings</option>
+              {designs.length > 0 && (
+                <optgroup label="Profiles">
+                  {designs.map((d) => (
+                    <option key={d.design_id} value={`d:${d.design_id}`}>
+                      {d.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {campaigns.length > 0 && (
+                <optgroup label="Plans">
+                  {campaigns.map((c) => (
+                    <option key={c.plan_id} value={`p:${c.plan_id}`}>
+                      {c.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+          </Field>
+        )}
         <div className="row between" style={{ marginTop: '1rem' }}>
           <span className="muted sm">A name or a company is enough to start.</span>
           <button className="btn primary" disabled={busy || (!r.name.trim() && !r.company.trim())}>
@@ -458,6 +543,14 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
               )}
               <CopyHover text={outreachTo(o)} what="Recipient" />
             </dd>
+            {o.campaign && (
+              <>
+                <dt>Written for</dt>
+                <dd>
+                  <Link to={o.design_id ? '/app/outreach?tab=profiles' : `/app/plans/${o.plan_id}`}>{o.campaign}</Link>
+                </dd>
+              </>
+            )}
             <dt>Subject</dt>
             <dd className={editing ? undefined : 'copyable'}>
               {editing ? (
@@ -565,6 +658,175 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
           </div>
         </>
       )}
+    </Modal>
+  )
+}
+
+/**
+ * Saved outreach profiles: a named design — who the emails are for and the
+ * angle, what to offer, extra rules — that belongs to no plan. Any draft can
+ * be written with one, to a prospect or anyone typed in, and a plan can use
+ * one as its outreach.
+ */
+function ProfilesTab({
+  write,
+  ready,
+  onChanged,
+  onDraft,
+}: {
+  write: boolean
+  ready: boolean
+  onChanged: () => void
+  onDraft: (designId: number) => void
+}) {
+  const toast = useToast()
+  const confirm = useConfirm()
+  const [designs, setDesigns] = useState<OutreachDesign[] | null>(null)
+  const [editing, setEditing] = useState<OutreachDesign | 'new' | null>(null)
+  const load = () => api.get<{ designs: OutreachDesign[] }>('/api/outreach/designs').then((r) => setDesigns(r.designs))
+  useEffect(() => {
+    load()
+  }, [])
+  const remove = async (d: OutreachDesign) => {
+    const ok = await confirm({
+      title: `Delete “${d.name}”?`,
+      body:
+        d.plans > 0
+          ? `${d.plans} plan${d.plans === 1 ? '' : 's'} use${d.plans === 1 ? 's' : ''} it; they go back to the workspace's settings. Drafts already written keep their text.`
+          : 'Drafts already written with it keep their text.',
+      confirm: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
+    try {
+      await api.del(`/api/outreach/designs/${d.design_id}`)
+      toast('Profile deleted')
+      load()
+      onChanged()
+    } catch (e: any) {
+      toast(e.message, true)
+    }
+  }
+  if (designs === null) return <Loading />
+  return (
+    <>
+      <div className="row between" style={{ marginBottom: '1rem' }}>
+        <p className="muted" style={{ margin: 0 }}>
+          Write any email — to someone a plan found or anyone you type in — for a particular group, without tying it to a plan.
+        </p>
+        {write && (
+          <button className="btn" onClick={() => setEditing('new')}>
+            + New profile
+          </button>
+        )}
+      </div>
+      {designs.length === 0 ? (
+        <Empty title="No profiles yet">
+          <p className="muted">
+            A profile says who a set of emails is for, the angle to take, what to offer them and any extra rules. Pick it when you draft.
+          </p>
+        </Empty>
+      ) : (
+        <div className="design-list">
+          {designs.map((d) => (
+            <div key={d.design_id} className="card design-card">
+              <div className="row between" style={{ alignItems: 'flex-start' }}>
+                <div style={{ minWidth: 0 }}>
+                  <h3 style={{ margin: 0 }}>{d.name}</h3>
+                  <p className="muted sm" style={{ margin: '0.2rem 0 0' }}>
+                    {d.plans > 0 ? `Used by ${d.plans} plan${d.plans === 1 ? '' : 's'} · ` : ''}updated {fmtDate(d.updated_at)}
+                  </p>
+                </div>
+                {write && (
+                  <div className="row" style={{ flex: 'none' }}>
+                    <button className="btn sm primary" onClick={() => onDraft(d.design_id)} disabled={!ready}>
+                      Draft with this
+                    </button>
+                    <button className="btn sm" onClick={() => setEditing(d)}>
+                      Edit
+                    </button>
+                    <button className="btn sm ghost danger" onClick={() => remove(d)}>
+                      Delete
+                    </button>
+                  </div>
+                )}
+              </div>
+              {d.brief && <p className="design-brief">{d.brief}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+      {editing && (
+        <ProfileDialog
+          design={editing === 'new' ? null : editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null)
+            load()
+            onChanged()
+          }}
+        />
+      )}
+    </>
+  )
+}
+
+function ProfileDialog({ design, onClose, onSaved }: { design: OutreachDesign | null; onClose: () => void; onSaved: () => void }) {
+  const toast = useToast()
+  const [name, setName] = useState(design?.name || '')
+  const [brief, setBrief] = useState(design?.brief || '')
+  const [product, setProduct] = useState(design?.product || '')
+  const [rules, setRules] = useState(design?.rules || '')
+  const [busy, setBusy] = useState(false)
+  const empty = !brief.trim() && !product.trim() && !rules.trim()
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    try {
+      const body = { name, brief, product, rules }
+      if (design) await api.put(`/api/outreach/designs/${design.design_id}`, body)
+      else await api.post('/api/outreach/designs', body)
+      toast(design ? 'Profile saved' : 'Profile created')
+      onSaved()
+    } catch (err: any) {
+      toast(err.message, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Modal title={design ? 'Edit profile' : 'New outreach profile'} onClose={onClose} className="outreach-dialog">
+      <form onSubmit={save}>
+        <Field label="Name">
+          <input value={name} onChange={(e) => setName(e.target.value)} maxLength={120} placeholder="Newly renovated hotels" autoFocus />
+        </Field>
+        <Field label="Who it's for, and the angle" hint="Who these people are, why you're writing now, and what you want from the email.">
+          <textarea
+            rows={4}
+            value={brief}
+            maxLength={4000}
+            onChange={(e) => setBrief(e.target.value)}
+            placeholder="Owners of boutique hotels who renovated in the last year. Lead with filling a newly reopened hotel's first season. Ask for a 15-minute call."
+          />
+        </Field>
+        <Field label="What you're offering them" hint="Leave blank to use your workspace's description.">
+          <textarea rows={3} value={product} maxLength={4000} onChange={(e) => setProduct(e.target.value)} />
+        </Field>
+        <Field label="Rules" hint="Added to your workspace's rules. Where they disagree, these win.">
+          <textarea rows={3} value={rules} maxLength={4000} onChange={(e) => setRules(e.target.value)} placeholder="Mention their renovation. Under 90 words." />
+        </Field>
+        <div className="row between" style={{ marginTop: '1rem' }}>
+          <span className="muted sm">{empty ? 'Fill in at least one of the three.' : ''}</span>
+          <div className="row">
+            <button className="btn" type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={busy || !name.trim() || empty}>
+              {busy ? 'Saving…' : 'Save profile'}
+            </button>
+          </div>
+        </div>
+      </form>
     </Modal>
   )
 }

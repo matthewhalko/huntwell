@@ -5,14 +5,12 @@ import { useAuth } from '../auth'
 import { useAuthConfig } from '../pages/Auth'
 
 /// The public site's pages, in the order someone new asks about them: what it
-/// is, what people use it for, what it costs, how to build on it, and whether
-/// it is safe. One list feeds the top menu, the phone menu and the footer.
+/// is, and what people use it for. One list feeds the top menu, the phone menu
+/// and the footer.
 export const SITE_PAGES: { to: string; label: string }[] = [
   { to: '/product', label: 'Product' },
   { to: '/use-cases', label: 'Use cases' },
   { to: '/pricing', label: 'Pricing' },
-  { to: '/developers', label: 'Developers' },
-  { to: '/security', label: 'Security' },
 ]
 
 /// Titles and descriptions per public page — mirrors `PAGES` in
@@ -32,16 +30,8 @@ const PAGE_META: Record<string, { title: string; description: string }> = {
     description: 'Sales prospecting, market and listing watch, hiring research, research briefs, tenders and document collection: what people use Huntwell for.',
   },
   '/pricing': {
-    title: 'Pricing — pay as you go, no seat fees | Huntwell',
-    description: 'Prepaid credits from $5 to $500. Each run is charged for the work it does, every run shows its cost, and your whole team is included.',
-  },
-  '/developers': {
-    title: 'Developers — the Huntwell API | Huntwell',
-    description: 'Create plans, start runs and sync results from your own code. HMAC-signed requests, keys you can pin to a plan or an address, and a full reference.',
-  },
-  '/security': {
-    title: 'Security — how Huntwell keeps your data yours | Huntwell',
-    description: 'Managed sign-in with two-factor, isolated workspaces, a browser per run, pages that cannot instruct the agent, and a signed API with an audit log.',
+    title: 'Pricing — pay for the tokens a run spends | Huntwell',
+    description: 'Huntwell charges by how many tokens a browse uses. Prepaid credits, no seat fee, and a cap on every run.',
   },
   '/terms': { title: 'Terms of Service | Huntwell', description: 'The terms that apply to using Huntwell.' },
   '/privacy': { title: 'Privacy Policy | Huntwell', description: 'What Huntwell collects, why, and what you can ask us to do with it.' },
@@ -74,31 +64,6 @@ export function RouteMeta() {
   }, [pathname])
   return null
 }
-
-/// Where to find Huntwell. Set a URL and its icon appears in the footer; leave
-/// it empty and it does not — a marketing page linking to a profile that does
-/// not exist is worse than one icon fewer.
-const SOCIAL: { name: string; url: string; icon: React.ReactNode }[] = [
-  {
-    name: 'X',
-    url: 'https://x.com/huntwell',
-    icon: <path d="M18.9 2H22l-7.5 8.6L23.3 22h-6.9l-5.4-7-6.2 7H1.7l8-9.2L1 2h7.1l4.9 6.5L18.9 2zm-1.2 18h1.9L7.4 3.9H5.4L17.7 20z" />,
-  },
-  {
-    name: 'LinkedIn',
-    url: 'https://www.linkedin.com/company/huntwell',
-    icon: (
-      <path d="M4.98 3.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5zM3 9h4v12H3V9zm6 0h3.8v1.7h.05c.53-1 1.83-2.05 3.76-2.05 4.02 0 4.76 2.6 4.76 6V21h-4v-5.3c0-1.27-.02-2.9-1.8-2.9-1.8 0-2.07 1.38-2.07 2.8V21H9V9z" />
-    ),
-  },
-  {
-    name: 'GitHub',
-    url: 'https://github.com/huntwell',
-    icon: (
-      <path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48l-.01-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85l-.01 2.75c0 .27.18.58.69.48A10 10 0 0 0 12 2z" />
-    ),
-  },
-]
 
 /// The primary call to action, worded for who is looking: the app for someone
 /// signed in, the waitlist while sign-up is invite-only, sign-up otherwise.
@@ -182,61 +147,29 @@ export function SiteHeader() {
   )
 }
 
-export function SiteFooter({ cta = true }: { cta?: boolean }) {
+export function SiteFooter() {
   const { me } = useAuth()
   const action = useCta()
   return (
     <footer className="site-foot">
-      {/* One last invitation. A footer that only holds legal text wastes the
-          best-read strip on the page. */}
-      {cta && (
-        <div className="foot-cta">
-          <div>
-            <h2>Ready to find them?</h2>
-            <p>Describe what you're after. Your first results are minutes away.</p>
-          </div>
-          <Link to={me ? '/app' : action.to} className="btn primary lg">
-            {me ? 'Search now' : action.label}
-          </Link>
-        </div>
-      )}
-
       <div className="foot-cols">
         <div className="foot-brand">
-          <div className="brand" style={{ color: 'var(--text)', padding: 0, fontSize: '1.3rem' }}>
+          <div className="brand" style={{ color: 'var(--text)', padding: 0 }}>
             <span className="grad-text" aria-hidden>
               ✦
             </span>
             <span className="word">huntwell</span>
           </div>
-          {SOCIAL.some((x) => x.url) && (
-            <div className="foot-social">
-              {SOCIAL.filter((x) => x.url).map((x) => (
-                <a key={x.name} href={x.url} target="_blank" rel="noreferrer noopener" aria-label={x.name} title={x.name}>
-                  <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                    {x.icon}
-                  </svg>
-                </a>
-              ))}
-            </div>
-          )}
+          <p>Describe what you are searching for, and we will find it.</p>
         </div>
 
         <div className="foot-col">
-          <h3>Huntwell</h3>
+          <h3>Links</h3>
           {SITE_PAGES.map((p) => (
             <Link key={p.to} to={p.to}>
               {p.label}
             </Link>
           ))}
-        </div>
-
-        <div className="foot-col">
-          <h3>What it finds</h3>
-          <span>Companies and the people in them</span>
-          <span>Custom lists of cars, jobs, tenders</span>
-          <span>Written reports with sources</span>
-          <span>Files and documents</span>
         </div>
 
         <div className="foot-col">
@@ -253,7 +186,6 @@ export function SiteFooter({ cta = true }: { cta?: boolean }) {
           © {new Date().getFullYear()} Yak Systems, Inc. All rights reserved. <Link to="/terms">Terms</Link> ·{' '}
           <Link to="/privacy">Privacy</Link>
         </span>
-        <span className="foot-made">So you can stop opening tabs.</span>
       </div>
     </footer>
   )

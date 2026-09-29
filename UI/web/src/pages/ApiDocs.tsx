@@ -126,6 +126,8 @@ const PLAN = `{
 const OUTREACH = `{
   "id": 57,
   "prospect_id": 9120,
+  "plan_id": 13,
+  "campaign": "Boutique hotels on the Oregon coast",
   "recipient": { "name": "Ana Ruiz", "email": "ana@coasthotels.com", "title": "General Manager",
                  "company": "Coast Hotels", "notes": "" },
   "to": "Ana Ruiz <ana@coasthotels.com>",
@@ -297,9 +299,12 @@ export const ENDPOINTS: Endpoint[] = [
     method: 'POST',
     path: '/v1/plans/{id}/executions',
     title: 'Run a plan',
-    blurb: 'Starts an execution and returns immediately with 202. Poll the execution (or its log) until it finishes. 402 means no card on file or no credits; 409 means the plan is still drafting or already running.',
-    params: [['target', 'Override how many results to aim for, just for this run.']],
-    exampleQuery: 'target=25',
+    blurb: 'Starts an execution and returns immediately with 202. Any number of plans can run at once; when every slot is busy the execution waits as `queued` and starts by itself when one frees up. Poll the execution (or its log) until it finishes. 402 means no card on file or no credits; 409 means the plan is still drafting or this plan is already running.',
+    params: [
+      ['target', 'Override how many results to aim for, just for this run.'],
+      ['max_tokens', 'The most billable tokens this run may spend. It stops there and keeps what it found, finishing as succeeded. Omit for no limit beyond your credits.'],
+    ],
+    exampleQuery: 'target=25&max_tokens=200000',
     response: `{ "id": 418, "status": "queued" }`,
     status: '202',
   },
@@ -470,7 +475,7 @@ export const ENDPOINTS: Endpoint[] = [
     path: '/v1/outreach',
     title: 'Draft an email',
     blurb:
-      'Writes a cold outreach email to one person, from your workspace\'s product description and rules, ending with the key maker\'s footer. Give a `prospect_id` a plan found, or a `recipient` by hand (a name or a company is enough). One short model call, charged to your credits like a run; nothing is sent. Needs a workspace key — a key pinned to one plan is refused.',
+      'Writes a cold outreach email to one person, from your workspace\'s product description and rules — or, when the plan has its own outreach, that campaign\'s — ending with the key maker\'s footer. Give a `prospect_id` a plan found, or a `recipient` by hand (a name or a company is enough). One short model call, charged to your credits like a run; nothing is sent. Needs a workspace key — a key pinned to one plan is refused.',
     body: `{ "prospect_id": 9120 }
 
 // or, to anyone:
@@ -480,6 +485,8 @@ export const ENDPOINTS: Endpoint[] = [
     fields: [
       ['prospect_id', 'integer', 'A prospect in this workspace. Its name, title, company, industry, location, website and notes are used.'],
       ['recipient', 'object', 'Instead of a prospect: name, email, title, company, notes. Name or company required.'],
+      ['plan_id', 'integer', 'Optional. Write it to this plan\'s own outreach (its campaign brief, offer and rules). A prospect uses its own plan\'s when this is left out; a plan without its own outreach uses the workspace\'s.'],
+      ['design_id', 'integer', 'Optional. Write it with this saved outreach profile (Outreach → Profiles) — for any prospect or recipient. Wins over any plan\'s outreach.'],
     ],
     response: OUTREACH,
     returns: [
@@ -488,6 +495,7 @@ export const ENDPOINTS: Endpoint[] = [
       ['body_with_footer', 'string', 'The body as sent: the draft, then your footer.'],
       ['to', 'string', '`Name <address>`, or whichever half is known.'],
       ['version', 'integer', 'Goes up with every revision, edit or restore.'],
+      ['campaign', 'string', 'What it was written for: the saved profile\'s name or the plan\'s, or null for the workspace\'s settings.'],
     ],
     status: '201 Created · 402 no credits · 429 more than 30 drafts a minute · 503 drafting not set up on this server',
   },
@@ -572,6 +580,36 @@ export const ENDPOINTS: Endpoint[] = [
       ['product', 'string', 'What you sell, what it does, who it is for. Up to 4,000 characters.'],
       ['rules', 'string', 'How every draft should read. Up to 4,000 characters.'],
       ['footer', 'string', 'Your sign-off, appended verbatim. Up to 1,000 characters.'],
+    ],
+  },
+  {
+    group: 'Outreach',
+    method: 'GET',
+    path: '/v1/plans/{id}/outreach',
+    title: 'A plan\'s outreach',
+    blurb: 'What drafts for this plan\'s prospects are written from. With `custom` on, the plan\'s `brief`, `product` and `rules` apply; off, the workspace settings do. The workspace\'s own are included so you can show what a blank field falls back to.',
+    response: `{
+  "plan_id": 42,
+  "custom": true,
+  "design_id": null,
+  "brief": "Practice owners thinking about succession — lead with the sale, not the software.",
+  "product": "",
+  "rules": "Mention their city. Under 100 words.",
+  "workspace": { "product": "We make booking software…", "rules": "Never mention pricing." }
+}`,
+  },
+  {
+    group: 'Outreach',
+    method: 'PUT',
+    path: '/v1/plans/{id}/outreach',
+    title: 'Change a plan\'s outreach',
+    blurb: 'Any of `custom`, `brief`, `product` and `rules`; whatever you leave out stays as it is. Returns the plan\'s outreach as above.',
+    body: `{ "custom": true, "rules": "Mention their city. Under 100 words." }`,
+    fields: [
+      ['custom', 'boolean', 'Use this plan\'s own outreach rather than the workspace settings.'],
+      ['brief', 'string', 'Who this campaign is for and the angle to take. Up to 4,000 characters.'],
+      ['product', 'string', 'Replaces the workspace\'s product description for this plan. Up to 4,000 characters.'],
+      ['rules', 'string', 'Added to the workspace\'s rules; these win where they differ. Up to 4,000 characters.'],
     ],
   },
   {
@@ -810,7 +848,7 @@ function ErrorsGuide() {
           ['402', 'Payment required', 'No card on file, or no prepaid credits left.'],
           ['403', 'Forbidden', 'This key is pinned to another plan, or a pinned key tried to create a plan.'],
           ['404', 'Not found', 'That plan or execution is not in this workspace.'],
-          ['409', 'Conflict', 'The plan is still drafting, or an execution is already running.'],
+          ['409', 'Conflict', 'The plan is still drafting, or that plan is already running (other plans can run at the same time).'],
           ['429', 'Too many requests', 'Slow down. `Retry-After: 60`. Eight failed auths lock the address for 15 minutes.'],
         ]}
       />

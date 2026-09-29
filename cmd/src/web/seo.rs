@@ -56,24 +56,10 @@ pub const PAGES: &[Page] = &[
     },
     Page {
         path: "/pricing",
-        title: "Pricing — pay as you go, no seat fees | Huntwell",
-        description: "Prepaid credits from $5 to $500. Each run is charged for the work it does, every run shows its cost, and your whole team is included.",
+        title: "Pricing — pay for the tokens a run spends | Huntwell",
+        description: "Huntwell charges by how many tokens a browse uses. Prepaid credits, no seat fee, and a cap on every run.",
         changefreq: "monthly",
-        priority: "0.8",
-    },
-    Page {
-        path: "/developers",
-        title: "Developers — the Huntwell API | Huntwell",
-        description: "Create plans, start runs and sync results from your own code. HMAC-signed requests, keys you can pin to a plan or an address, and a full reference.",
-        changefreq: "monthly",
-        priority: "0.7",
-    },
-    Page {
-        path: "/security",
-        title: "Security — how Huntwell keeps your data yours | Huntwell",
-        description: "Managed sign-in with two-factor, isolated workspaces, a browser per run, pages that cannot instruct the agent, and a signed API with an audit log.",
-        changefreq: "monthly",
-        priority: "0.6",
+        priority: "0.9",
     },
     Page {
         path: "/terms",
@@ -118,7 +104,7 @@ pub enum Route {
 }
 
 pub fn route(path: &str) -> Route {
-    // One address per page: `/pricing/` → `/pricing`.
+    // One address per page: `/product/` → `/product`.
     if path.len() > 1 && path.ends_with('/') {
         let bare = normalise(path);
         if page(bare).is_some() {
@@ -137,7 +123,7 @@ pub fn page(path: &str) -> Option<&'static Page> {
     PAGES.iter().find(|p| p.path == path)
 }
 
-/// `/pricing/` and `/pricing` are one page.
+/// `/product/` and `/product` are one page.
 fn normalise(path: &str) -> &str {
     if path.len() > 1 {
         path.trim_end_matches('/')
@@ -262,17 +248,6 @@ fn structured_data(p: &Page, base: &str, url: &str) -> Vec<serde_json::Value> {
                 ],
             }));
         }
-        "/pricing" => {
-            out.push(json!({
-                "@context": "https://schema.org",
-                "@type": "FAQPage",
-                "mainEntity": [
-                    faq("What decides the cost of a run?", "How much reading it has to do. A plan's effort setting sets how many pages a search may open; a narrow brief on a few sites costs little, a broad one across many sites costs more."),
-                    faq("Do I need a card?", "Yes — a card on file and credits in the account are needed to start a run. Payments are handled by Stripe."),
-                    faq("What happens when credits run out?", "New runs will not start until you top up. Nothing is charged to your card without you buying credits."),
-                ],
-            }));
-        }
         _ => {}
     }
     if p.path != "/" {
@@ -286,10 +261,6 @@ fn structured_data(p: &Page, base: &str, url: &str) -> Vec<serde_json::Value> {
         }));
     }
     out
-}
-
-fn faq(q: &str, a: &str) -> serde_json::Value {
-    serde_json::json!({ "@type": "Question", "name": q, "acceptedAnswer": { "@type": "Answer", "text": a } })
 }
 
 /// Markers in `index.html` around the part of the head this module owns.
@@ -355,11 +326,11 @@ mod tests {
 
     #[test]
     fn public_pages_get_their_own_head() {
-        let html = render_index(INDEX, "/pricing/", "https://huntwell.ai");
-        assert!(html.contains("<title>Pricing — pay as you go, no seat fees | Huntwell</title>"), "{html}");
-        assert!(html.contains("<link rel=\"canonical\" href=\"https://huntwell.ai/pricing\" />"));
+        let html = render_index(INDEX, "/product/", "https://huntwell.ai");
+        assert!(html.contains("<title>How Huntwell works — from a sentence to structured data</title>"), "{html}");
+        assert!(html.contains("<link rel=\"canonical\" href=\"https://huntwell.ai/product\" />"));
         assert!(html.contains("og:image\" content=\"https://huntwell.ai/og.png\""));
-        assert!(html.contains("\"FAQPage\""));
+        assert!(html.contains("BreadcrumbList"));
         assert!(!html.contains("<title>x</title>"), "the default title is replaced, not duplicated");
     }
 
@@ -398,12 +369,18 @@ mod tests {
 
     #[test]
     fn unknown_urls_are_404_and_slashes_redirect() {
-        assert!(matches!(route("/pricing"), Route::Page));
+        assert!(matches!(route("/product"), Route::Page));
         assert!(matches!(route("/"), Route::Page));
         assert!(matches!(route("/app/plans/3"), Route::Page));
         assert!(matches!(route("/join/abc"), Route::Page));
         assert!(matches!(route("/login"), Route::Page));
+        assert!(matches!(route("/product/"), Route::Redirect(ref to) if to == "/product"));
+        assert!(matches!(route("/pricing"), Route::Page));
         assert!(matches!(route("/pricing/"), Route::Redirect(ref to) if to == "/pricing"));
+        assert!(matches!(route("/developers"), Route::NotFound));
+        assert!(matches!(route("/developers/"), Route::NotFound));
+        assert!(matches!(route("/security"), Route::NotFound));
+        assert!(matches!(route("/security/"), Route::NotFound));
         assert!(matches!(route("/wp-admin"), Route::NotFound));
         assert!(matches!(route("/pricingx"), Route::NotFound));
     }

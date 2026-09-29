@@ -189,7 +189,6 @@ export function ArtifactTable({ planId }: { planId: number }) {
             }),
             ['URL', open.url],
             ['Plan', open.source],
-            ['Key', open.source_key],
             ['First seen', fmtDate(open.first_seen_utc)],
           ]}
           onClose={() => setOpen(null)}

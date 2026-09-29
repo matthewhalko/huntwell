@@ -24,7 +24,6 @@ export default function ApiAccess() {
     load()
     api.get<PlanSummary[]>('/api/plans').then(setPlans)
   }, [])
-  const origin = window.location.origin
 
   return (
     <>
@@ -183,26 +182,17 @@ export default function ApiAccess() {
             This is the only time these are shown. Copy them now — neither can be recovered later.
           </p>
           <p className="muted" style={{ margin: '0.6rem 0 0.3rem' }}>
-            Key — identifies you, and travels with every request
+            Key
           </p>
           <Copy text={fresh.token} />
           {fresh.secret && (
             <>
               <p className="muted" style={{ margin: '1rem 0 0.3rem' }}>
-                Secret — signs your requests, and should never leave your server
+                Secret
               </p>
               <Copy text={fresh.secret} />
-              <p className="muted" style={{ fontSize: '0.82rem', marginTop: '0.4rem' }}>
-                Send <code>X-HW-KEY</code>, <code>X-HW-TS</code>, <code>X-HW-NONCE</code> and <code>X-HW-SIGN</code> — the
-                signature covers the body too. See the{' '}
-                <Link to="/app/api-docs">API documentation</Link> for a working example.
-              </p>
             </>
           )}
-          <p className="muted" style={{ margin: '1rem 0 0.3rem' }}>
-            Download URL
-          </p>
-          <Copy text={`${origin}/dl/prospects.csv?token=${fresh.token}`} />
         </Modal>
       )}
     </>

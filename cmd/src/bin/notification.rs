@@ -1,4 +1,4 @@
-//! The Huntwell notification service: drains the mail outbox.
+//! The Huntwell notification service: drains the mail and Slack outboxes.
 //!
 //! Serves no HTTP and is called by nothing. Everything that wants to send mail
 //! writes a `MailOutbox` row and returns; this is the only process that talks

@@ -267,6 +267,18 @@ dialog{border:1px solid var(--border);border-radius:var(--radius);max-width:560p
   background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog .card{border:none;box-shadow:none}
+/* A row's "…" actions. The menu is fixed to the page, not inside the grid
+   cell, which would clip it. */
+button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08em}
+.rowmenu{position:fixed;z-index:50;min-width:190px;padding:.3rem;background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);display:flex;flex-direction:column}
+.rowmenu button{display:block;width:100%;justify-content:flex-start;border:none;background:none;box-shadow:none;text-align:left;padding:.45rem .7rem;border-radius:var(--radius-sm);
+  font-size:.88rem;font-weight:500;transform:none}
+.rowmenu button:hover:not(:disabled),.rowmenu button:focus-visible{background:var(--surface-2);outline:none}
+.rowmenu button.danger:hover:not(:disabled),.rowmenu button.danger:focus-visible{background:var(--bad-bg)}
+.rowmenu button:disabled{color:var(--text-3);cursor:not-allowed}
+.rowmenu hr{border:none;border-top:1px solid var(--border);margin:.3rem .2rem}
+#deldlg .notice{margin:.4rem 0 1rem}
 
 /* ---------- AG Grid, dressed in the house theme ---------- */
 #route-grid{height:380px}
@@ -401,7 +413,7 @@ dialog .card{border:none;box-shadow:none}
       <button class="primary sm" onclick="saveFeatures()">Save default</button>
       <span id="features-note" class="muted"></span>
     </div>
-    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th title="What this workspace is charged per million billable tokens">Rate $/M tokens</th><th></th></tr></thead>
+    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th title="What this workspace is charged per million billable tokens">Rate $/M tokens</th><th title="Spendable credit in this workspace's wallet">Credits</th><th></th></tr></thead>
     <tbody id="accounts"></tbody></table>
   </div>
 </section>
@@ -537,6 +549,43 @@ sys incus token</pre></div>
     <div id="model-list" class="model-list" onclick="if(event.target.closest('.model-opt'))pickModel(event.target.closest('.model-opt').dataset.id)"></div>
     <div class="row" style="margin-top:1rem">
       <button onclick="document.getElementById('modeldlg').close()">Cancel</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="creditdlg">
+  <div class="card" style="border:none">
+    <h2>Add free credit</h2>
+    <div class="sub" id="cr-who"></div>
+    <div class="grid2" style="margin-top:.8rem">
+      <div><label for="cr-usd">Amount (USD)</label>
+        <input id="cr-usd" type="number" min="0.01" max="10000" step="0.01" value="100" oninput="creditTyped()"></div>
+      <div><label>&nbsp;</label><div class="row" style="gap:.35rem">
+        <button class="sm" onclick="$('cr-usd').value=25;creditTyped()">$25</button>
+        <button class="sm" onclick="$('cr-usd').value=50;creditTyped()">$50</button>
+        <button class="sm" onclick="$('cr-usd').value=100;creditTyped()">$100</button></div></div>
+    </div>
+    <label for="cr-note">Note to them <span class="muted">(optional — goes in the email)</span></label>
+    <textarea id="cr-note" rows="3" maxlength="500" style="font-family:var(--font)" placeholder="Your first $100 is on us — welcome to Huntwell."></textarea>
+    <div class="muted" style="font-size:.85rem;margin-top:.5rem">Free — no card is charged. They get an email saying it was added and their new balance.</div>
+    <div class="row" style="margin-top:1rem">
+      <button class="primary" id="cr-btn" onclick="grantCredit()">Add credit</button>
+      <button onclick="$('creditdlg').close()">Cancel</button>
+      <span id="cr-err" class="muted"></span>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="deldlg">
+  <div class="card" style="border:none">
+    <h2 id="del-title">Delete permanently?</h2>
+    <div class="notice"><span class="ico">!</span><div id="del-warn"></div></div>
+    <label for="del-confirm">Type <b id="del-email"></b> to confirm</label>
+    <input id="del-confirm" autocomplete="off" spellcheck="false" oninput="delTyped()" onkeydown="if(event.key==='Enter'&&!$('del-btn').disabled)doDelete()">
+    <div class="row" style="margin-top:1rem">
+      <button class="danger" id="del-btn" disabled onclick="doDelete()">Delete forever</button>
+      <button onclick="$('deldlg').close()">Cancel</button>
+      <span id="del-err" class="muted"></span>
     </div>
   </div>
 </dialog>
@@ -1061,9 +1110,13 @@ async function loadFeatures(){
       <td class="row">${cl}</td>
       <td>${a.mfa_enabled?`<span class="badge ok">on</span> <button class="sm" onclick="resetMfa(${a.account_id})" title="For someone who lost their device">Reset</button>`:'<span class="muted">off</span>'}</td>
       <td>${rate}</td>
+      <td style="white-space:nowrap"><b>${fmtUsd(a.credits_usd)}</b>
+        <button class="sm" onclick="openCredit(${Number(a.account_id)})" style="margin-left:.35rem">Add</button>
+        ${Number(a.granted_usd)>0?`<br><span class="muted" style="font-size:.78rem">${fmtUsd(a.granted_usd)} added free</span>`:''}</td>
       <td class="row"><button class="sm" onclick="saveAccount(${a.account_id})">Save</button>
       <button class="sm" onclick="resetAccount(${a.account_id})" title="Follow the installation default again">Reset</button></td></tr>`}).join('')
-    ||'<tr><td colspan="7" class="muted">No accounts yet.</td></tr>';
+    ||'<tr><td colspan="8" class="muted">No accounts yet.</td></tr>';
+  ACCOUNTS=Object.fromEntries(as.map(a=>[Number(a.account_id),a]));
 }
 
 // ---- waitlist & invitations ----
@@ -1083,18 +1136,17 @@ function initWaitlist(){
       tooltipValueGetter:p=>p.value?`${new Date(p.value).toLocaleString()} by ${p.data.invited_by}`
         +(p.data.invite_expires_at?` · link expires ${new Date(p.data.invite_expires_at).toLocaleString()}`:''):''},
     {field:'joined_at',headerName:'Joined',width:120,valueFormatter:p=>since(p.value)},
-    {headerName:'',width:210,sortable:false,resizable:false,cellRenderer:p=>{
+    {headerName:'',width:170,sortable:false,resizable:false,cellStyle:{display:'flex',justifyContent:'flex-end',alignItems:'center'},cellRenderer:p=>{
       const d=p.data,id=Number(d.waitlist_id);
-      if(d.status==='joined')return `<span class="muted">account #${esc(d.account_id)}</span>`;
-      const send=d.status==='invited'
-        ?`<button class="sm" onclick="approveWaitlist(${id},true)" title="A new link; the old one stops working">Resend</button>`
-        :`<button class="sm primary" onclick="approveWaitlist(${id},false)">${d.status==='declined'?'Invite anyway':'Approve'}</button>`;
-      const decline=d.status==='declined'?'':` <button class="sm" onclick="declineWaitlist(${id})">Decline</button>`;
-      return `<span class="row" style="gap:.35rem">${send}${decline}</span>`}},
+      const acct=d.status==='joined'?`<span class="muted">account #${esc(d.account_id)}</span>`:'';
+      return `<span class="row" style="gap:.5rem">${acct}<button class="sm more" aria-haspopup="menu" aria-expanded="false"
+        title="Actions" aria-label="Actions for ${esc(d.email)}" onclick="wlMenu(this,${id})">&#8943;</button></span>`}},
   ],{tooltipShowDelay:300,overlayNoRowsTemplate:'<span class="muted">Nobody has asked to join yet.</span>'});
 }
+let WL_ROWS={};
 async function loadWaitlist(){
   try{const r=await api('GET','/admin/api/waitlist');
+    WL_ROWS=Object.fromEntries(r.rows.map(x=>[Number(x.waitlist_id),x]));
     setRows('waitlist',r.rows);
     $('wl-sub').textContent=r.open_signup
       ?'Sign-up is open right now (HUNTWELL_OPEN_SIGNUP=1), so nobody needs an invitation. Invitations still work.'
@@ -1124,6 +1176,79 @@ async function approveWaitlist(id,resend){
   if(resend&&!confirm('Send a new invitation? The link they already have stops working.'))return;
   try{const r=await api('POST',`/admin/api/waitlist/${id}/approve`);showWlNote(invitedNote(r));loadWaitlist()}
   catch(e){showWlNote(errText(e),true)}}
+// ---- free credit ----
+let ACCOUNTS={},CREDIT_ID=null;
+function fmtUsd(v){return '$'+Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function openCredit(id){const a=ACCOUNTS[id];if(!a)return;CREDIT_ID=id;
+  $('cr-who').innerHTML=`To <b>${esc(a.email)}</b> (account #${esc(a.account_id)}) · balance now ${esc(fmtUsd(a.credits_usd))}`;
+  $('cr-usd').value=100;$('cr-note').value='';$('cr-err').textContent='';creditTyped();
+  $('creditdlg').showModal();$('cr-usd').focus()}
+function creditTyped(){const v=Number($('cr-usd').value);const ok=v>=0.01&&v<=10000;
+  $('cr-btn').disabled=!ok;$('cr-btn').textContent=ok?`Add ${fmtUsd(v)} credit`:'Add credit'}
+async function grantCredit(){const usd=Number($('cr-usd').value),a=ACCOUNTS[CREDIT_ID];if(!a)return;
+  $('cr-btn').disabled=true;$('cr-err').textContent='Adding…';
+  try{const r=await api('POST',`/admin/api/accounts/${CREDIT_ID}/credits`,{usd,note:$('cr-note').value});
+    $('creditdlg').close();
+    $('features-note').textContent=`Added ${fmtUsd(usd)} to ${a.email} — balance ${fmtUsd(r.credits_usd)}. They've been emailed.`;
+    setTimeout(()=>$('features-note').textContent='',6000);loadFeatures()}
+  catch(e){$('cr-err').textContent=errText(e);creditTyped()}}
+
+// ---- a row's actions menu ----
+let OPEN_MENU=null;
+function closeMenu(){if(!OPEN_MENU)return;OPEN_MENU.m.remove();OPEN_MENU.btn.setAttribute('aria-expanded','false');OPEN_MENU=null}
+document.addEventListener('mousedown',e=>{if(OPEN_MENU&&!OPEN_MENU.m.contains(e.target)&&!OPEN_MENU.btn.contains(e.target))closeMenu()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu()});
+window.addEventListener('scroll',closeMenu,true);window.addEventListener('resize',closeMenu);
+function wlMenu(btn,id){
+  if(OPEN_MENU&&OPEN_MENU.btn===btn){closeMenu();return}
+  closeMenu();const d=WL_ROWS[id];if(!d)return;
+  const joined=d.status==='joined';
+  const m=document.createElement('div');m.className='rowmenu';m.setAttribute('role','menu');
+  const item=(label,fn,o={})=>{const b=document.createElement('button');b.type='button';b.textContent=label;
+    b.setAttribute('role','menuitem');if(o.danger)b.className='danger';if(o.title)b.title=o.title;
+    if(o.disabled)b.disabled=true;else b.onclick=()=>{closeMenu();fn()};m.appendChild(b)};
+  item(d.status==='invited'?'Resend invitation':d.status==='declined'?'Invite anyway':'Approve',
+    ()=>approveWaitlist(id,d.status==='invited'),
+    {disabled:joined,title:joined?'Already has an account':d.status==='invited'?'A new link; the old one stops working':''});
+  item('Decline',()=>declineWaitlist(id),
+    {disabled:joined||d.status==='declined',title:joined?'Already has an account':d.status==='declined'?'Already declined':''});
+  m.appendChild(document.createElement('hr'));
+  item(joined?'Delete user and all data…':'Delete request…',()=>openDelete(id),{danger:true});
+  document.body.appendChild(m);
+  const r=btn.getBoundingClientRect(),h=m.offsetHeight,w=m.offsetWidth;
+  const top=r.bottom+4+h>innerHeight-8?r.top-h-4:r.bottom+4;
+  m.style.top=Math.max(8,top)+'px';m.style.left=Math.max(8,r.right-w)+'px';
+  btn.setAttribute('aria-expanded','true');OPEN_MENU={m,btn};
+  m.querySelector('button:not(:disabled)')?.focus()}
+
+// ---- delete, behind a typed confirmation ----
+let DEL_ID=null;
+function openDelete(id){const d=WL_ROWS[id];if(!d)return;DEL_ID=id;
+  const joined=d.status==='joined'&&d.account_id;
+  $('del-title').textContent=joined?'Delete this user and all their data?':'Delete this request?';
+  $('del-warn').innerHTML=joined
+    ?`This permanently deletes <b>${esc(d.email)}</b> (account #${esc(d.account_id)}) and everything in it: every plan, result, run, file,
+      API key and outreach draft, their credit balance and billing records, and their sign-in. Teammates lose access to the workspace.
+      <b>This cannot be undone.</b>`
+    :`This permanently deletes the request from <b>${esc(d.email)}</b>. They are not told, and any invitation link they have stops working.
+      <b>This cannot be undone.</b>`;
+  $('del-email').textContent=d.email;$('del-confirm').value='';$('del-err').textContent='';
+  $('del-btn').disabled=true;$('del-btn').textContent=joined?'Delete user forever':'Delete forever';
+  $('deldlg').showModal();$('del-confirm').focus()}
+function delTyped(){const d=WL_ROWS[DEL_ID];
+  $('del-btn').disabled=!d||$('del-confirm').value.trim().toLowerCase()!==d.email.trim().toLowerCase()}
+async function doDelete(){const d=WL_ROWS[DEL_ID];if(!d)return;
+  $('del-btn').disabled=true;$('del-err').textContent='Deleting…';
+  try{const r=await api('DELETE',`/admin/api/waitlist/${DEL_ID}`,{confirm:$('del-confirm').value.trim()});
+    $('deldlg').close();
+    const left=[r.files_left?`${r.files_left} stored file(s) could not be removed`:'',r.account_deleted&&!r.identity_removed?'their sign-in could not be removed from the user pool':'']
+      .filter(Boolean).join('; ');
+    showWlNote(r.account_deleted
+      ?`Deleted <b>${esc(d.email)}</b> and all their data (${Number(r.plans)} plan(s), ${Number(r.files)} file(s)).${left?` <b>Check the logs:</b> ${esc(left)}.`:''}`
+      :`Deleted the request from <b>${esc(d.email)}</b>.`);
+    loadWaitlist();loadFeatures()}
+  catch(e){$('del-err').textContent=errText(e);delTyped()}}
+
 async function declineWaitlist(id){
   if(!confirm('Decline this request? They are not told, and any invitation link they have stops working.'))return;
   try{await api('POST',`/admin/api/waitlist/${id}/decline`);loadWaitlist()}

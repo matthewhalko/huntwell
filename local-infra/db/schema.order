@@ -14,6 +14,7 @@ report.sql
 asset.sql
 # Outreach: cold emails drafted to prospects, and what drafts are told.
 outreach_profile.sql
+outreach_design.sql
 outreach.sql
 outreach_version.sql
 search_frontier.sql
@@ -37,4 +38,5 @@ control_setting.sql
 admin_user.sql
 route_log.sql
 mail_outbox.sql
+slack_outbox.sql
 setting.sql

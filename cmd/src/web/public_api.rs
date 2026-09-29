@@ -44,6 +44,7 @@ pub fn router() -> Router<App> {
         .route("/usage", get(usage))
         .route("/outreach", get(outreach_list).post(outreach_create))
         .route("/outreach/profile", get(outreach_profile).put(outreach_save_profile))
+        .route("/plans/{id}/outreach", get(plan_outreach).put(plan_save_outreach))
         .route("/outreach/{id}", get(outreach_get).patch(outreach_edit).delete(outreach_delete))
         .route("/outreach/{id}/revise", post(outreach_revise))
         .route("/outreach/{id}/restore", post(outreach_restore))
@@ -431,6 +432,8 @@ async fn start_execution(
     };
     let args = crate::pipeline::RunArgs {
         target: q.get("target").and_then(|v| v.parse().ok()),
+        // The most tokens this run may spend; it stops there and keeps what it found.
+        max_tokens: q.get("max_tokens").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0),
         ..Default::default()
     };
     match super::runner::start(&state, c.workspace, plan.plan_id, "api", args).await {
@@ -1191,6 +1194,10 @@ fn outreach_json(o: &store::OutreachRow) -> Value {
     json!({
         "id": o.outreach_id,
         "prospect_id": o.prospect_id,
+        // The plan whose own outreach it was written to; null = the workspace's.
+        "plan_id": o.plan_id,
+        "design_id": o.design_id,
+        "campaign": o.campaign,
         "recipient": {
             "name": o.recipient_name,
             "email": o.recipient_email,
@@ -1378,6 +1385,103 @@ async fn outreach_delete(
     match store::delete_outreach(&state.db, c.workspace, id).await {
         Ok(true) => Json(json!({ "deleted": id })).into_response(),
         Ok(false) => err(StatusCode::NOT_FOUND, "draft not found"),
+        Err(e) => oops(e),
+    }
+}
+
+/// A plan's own outreach design — what a draft for one of its prospects is
+/// written from — with the workspace's beside it, so a caller can show what a
+/// blank field falls back to. The same as the app's `GET /plans/{id}/outreach`.
+async fn plan_outreach(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (c, _) = match outreach_caller(&state, &headers, &q, peer, "GET", &format!("/v1/plans/{id}/outreach")).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    plan_outreach_json(&state, c.workspace, id).await
+}
+
+async fn plan_outreach_json(state: &App, workspace: i64, id: i64) -> Response {
+    let o = match store::get_plan_outreach(&state.db, workspace, id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "plan not found"),
+        Err(e) => return oops(e),
+    };
+    let ws = match store::get_outreach_profile(&state.db, workspace).await {
+        Ok(p) => p,
+        Err(e) => return oops(e),
+    };
+    Json(json!({
+        "plan_id": id,
+        "custom": o.custom,
+        "design_id": o.design_id,
+        "brief": o.brief,
+        "product": o.product,
+        "rules": o.rules,
+        "workspace": { "product": ws.product, "rules": ws.rules },
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PlanOutreachBody {
+    #[serde(default)]
+    custom: Option<bool>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    product: Option<String>,
+    #[serde(default)]
+    rules: Option<String>,
+}
+
+/// Any of custom, brief, product and rules; what is left out stays as it is.
+/// Turning `custom` on makes the plan's own text what its drafts are written
+/// from; off, they fall back to the workspace (or the plan's saved profile).
+async fn plan_save_outreach(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<PlanOutreachBody>,
+) -> Response {
+    let (c, _) = match outreach_caller(&state, &headers, &q, peer, "PUT", &format!("/v1/plans/{id}/outreach")).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(r) = needs_plans(&c) {
+        return r;
+    }
+    use crate::outreach::{MAX_BRIEF, MAX_PRODUCT, MAX_RULES};
+    for (what, v, max) in [("brief", &body.brief, MAX_BRIEF), ("product", &body.product, MAX_PRODUCT), ("rules", &body.rules, MAX_RULES)] {
+        if v.as_ref().is_some_and(|v| v.chars().count() > max) {
+            return err(StatusCode::BAD_REQUEST, &format!("{what} must be {max} characters or fewer"));
+        }
+    }
+    let current = match store::get_plan_outreach(&state.db, c.workspace, id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "plan not found"),
+        Err(e) => return oops(e),
+    };
+    let o = store::PlanOutreach {
+        custom: body.custom.unwrap_or(current.custom),
+        design_id: current.design_id,
+        brief: body.brief.as_deref().map(|v| v.trim().to_string()).unwrap_or(current.brief),
+        product: body.product.as_deref().map(|v| v.trim().to_string()).unwrap_or(current.product),
+        rules: body.rules.as_deref().map(|v| v.trim().to_string()).unwrap_or(current.rules),
+    };
+    if o.custom && o.brief.is_empty() && o.product.is_empty() && o.rules.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "say who this campaign is for, or what to offer them, before tailoring it");
+    }
+    match store::set_plan_outreach(&state.db, c.workspace, id, &o).await {
+        Ok(true) => plan_outreach_json(&state, c.workspace, id).await,
+        Ok(false) => err(StatusCode::NOT_FOUND, "plan not found"),
         Err(e) => oops(e),
     }
 }

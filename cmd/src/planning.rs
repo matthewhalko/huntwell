@@ -41,7 +41,7 @@ pub fn draft_request(sc: &SourceConfig) -> crate::plan_chat::PlanDraftRequest {
         target_prospects: sc.target_prospects as i64,
         // It keeps the columns the plan already has: they are the shape of the
         // rows already stored against it.
-        columns: crate::artifact::parse_schema(&sc.fields_schema_json)
+        columns: crate::artifact::output_columns(&crate::artifact::parse_schema(&sc.fields_schema_json))
             .into_iter()
             .map(|f| crate::artifact::ColumnRequest {
                 name: if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() },

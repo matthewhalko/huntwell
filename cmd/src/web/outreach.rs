@@ -22,6 +22,9 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/outreach", get(list).post(create))
         .route("/outreach/profile", get(profile).put(save_profile))
+        .route("/plans/{id}/outreach", get(plan_outreach).put(save_plan_outreach))
+        .route("/outreach/designs", get(list_designs).post(create_design))
+        .route("/outreach/designs/{id}", axum::routing::put(update_design).delete(delete_design))
         .route("/outreach/{id}", get(one).put(edit).delete(remove))
         .route("/outreach/{id}/revise", post(revise))
         .route("/outreach/{id}/restore", post(restore))
@@ -40,6 +43,17 @@ async fn profile(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Js
         "product": p.product,
         "rules": p.rules,
         "footer": footer,
+        // Plans with their own outreach on — what a hand-entered draft can be
+        // written for.
+        "campaigns": store::outreach_campaigns(&state.db, acc.tenant()).await?
+            .into_iter()
+            .map(|(plan_id, name)| json!({ "plan_id": plan_id, "name": name }))
+            .collect::<Vec<_>>(),
+        // Saved profiles — any draft, to anyone, can be written to one.
+        "designs": store::list_outreach_designs(&state.db, acc.tenant()).await?
+            .into_iter()
+            .map(|d| json!({ "design_id": d.design_id, "name": d.name }))
+            .collect::<Vec<_>>(),
         // Whether drafting can work at all on this server, so the page can say
         // so instead of offering a button that fails.
         "ready": draft::model(&state.db).await.is_some(),
@@ -74,6 +88,129 @@ async fn save_profile(State(state): State<App>, AuthUser(acc): AuthUser, Json(b)
         store::set_outreach_profile(&state.db, acc.tenant(), b.product.trim(), b.rules.trim(), acc.account_id).await?;
     }
     store::set_outreach_footer(&state.db, acc.account_id, b.footer.trim_end()).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// A plan's own outreach design, with the workspace's beside it so the page
+/// can show what a blank field falls back to.
+async fn plan_outreach(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let o = store::get_plan_outreach(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
+    let ws = store::get_outreach_profile(&state.db, acc.tenant()).await?;
+    Ok(Json(json!({
+        "custom": o.custom,
+        "design_id": o.design_id,
+        "brief": o.brief,
+        "product": o.product,
+        "rules": o.rules,
+        "workspace": { "product": ws.product, "rules": ws.rules },
+    })))
+}
+
+async fn save_plan_outreach(
+    State(state): State<App>,
+    AuthUser(acc): AuthUser,
+    Path(id): Path<i64>,
+    Json(b): Json<store::PlanOutreach>,
+) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
+    if b.brief.chars().count() > draft::MAX_BRIEF {
+        return Err(too_long("The campaign brief", draft::MAX_BRIEF));
+    }
+    if b.product.chars().count() > draft::MAX_PRODUCT {
+        return Err(too_long("The product description", draft::MAX_PRODUCT));
+    }
+    if b.rules.chars().count() > draft::MAX_RULES {
+        return Err(too_long("The rules", draft::MAX_RULES));
+    }
+    let o = store::PlanOutreach {
+        custom: b.custom,
+        design_id: b.design_id,
+        brief: b.brief.trim().into(),
+        product: b.product.trim().into(),
+        rules: b.rules.trim().into(),
+    };
+    if o.custom && o.brief.is_empty() && o.product.is_empty() && o.rules.is_empty() {
+        return Err(bad_request("say who this campaign is for, or what to offer them, before tailoring it"));
+    }
+    if let Some(d) = o.design_id {
+        if !store::outreach_design_exists(&state.db, acc.tenant(), d).await? {
+            return Err(not_found("outreach profile not found"));
+        }
+    }
+    if !store::set_plan_outreach(&state.db, acc.tenant(), id, &o).await? {
+        return Err(not_found("plan not found"));
+    }
+    plan_outreach(State(state), AuthUser(acc), Path(id)).await
+}
+
+// ---- saved profiles -----------------------------------------------------------
+//
+// A named outreach design that belongs to no plan: picked for any draft, or
+// used by a plan as its outreach.
+
+async fn list_designs(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "designs": store::list_outreach_designs(&state.db, acc.tenant()).await? })))
+}
+
+#[derive(Deserialize)]
+struct DesignBody {
+    name: String,
+    #[serde(default)]
+    brief: String,
+    #[serde(default)]
+    product: String,
+    #[serde(default)]
+    rules: String,
+}
+
+async fn save_design(state: &App, acc: &store::Account, id: Option<i64>, b: DesignBody) -> Result<Json<Value>, ApiError> {
+    require_cap(state, acc, store::CAP_PLANS).await?;
+    let name: String = b.name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string();
+    if name.is_empty() {
+        return Err(bad_request("give the profile a name"));
+    }
+    if name.chars().count() > 120 {
+        return Err(too_long("The name", 120));
+    }
+    if b.brief.chars().count() > draft::MAX_BRIEF {
+        return Err(too_long("Who it's for", draft::MAX_BRIEF));
+    }
+    if b.product.chars().count() > draft::MAX_PRODUCT {
+        return Err(too_long("The product description", draft::MAX_PRODUCT));
+    }
+    if b.rules.chars().count() > draft::MAX_RULES {
+        return Err(too_long("The rules", draft::MAX_RULES));
+    }
+    let d = store::PlanOutreach { custom: true, design_id: None, brief: b.brief.trim().into(), product: b.product.trim().into(), rules: b.rules.trim().into() };
+    if d.brief.is_empty() && d.product.is_empty() && d.rules.is_empty() {
+        return Err(bad_request("say who it's for, what to offer, or how the emails should read"));
+    }
+    let saved = store::save_outreach_design(&state.db, acc.tenant(), id, &name, &d, acc.account_id).await.map_err(|e| {
+        if format!("{e:#}").contains("outreach_design_name_idx") {
+            bad_request("you already have a profile with that name")
+        } else {
+            e.into()
+        }
+    })?;
+    let id = saved.ok_or_else(|| not_found("outreach profile not found"))?;
+    let all = store::list_outreach_designs(&state.db, acc.tenant()).await?;
+    let one = all.into_iter().find(|d| d.design_id == id).ok_or_else(|| not_found("outreach profile not found"))?;
+    Ok(Json(json!({ "design": one })))
+}
+
+async fn create_design(State(state): State<App>, AuthUser(acc): AuthUser, Json(b): Json<DesignBody>) -> Result<Json<Value>, ApiError> {
+    save_design(&state, &acc, None, b).await
+}
+
+async fn update_design(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>, Json(b): Json<DesignBody>) -> Result<Json<Value>, ApiError> {
+    save_design(&state, &acc, Some(id), b).await
+}
+
+async fn delete_design(State(state): State<App>, AuthUser(acc): AuthUser, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require_cap(&state, &acc, store::CAP_PLANS).await?;
+    if !store::delete_outreach_design(&state.db, acc.tenant(), id).await? {
+        return Err(not_found("outreach profile not found"));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -118,6 +255,14 @@ pub(crate) struct CreateBody {
     pub prospect_id: Option<i64>,
     #[serde(default)]
     pub recipient: Option<Recipient>,
+    /// Write it to this plan's outreach design. A prospect's own plan is used
+    /// when this is absent.
+    #[serde(default)]
+    pub plan_id: Option<i64>,
+    /// Write it with this saved profile — for anyone, prospect or not. Wins
+    /// over any plan.
+    #[serde(default)]
+    pub design_id: Option<i64>,
 }
 
 async fn list(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Json<Value>, ApiError> {
@@ -217,15 +362,26 @@ pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<
         }
         (None, None) => return Err(bad_request("choose a prospect or enter a recipient")),
     };
+    // Checked before anything is spent: a plan named here must be this
+    // workspace's.
+    if let Some(pid) = b.plan_id {
+        store::get_plan_outreach(&state.db, w.workspace, pid).await?.ok_or_else(|| not_found("plan not found"))?;
+    }
+    if let Some(d) = b.design_id {
+        if !store::outreach_design_exists(&state.db, w.workspace, d).await? {
+            return Err(not_found("outreach profile not found"));
+        }
+    }
+    let campaign = store::outreach_campaign(&state.db, w.workspace, b.design_id, b.plan_id.or(prospect.as_ref().map(|p| p.plan_id))).await?;
     let model = paid_call_checks(state, w.workspace).await?;
     let profile = store::get_outreach_profile(&state.db, w.workspace).await?;
     let footer = store::get_outreach_footer(&state.db, w.person).await?;
     let extra = prospect.as_ref().map(prospect_extra).unwrap_or_default();
-    let prompt = draft::prompt(&profile, &w.sender, &to, &extra);
+    let prompt = draft::prompt(&profile, campaign.as_ref(), &w.sender, &to, &extra);
     let d = draft::draft(&model, &prompt, None, None).await.map_err(model_failed)?;
     bill(state, w.workspace, &d).await;
     let text = OutreachText { subject: &d.subject, body: &d.body, source: "draft", feedback: "", model: &model, usage: d.usage };
-    Ok(store::create_outreach(&state.db, w.workspace, w.person, prospect.map(|p| p.prospect_id), &to, &footer, &text).await?)
+    Ok(store::create_outreach(&state.db, w.workspace, w.person, prospect.map(|p| p.prospect_id), campaign.as_ref(), &to, &footer, &text).await?)
 }
 
 /// Rewrite a draft from feedback.
@@ -254,7 +410,9 @@ pub(crate) async fn revise_draft(state: &App, w: &Writer, id: i64, feedback: &st
         None => None,
     };
     let extra = prospect.as_ref().map(prospect_extra).unwrap_or_default();
-    let prompt = draft::prompt(&profile, &w.sender, &to, &extra);
+    // The campaign it was first written to, as that plan's design reads now.
+    let campaign = store::outreach_campaign(&state.db, w.workspace, o.design_id, o.plan_id).await?;
+    let prompt = draft::prompt(&profile, campaign.as_ref(), &w.sender, &to, &extra);
     let d = draft::draft(&model, &prompt, Some((&o.subject, &o.body)), Some(feedback)).await.map_err(model_failed)?;
     bill(state, w.workspace, &d).await;
     let text = OutreachText { subject: &d.subject, body: &d.body, source: "revise", feedback, model: &model, usage: d.usage };

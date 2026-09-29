@@ -109,3 +109,33 @@ CREATE INDEX IF NOT EXISTS plan_schedule_idx ON public.plan (next_run_at) WHERE 
 -- seconds and the answer is almost always no. Partial, so it stays small.
 CREATE INDEX IF NOT EXISTS plan_draft_queue_idx ON public.plan (plan_id)
     WHERE draft_status = 'queued';
+
+-- The plan's columns are the ones the person typed (2026-09-26): those are
+-- the only output columns — the table, the CSV and the API show exactly them,
+-- and a rebuild keeps them. Set when a plan is created with columns.
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS custom_columns boolean NOT NULL DEFAULT false;
+
+-- Post new results into a Slack channel (2026-09-27). The incoming-webhook URL
+-- is a credential — whoever holds it can post to that channel — so it is
+-- stored sealed (web::signing::seal_secret) and never sent back to a browser
+-- in full. Only the notification service opens it; worker VMs cannot.
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_webhook text NOT NULL DEFAULT '';
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_enabled boolean NOT NULL DEFAULT false;
+-- 'auto': every new row in one post up to slack_limit, past it a summary with
+-- a link to the plan. 'all': every new row, however many posts that takes.
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_layout varchar(12) NOT NULL DEFAULT 'auto';
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_limit integer NOT NULL DEFAULT 10;
+-- How the last delivery went, so a webhook someone deleted in Slack shows up
+-- in the plan's settings instead of failing silently forever.
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_last_error text NOT NULL DEFAULT '';
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS slack_last_at timestamptz;
+
+-- Outreach tailored to this plan (2026-09-27). Off: drafts to this plan's
+-- people use the workspace's outreach settings (outreach_profile). On: the
+-- brief says who this campaign is for and the angle to take; a product here
+-- replaces the workspace's description for these drafts, and these rules are
+-- added to the workspace's, winning where they differ.
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS outreach_custom boolean NOT NULL DEFAULT false;
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS outreach_brief text NOT NULL DEFAULT '';
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS outreach_product text NOT NULL DEFAULT '';
+ALTER TABLE public.plan ADD COLUMN IF NOT EXISTS outreach_rules text NOT NULL DEFAULT '';

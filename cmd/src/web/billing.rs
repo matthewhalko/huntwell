@@ -402,7 +402,9 @@ pub async fn purchase_credits(
             return Err(bad_request("Stripe is not configured on this server"));
         }
         let ref_id = format!("mock_{}_{}", acc.tenant(), purchase_id);
-        store::apply_credit_purchase(&state.db, acc.tenant(), micros, &ref_id).await?;
+        if store::apply_credit_purchase(&state.db, acc.tenant(), micros, &ref_id).await? {
+            announce_credit(&state.db, acc.tenant(), micros, false, "").await;
+        }
         let usage = store::ensure_usage(&state.db, acc.tenant()).await?;
         return Ok(Json(json!({"mocked": true, "credits_usd": usage.credits_usd, "usage": usage})));
     };
@@ -492,9 +494,30 @@ async fn apply_payment_intent(state: &App, account_id: i64, micros: i64, pi: &Va
     if amount_micros != micros || currency != "usd" || owner != account_id.to_string() {
         return Err(bad_request("Stripe payment details do not match this credit purchase"));
     }
-    store::apply_credit_purchase(&state.db, account_id, micros, id).await?;
+    // `false` when this payment was already applied (the browser retried, or
+    // the 3-D Secure confirm raced the first call) — one email per payment.
+    if store::apply_credit_purchase(&state.db, account_id, micros, id).await? {
+        announce_credit(&state.db, account_id, micros, false, "").await;
+    }
     let usage = store::ensure_usage(&state.db, account_id).await?;
     Ok(Json(json!({"credits_usd": usage.credits_usd, "usage": usage})))
+}
+
+/// Email the workspace's owner that credit landed — bought, or added free by
+/// an operator (`granted`, with their note). Queued, never sent inline, and a
+/// failure to queue is logged rather than failing the credit, which is done.
+pub async fn announce_credit(db: &store::Db, account_id: i64, usd_micros: i64, granted: bool, note: &str) {
+    let Ok(Some(owner)) = store::get_account(db, account_id).await else { return };
+    let balance = store::ensure_usage(db, account_id).await.map(|u| u.credits_usd).unwrap_or(0.0);
+    let link = crate::config::get("HUNTWELL_PUBLIC_URL")
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+        .map(|b| format!("{b}/app/usage"));
+    let msg = crate::mail::credits_added(usd_micros as f64 / 1e6, balance, granted, note, link.as_deref());
+    let kind = if granted { "credit_grant" } else { "credit_purchase" };
+    if let Err(e) = store::queue_mail(db, Some(account_id), &owner.email, kind, &msg).await {
+        tracing::warn!(account_id, "credit email not queued: {e:#}");
+    }
 }
 
 async fn first_card_pm(key: &str, customer: &str) -> Result<String, ApiError> {

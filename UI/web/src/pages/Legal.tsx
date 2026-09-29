@@ -39,7 +39,7 @@ function Shell({ title, updated, children }: { title: string; updated: string; c
         <p className="muted">Last updated {updated}</p>
         {children}
         <p className="muted" style={{ marginTop: '2.5rem' }}>
-          Questions about this page: <a href="mailto:legal@huntwell.app">legal@huntwell.app</a>
+          Questions about this page: <a href="mailto:legal@huntwell.ai">legal@huntwell.ai</a>
         </p>
       </div>
     </div>

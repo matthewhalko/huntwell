@@ -19,3 +19,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS credit_purchase_payment_ref_idx
 	ON public.credit_purchase (payment_ref);
 CREATE INDEX IF NOT EXISTS credit_purchase_account_idx
 	ON public.credit_purchase (account_id, created_at DESC);
+
+-- Credit an operator adds by hand (2026-09-28) lands here too, so the wallet
+-- has one history: 'purchase' is paid through Stripe (or the local mock),
+-- 'grant' is free credit from the admin — never revenue. A grant's
+-- payment_ref is 'grant_…', its note is what the operator wrote, and
+-- granted_by is the operator's address.
+ALTER TABLE public.credit_purchase ADD COLUMN IF NOT EXISTS kind varchar(12) NOT NULL DEFAULT 'purchase';
+ALTER TABLE public.credit_purchase ADD COLUMN IF NOT EXISTS note text NOT NULL DEFAULT '';
+ALTER TABLE public.credit_purchase ADD COLUMN IF NOT EXISTS granted_by varchar(320) NOT NULL DEFAULT '';

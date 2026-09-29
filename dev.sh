@@ -70,6 +70,7 @@ TMP_DIR="$DATA_DIR/temp"
 DEV_PID_FILE="$TMP_DIR/dev.pid"
 ADMIN_PID_FILE="$TMP_DIR/admin.pid"
 SERVER_PID_FILE="$TMP_DIR/server.pid"
+NOTIFY_PID_FILE="$TMP_DIR/notification.pid"
 VITE_PID_FILE="$TMP_DIR/vite.pid"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -137,6 +138,7 @@ stop_previous_stack() {
   stop_by_pidfile "previous ./dev.sh" "$DEV_PID_FILE" "dev.sh"
   stop_by_pidfile "admin" "$ADMIN_PID_FILE" "huntwell"
   stop_by_pidfile "server" "$SERVER_PID_FILE" "huntwell"
+  stop_by_pidfile "notification" "$NOTIFY_PID_FILE" "notification"
   stop_by_pidfile "vite" "$VITE_PID_FILE" "vite"
   # Pool workers and leftover `run` children are not in a pid file — they
   # are spawned by admin and would double-claim if they survived it.
@@ -241,39 +243,38 @@ fi
 
 cleanup() {
   trap - INT TERM EXIT
-  for pid in "${UI_PID:-}" "${SERVER_PID:-}" "${ADMIN_PID:-}"; do
+  for pid in "${UI_PID:-}" "${SERVER_PID:-}" "${ADMIN_PID:-}" "${NOTIFY_PID:-}"; do
     [[ -n "$pid" ]] || continue
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
   pkill -f "huntwell worker-pool" 2>/dev/null || true
-  rm -f "$DEV_PID_FILE" "$ADMIN_PID_FILE" "$SERVER_PID_FILE" "$VITE_PID_FILE"
+  rm -f "$DEV_PID_FILE" "$ADMIN_PID_FILE" "$SERVER_PID_FILE" "$VITE_PID_FILE" "$NOTIFY_PID_FILE"
 }
 trap cleanup INT TERM EXIT
 
 # --- admin control plane -----------------------------------------------------
-# Operator credentials live in the global file so they survive restarts; a
-# fresh checkout gets a generated password (printed below).
-ADMIN_EMAIL="$(grep -E '^HUNTWELL_ADMIN_EMAIL=' "$GLOBAL" | cut -d= -f2- || true)"
-if [[ -z "$ADMIN_EMAIL" ]]; then
-  ADMIN_EMAIL="admin@local.test"
-  ADMIN_PASS="$(LC_ALL=C head -c 24 /dev/urandom | base64 | tr -d '\n=/+' | head -c 16)"
-  {
-    echo "HUNTWELL_ADMIN_EMAIL=$ADMIN_EMAIL"
-    echo "HUNTWELL_ADMIN_PASSWORD=$ADMIN_PASS"
-  } >> "$GLOBAL"
+# The admin signs operators in through their own Cognito pool and refuses to
+# start without one. Most dev boxes have none, and the app runs fine without
+# the admin — so it is started only when that pool is configured, and runs
+# are then executed in-process (RUN_DISPATCH=local) since pool placement is
+# the admin's job.
+ADMIN_PID=""
+if "$SERVER_BIN" config get ADMIN_COGNITO_USER_POOL_ID >/dev/null 2>&1 \
+   && "$SERVER_BIN" config get ADMIN_COGNITO_CLIENT_ID >/dev/null 2>&1; then
+  step "Starting admin control plane on http://$ADMIN_ADDR (local pool of ${LOCAL_POOL:-2} workers)"
+  HUNTWELL_LOCAL_POOL="${LOCAL_POOL:-2}" "$SERVER_BIN" admin --addr "$ADMIN_ADDR" &
+  ADMIN_PID=$!
+  write_pid "$ADMIN_PID_FILE" "$ADMIN_PID"
+  wait_for "$ADMIN_PORT" "admin" "$ADMIN_PID"
+  # Runs route through the pool (admin + local workers) by default, exercising
+  # the same placement path production uses. RUN_DISPATCH=local ./dev.sh opts out.
+  RUN_DISPATCH="${RUN_DISPATCH:-pool}"
+else
+  warn "admin console skipped — no operators' Cognito pool (ADMIN_COGNITO_USER_POOL_ID / _CLIENT_ID in $GLOBAL)"
+  printf "   the app and the public site run without it; plans run in this process (RUN_DISPATCH=local)\n"
+  RUN_DISPATCH=local
 fi
-ADMIN_PASS="$(grep -E '^HUNTWELL_ADMIN_PASSWORD=' "$GLOBAL" | cut -d= -f2- || true)"
-
-step "Starting admin control plane on http://$ADMIN_ADDR (local pool of ${LOCAL_POOL:-2} workers)"
-HUNTWELL_LOCAL_POOL="${LOCAL_POOL:-2}" "$SERVER_BIN" admin --addr "$ADMIN_ADDR" &
-ADMIN_PID=$!
-write_pid "$ADMIN_PID_FILE" "$ADMIN_PID"
-wait_for "$ADMIN_PORT" "admin" "$ADMIN_PID"
-
-# Runs route through the pool (admin + local workers) by default, exercising
-# the same placement path production uses. RUN_DISPATCH=local ./dev.sh opts out.
-RUN_DISPATCH="${RUN_DISPATCH:-pool}"
 export RUN_DISPATCH
 
 step "Starting server on http://$API_ADDR (RUN_DISPATCH=$RUN_DISPATCH)"
@@ -281,6 +282,20 @@ step "Starting server on http://$API_ADDR (RUN_DISPATCH=$RUN_DISPATCH)"
 SERVER_PID=$!
 write_pid "$SERVER_PID_FILE" "$SERVER_PID"
 wait_for "$API_PORT" "server" "$SERVER_PID"
+
+# The notification service drains queued mail (logged, not sent, without a
+# mail provider) and delivers runs' Slack posts. Production runs it on the app
+# VM; without it here, nothing queued would ever go out.
+NOTIFY_BIN="$(dirname "$SERVER_BIN")/notification"
+NOTIFY_PID=""
+if [[ -x "$NOTIFY_BIN" ]]; then
+  step "Starting notification service (mail + Slack)"
+  HUNTWELL_NOTIFICATION_ADDR="127.0.0.1:$((API_PORT + 4))" "$NOTIFY_BIN" &
+  NOTIFY_PID=$!
+  write_pid "$NOTIFY_PID_FILE" "$NOTIFY_PID"
+else
+  warn "no notification binary at $NOTIFY_BIN — queued mail and Slack posts will wait"
+fi
 
 if [[ "$WITH_UI" == "1" ]]; then
   step "Starting Vite on http://127.0.0.1:$UI_PORT"
@@ -298,7 +313,7 @@ open_lan_firewall
 printf '\n  Ready — open these:\n\n'
 [[ "$WITH_UI" == "1" ]] && printf '    App (HMR)      http://127.0.0.1:%s\n' "$UI_PORT"
 printf '    Server         http://127.0.0.1:%s   (embedded UI, no HMR)\n' "$API_PORT"
-printf '    Admin          http://127.0.0.1:%s   (%s / %s)\n' "$ADMIN_PORT" "$ADMIN_EMAIL" "$ADMIN_PASS"
+[[ -n "$ADMIN_PID" ]] && printf '    Admin          http://127.0.0.1:%s   (sign in with an operator from the admin Cognito pool)\n' "$ADMIN_PORT"
 printf '    Health         http://127.0.0.1:%s/healthz\n' "$API_PORT"
 if [[ "$UI_HOST" == "0.0.0.0" ]]; then
   printf '\n'
@@ -306,7 +321,7 @@ if [[ "$UI_HOST" == "0.0.0.0" ]]; then
     [[ -n "$addr" ]] || continue
     [[ "$WITH_UI" == "1" ]] && printf '    LAN app        http://%s:%s\n' "$addr" "$UI_PORT"
     printf '    LAN server     http://%s:%s\n' "$addr" "$API_PORT"
-    [[ "$ADMIN_HOST" == "0.0.0.0" ]] && printf '    LAN admin      http://%s:%s\n' "$addr" "$ADMIN_PORT"
+    [[ -n "$ADMIN_PID" && "$ADMIN_HOST" == "0.0.0.0" ]] && printf '    LAN admin      http://%s:%s\n' "$addr" "$ADMIN_PORT"
   done < <(lan_ipv4_addrs)
   printf '    tip: if LAN is blocked, check macOS Settings > Network > Firewall\n'
 fi
@@ -316,7 +331,7 @@ printf '\n    Ctrl-C stops all.\n\n'
 # hiding behind the other. (Bash 3.2 on macOS has no `wait -n`.)
 EXIT_CODE=0
 while true; do
-  for pid in ${UI_PID:+"$UI_PID"} "$SERVER_PID" "$ADMIN_PID"; do
+  for pid in ${UI_PID:+"$UI_PID"} "$SERVER_PID" ${ADMIN_PID:+"$ADMIN_PID"}; do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid" 2>/dev/null || EXIT_CODE=$?
       cleanup

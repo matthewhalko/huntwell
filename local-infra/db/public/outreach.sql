@@ -29,3 +29,11 @@ CREATE TABLE IF NOT EXISTS public.outreach (
 );
 CREATE INDEX IF NOT EXISTS outreach_account_idx ON public.outreach (account_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS outreach_prospect_idx ON public.outreach (prospect_id) WHERE prospect_id IS NOT NULL;
+
+-- The plan whose outreach design a draft was written with (2026-09-27): the
+-- prospect's plan, or the one picked for a hand-entered recipient. Kept so a
+-- revision is written to the same campaign. NULL = the workspace's settings.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS plan_id bigint REFERENCES public.plan (plan_id) ON DELETE SET NULL;
+-- The saved profile a draft was written with, if one (2026-09-27). Pinned like
+-- plan_id so a revision stays on it.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS design_id bigint REFERENCES public.outreach_design (design_id) ON DELETE SET NULL;

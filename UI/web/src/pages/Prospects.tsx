@@ -193,9 +193,12 @@ export function ProspectTable({ planId }: { planId?: number }) {
           onDelete={write ? () => del(open.prospect_id) : undefined}
           actions={
             write && (
-              <button className="btn primary sm" onClick={() => outreach.start(open.prospect_id)} disabled={outreach.busy}>
-                {outreach.busy ? 'Writing…' : 'Draft outreach'}
-              </button>
+              <span className="row outreach-go">
+                {outreach.picker}
+                <button className="btn primary sm" onClick={() => outreach.start(open.prospect_id)} disabled={outreach.busy}>
+                  {outreach.busy ? 'Writing…' : 'Draft outreach'}
+                </button>
+              </span>
             )
           }
         />
@@ -400,9 +403,12 @@ function UnifiedResults({ q }: { q: string }) {
             write &&
             open.kind === 'prospect' &&
             open.id > 0 && (
-              <button className="btn primary sm" onClick={() => outreach.start(open.id)} disabled={outreach.busy}>
-                {outreach.busy ? 'Writing…' : 'Draft outreach'}
-              </button>
+              <span className="row outreach-go">
+                {outreach.picker}
+                <button className="btn primary sm" onClick={() => outreach.start(open.id)} disabled={outreach.busy}>
+                  {outreach.busy ? 'Writing…' : 'Draft outreach'}
+                </button>
+              </span>
             )
           }
           onClose={() => setOpen(null)}

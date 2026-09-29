@@ -83,6 +83,14 @@ is known). Two invitations let someone in, resolved by `find_invitation`:
 - **Team** — a workspace's existing `invite`; still lets someone sign up while
   closed. It can be copied, so the OTP is still required.
 
+Each waitlist row has a "…" menu (Approve / Decline / Delete). Delete on a
+joined row is `store::purge_account` — one transaction over every table that
+names the account (most do not cascade from `account`; add a new
+account-keyed table to its list), refused while a run is queued or running,
+then the asset bytes and the Cognito user. The operator must type the address;
+the server checks it too. `purge_tests` (ignored; dev DB) fails if any
+`account_id`-like column still points at a deleted account.
+
 ## Public site and SEO (`cmd/src/web/seo.rs`, `UI/web/src/components/Site.tsx`)
 
 `seo::PAGES` is the one list of public pages: `/sitemap.xml`, `/robots.txt` and
@@ -138,7 +146,17 @@ the newest Claude Sonnet from Anthropic's live model list — never the plan
 drafter's model. Cursor ids cannot serve it. Current Claude models reject
 `temperature` (400); the Anthropic adapter drops it for them (`accepts_sampling`).
 Billed to the workspace via `charge_account_usage`, after a credit check.
-Product description and rules are per workspace (`outreach_profile`); the
+Product description and rules are per workspace (`outreach_profile`) — the
+default. On top of it, a draft can be written to a *campaign*
+(`store::Campaign`, `outreach::prompt`'s CAMPAIGN block: a brief, an optional
+product that replaces the workspace's, rules that win where they differ):
+- a saved profile (`outreach_design`, Outreach → Profiles) — belongs to no
+  plan, picked for any draft (`design_id`), prospect or hand-entered;
+- a plan's own design (`plan.outreach_*`, Edit tab), or the saved profile the
+  plan uses (`plan.outreach_design_id`).
+`store::outreach_campaign` is the one resolver: picked profile → plan's own →
+plan's profile → workspace only. `outreach.design_id`/`plan_id` pin a draft so
+revisions stay on it. The
 footer is per person (`account.outreach_footer`) and appended by code, never
 by the model. Every text change is a row in `outreach_version`. Scraped
 prospect fields go through `outreach::scraped` (flattened, bounded, dropped if
@@ -149,6 +167,27 @@ the same `pub(crate)` functions in `web/outreach.rs` (`draft_new`,
 maker (`api_key.created_by`), else the workspace owner. Plan-pinned keys are
 refused. Keep app and API on those functions; never copy the logic.
 
+## Slack (`cmd/src/slack.rs`, `components/SlackSettings.tsx`, `slack_outbox.sql`)
+
+Per plan: an incoming webhook posts each run's **new** rows to a channel.
+Layout `auto` = up to `slack_limit` rows in one post, past it a summary + a
+"View all" link to the plan; `all` = every row over several messages (capped).
+Webhooks cannot attach files, so there is no CSV in Slack by design.
+
+- The run only queues (`store::queue_slack_post`, in `pipeline::announce_new`);
+  the **notification service** renders from rows first seen in
+  `[since, created_at]` and sends. Workers hold neither the seal key nor
+  `HUNTWELL_PUBLIC_URL`, so they cannot send it themselves. A multi-message
+  post resumes from `parts_sent` on retry.
+- The webhook is sealed (`signing::seal_secret`); the browser only ever gets
+  `slack::hint`. `slack::validate_webhook` (https, exactly `hooks.slack.com`,
+  `/services/…`, no port/userinfo/query) is the SSRF defence, and it runs on
+  save *and* on open. No redirects are followed.
+- Everything posted is scraped data: `slack::escape` everything, and a URL
+  becomes a link only if `safe_url`. No unfurling.
+- A permanent Slack refusal is written to `plan.slack_last_error` and shown in
+  the plan's settings; transient ones retry with the mail backoff.
+
 ## Billing rate
 
 Customers pay per million billable (input + output) tokens. The rate is the
@@ -157,6 +196,13 @@ Users → Rate), else `HUNTWELL_SELL_USD_PER_MTOKEN` (default $5). Always price
 through `store::sell_rate` / `effective_sell_rate` — never read the config rate
 directly — so the wallet debit, the live limit, run costs and the admin's
 Charged column agree. A change applies to tokens billed from then on.
+
+Credit lands through `store::apply_credit` only: `apply_credit_purchase`
+(Stripe / local mock) or `apply_credit_grant` (admin → Users → Credits → Add;
+`credit_purchase.kind='grant'`, never revenue). It returns `false` for a
+`payment_ref` already applied; only a `true` calls
+`billing::announce_credit`, which queues the owner's "credit added" email —
+so a retried payment or repeated webhook never credits or emails twice.
 
 ## Spending less (`cmd/src/thrift/`)
 
@@ -205,7 +251,17 @@ do not re-derive the rules):
   only works on one machine). Downloads go through `assets.rs`, which is where
   the SSRF and size guards live.
 
-`./dev.sh` also starts the admin control plane (`huntwell admin`) with a
-process-backed local worker pool (`HUNTWELL_LOCAL_POOL`, default 2) and runs
-the server with `RUN_DISPATCH=pool`, so run routing works locally with no VMs.
-`RUN_DISPATCH=local ./dev.sh` opts out. Operator creds live in `local-infra/global`.
+**Runs.** A workspace may run many plans at once; only the same plan twice is
+refused (runner check + `execution_one_active_per_plan_idx`). With no room a
+run waits `queued`: pool dispatch → the admin's placement loop starts it when a
+slot frees; local dispatch → `runner::spawn_local_queue` starts it when a run
+ends (`HUNTWELL_LOCAL_MAX_RUNS`, default 4; an account's runs take turns when
+they share a local Chrome, i.e. without Browserbase). Queued runs can be
+cancelled. Credits stay safe: debits are atomic and capped at the wallet.
+
+`./dev.sh` starts the notification service (mail is logged without a
+provider; Slack posts are delivered). When the operators' Cognito pool is set
+(`ADMIN_COGNITO_USER_POOL_ID`/`_CLIENT_ID`) it also starts the admin control
+plane with a process-backed local worker pool (`HUNTWELL_LOCAL_POOL`, default
+2) and runs the server with `RUN_DISPATCH=pool`; without that pool the admin
+is skipped and runs are `RUN_DISPATCH=local`.

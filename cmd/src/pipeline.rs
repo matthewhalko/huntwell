@@ -45,6 +45,25 @@ pub struct RunArgs {
     pub progress: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// The most billable (input + output) tokens this run may spend. It stops
+    /// when it gets there and keeps what it found. `None` or 0: no limit
+    /// beyond the account's credits.
+    #[serde(default)]
+    pub max_tokens: Option<i64>,
+}
+
+/// This run's token limit (0 = none), set once at the start of the run.
+static RUN_TOKEN_CAP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Stop the run once `spent` billable tokens reach its limit. Called with the
+/// booked total and with the live estimate, so the stop comes as soon as
+/// either shows it — within a turn, not at the end of a long call.
+fn check_token_cap(spent: i64) {
+    let cap = RUN_TOKEN_CAP.load(std::sync::atomic::Ordering::Relaxed);
+    if cap > 0 && spent >= cap && !crate::agent::budget_reached() {
+        crate::agent::trip_budget();
+        println!("[stop] reached this run's limit of {cap} tokens — stopping and keeping what it found");
+    }
 }
 
 fn default_progress() -> String {
@@ -130,6 +149,11 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
     METER_ACCOUNT.store(run.account_id, std::sync::atomic::Ordering::Relaxed);
     METER_PLAN.store(run.plan_id, std::sync::atomic::Ordering::Relaxed);
     crate::agent::reset_credits_trip();
+    let cap = args.max_tokens.unwrap_or(0).max(0);
+    RUN_TOKEN_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
+    if cap > 0 {
+        println!("  limit      stops at {cap} tokens");
+    }
     // Write each turn to the row as the agent reports it, so the watching
     // page ticks instead of sitting at $0 until the (minutes-long) call ends.
     let meter_db = db.clone();
@@ -195,9 +219,17 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
             // Sent from the run itself, not the server: this is the only place
             // that holds for every dispatch mode, and it is where the count of
             // genuinely new rows is known.
-            if new > 0 && sc.alert_email {
-                alert_new_records(db, &sc, new).await;
-            }
+            announce_new(db, &sc, &run, new).await;
+            0
+        }
+        // Stopped at the limit the run was started with: that is the run doing
+        // what it was told, so it succeeds with whatever it found by then.
+        Err(e) if e.downcast_ref::<crate::agent::CreditsExhausted>().is_some() && crate::agent::budget_reached() => {
+            let new = store::count_found_since(db, run.plan_id, run.started_at).await.unwrap_or(0);
+            println!("[stop] token limit reached — {new} new result(s) kept");
+            let _ = store::set_execution_new_prospects(db, execution_id, new).await;
+            let _ = store::finish_execution(db, execution_id, "succeeded", Some(0)).await;
+            announce_new(db, &sc, &run, new).await;
             0
         }
         Err(e) if e.downcast_ref::<crate::agent::CreditsExhausted>().is_some() => {
@@ -219,6 +251,24 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
 /// worked. Every failure here is a log line, never an error return. Without
 /// `HUNTWELL_PUBLIC_URL` there is nowhere to link to, so nothing is sent —
 /// an email whose only call to action is a dead link is worse than silence.
+/// Tell whoever asked that a run found something new: the owner's email, and
+/// the plan's Slack channel. Slack is only queued here — the notification
+/// service renders the post from this run's rows and sends it, because the
+/// webhook is sealed with a key this process (on a worker VM) does not have.
+async fn announce_new(db: &Db, sc: &SourceConfig, run: &store::ExecutionRecord, new: i64) {
+    if new <= 0 {
+        return;
+    }
+    if sc.alert_email {
+        alert_new_records(db, sc, new).await;
+    }
+    match store::queue_slack_post(db, sc.account_id, sc.plan_id, run.execution_id, run.started_at).await {
+        Ok(Some(_)) => println!("[slack] {new} new result(s) queued for the plan's Slack channel"),
+        Ok(None) => {}
+        Err(e) => eprintln!("  ! could not queue the Slack post: {e:#}"),
+    }
+}
+
 async fn alert_new_records(db: &Db, sc: &SourceConfig, new: i64) {
     let Some(base) = crate::config::get("HUNTWELL_PUBLIC_URL") else {
         return;
@@ -610,6 +660,7 @@ async fn book_tokens(
         return;
     }
     let total = add_real_booked(u);
+    check_token_cap(total.billable());
     if let Err(e) = store::set_execution_token_totals(db, execution_id, total).await {
         tracing::warn!("meter run tokens: {e:#}");
         // Billing state is unavailable. Fail closed: continuing would create
@@ -673,6 +724,7 @@ async fn show_live_tokens(
     }
     let mut shown = real_booked_now();
     shown.add(est);
+    check_token_cap(shown.billable());
     if let Err(e) = store::set_execution_token_totals(db, execution_id, shown).await {
         tracing::warn!("meter live display: {e:#}");
         return;
@@ -2025,5 +2077,37 @@ mod tests {
         assert_eq!(result_noun(&files, 2), "files");
         assert!(!result_noun(&artifacts, 4).contains("prospect"));
         assert!(!result_noun(&people, 4).contains("prospect"));
+    }
+}
+
+#[cfg(test)]
+mod token_cap_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_run_stops_at_its_token_limit_and_not_before() {
+        let _lock = crate::agent::STOP_FLAGS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::agent::reset_credits_trip();
+        RUN_TOKEN_CAP.store(50_000, Ordering::Relaxed);
+        check_token_cap(49_999);
+        assert!(!crate::agent::credits_exhausted(), "under the limit: keeps going");
+        check_token_cap(50_000);
+        assert!(crate::agent::budget_reached(), "at the limit: stops");
+        assert!(crate::agent::credits_exhausted(), "…through the same kill paths as running out of credits");
+        crate::agent::reset_credits_trip();
+        assert!(!crate::agent::budget_reached());
+        // No limit set: nothing stops it but the account's credits.
+        RUN_TOKEN_CAP.store(0, Ordering::Relaxed);
+        check_token_cap(10_000_000);
+        assert!(!crate::agent::credits_exhausted());
+    }
+
+    #[test]
+    fn a_limit_arrives_with_the_run_arguments() {
+        let a: RunArgs = serde_json::from_value(serde_json::json!({ "target": 25, "max_tokens": 200000 })).unwrap();
+        assert_eq!(a.max_tokens, Some(200_000));
+        let none: RunArgs = serde_json::from_value(serde_json::json!({ "target": 25 })).unwrap();
+        assert_eq!(none.max_tokens, None);
     }
 }
