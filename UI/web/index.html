@@ -28,20 +28,15 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet" />
-    <script>
-      // Apply the theme before first paint so a dark-mode user never sees a
-      // white flash. Mirrors ThemeProvider's logic.
-      (function () {
-        try {
-          var t = localStorage.getItem('huntwell.theme') || 'system';
-          var dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-        } catch (e) {}
-      })();
-    </script>
+    <!-- Before first paint, so a dark-mode visitor never sees a white flash.
+         A file, not an inline script: the CSP is script-src 'self', which
+         refuses inline scripts — an inline copy here silently never ran. -->
+    <script src="/theme.js"></script>
   </head>
   <body>
     <div id="root"></div>
+    <!-- A skeleton of this page until the app's script arrives (see the file). -->
+    <script src="/skeleton.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { SkeletonRows } from './Skeleton'
 import { createPortal } from 'react-dom'
 import { CopyIcon, SearchIcon, TickIcon } from './icons'
 
@@ -209,9 +210,18 @@ export function Spinner() {
 
 /// A region that is not ready to show yet. Used for a grid, a picker, a page
 /// — anywhere the alternative would be an empty state that is a lie.
+/// Something is loading. Inline (a count, a button) it is a spinner; as a
+/// block it is a skeleton of rows, the shape most of what loads here takes.
 export function Loading({ inline }: { inline?: boolean }) {
+  if (!inline) {
+    return (
+      <div className="loading-skel" aria-busy="true" aria-label="Loading">
+        <SkeletonRows />
+      </div>
+    )
+  }
   return (
-    <div className={inline ? 'loading-inline' : 'loading-block'} aria-busy="true" aria-live="polite">
+    <div className="loading-inline" aria-busy="true" aria-live="polite">
       <Spinner />
     </div>
   )

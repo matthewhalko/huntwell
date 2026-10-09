@@ -64,7 +64,7 @@ function PlanRow({ plan, onChange }: { plan: PlanSummary; onChange: () => void }
       </td>
       <td>
         {plan.Status === 'drafting' ? (
-          <Badge kind="info" pulse>
+          <Badge kind="info">
             <Spinner /> building…
           </Badge>
         ) : plan.Status === 'failed' ? (

@@ -99,7 +99,12 @@ pub async fn start(state: &App, account_id: i64, plan_id: i64, trigger: &str, ar
     } else {
         store::has_payment_method(&state.db, account_id).await?
     };
-    if !has_card {
+    // Free credit from an operator is spent without a card; the card is asked
+    // for once it is gone (store::spends_free_credit).
+    if !has_card && !store::spends_free_credit(&state.db, account_id).await? {
+        if store::has_granted_credit(&state.db, account_id).await? {
+            anyhow::bail!("your free credit is used up — add a card in Usage & billing to keep running searches");
+        }
         anyhow::bail!("no payment method on file — add a card in Usage & billing to start a run");
     }
     if store::account_over_budget(&state.db, account_id).await? {

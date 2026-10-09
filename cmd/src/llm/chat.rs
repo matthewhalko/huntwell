@@ -114,7 +114,7 @@ pub fn build(spec: &Spec, req: &Request) -> Value {
 pub fn parse(provider: &str, v: &Value) -> Result<Reply, LlmError> {
     let choice = v.pointer("/choices/0").ok_or_else(|| {
         tracing::error!("{provider}: reply carried no choices: {}", kit::snippet(&v.to_string()));
-        LlmError::Unavailable
+        LlmError::Unavailable(format!("{provider} sent a reply with no answer in it"))
     })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
     let text = message.get("content").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string);
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_reply_with_no_choices_is_the_provider_being_unavailable() {
-        assert!(matches!(parse("test", &json!({ "id": "x" })), Err(LlmError::Unavailable)));
+        assert!(matches!(parse("test", &json!({ "id": "x" })), Err(LlmError::Unavailable(_))));
     }
 
     #[test]

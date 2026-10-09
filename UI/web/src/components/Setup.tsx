@@ -63,6 +63,9 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
   /// meets the card field, which is the check that actually matters.
 
   const hasCard = !!billing?.has_card
+  // Free credit an operator added: no card is needed until it is spent.
+  const free = !hasCard && !!billing?.free_credit
+  const ready = hasCard || free
   const firstName = (me?.display_name || '').split(' ')[0]
 
   if (addingCard) {
@@ -93,10 +96,10 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
         </p>
 
         <ol className="steps">
-          <li className={'step' + (hasCard ? ' on' : '')}>
-            <span className="step-mark">{hasCard ? '✓' : '1'}</span>
+          <li className={'step' + (ready ? ' on' : '')}>
+            <span className="step-mark">{ready ? '✓' : '1'}</span>
             <div className="step-body">
-              <div className="step-title">Add a payment method</div>
+              <div className="step-title">{free ? 'Free credit to start with' : 'Add a payment method'}</div>
               <p className="step-hint">
                 {hasCard ? (
                   <span className="pay-method" style={{ marginTop: 0 }}>
@@ -105,18 +108,20 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
                       {cardBrandLabel(billing?.card?.brand)} •••• {billing?.card?.last4} on file. Credits are purchased next — a run spends only what you have preallocated.
                     </span>
                   </span>
+                ) : free ? (
+                  `You have ${'$' + (billing?.credits_usd ?? 0).toFixed(2)} of credit on us — no card needed until it's used up. You'll be asked for one then.`
                 ) : (
                   'Executions cost money, so a card comes first. You then buy credits and spend only those.'
                 )}
               </p>
-              {!hasCard && (
+              {!ready && (
                 <button className="btn primary sm" onClick={() => setAddingCard(true)}>
                   Add a card
                 </button>
               )}
             </div>
           </li>
-          <li className={'step' + (hasCard ? '' : ' waiting')}>
+          <li className={'step' + (ready ? '' : ' waiting')}>
             <span className="step-mark">2</span>
             <div className="step-body">
               <div className="step-title">{resume ? 'Start the search you typed' : 'Create your first search'}</div>
@@ -125,7 +130,7 @@ export default function Setup({ resume, onClose }: { resume?: () => void; onClos
                   ? 'It is ready to go — this picks up right where you left off.'
                   : "Say what you're looking for in plain words — Huntwell works out how to find it."}
               </p>
-              <button className="btn primary sm" disabled={!hasCard || busy} onClick={() => done('/app')}>
+              <button className="btn primary sm" disabled={!ready || busy} onClick={() => done('/app')}>
                 {resume ? 'Start it' : 'Create a search plan'}
               </button>
             </div>

@@ -182,7 +182,7 @@ pub fn parse(v: &Value) -> Result<Reply, LlmError> {
         // that is a refusal rather than an outage — but the run should see the
         // difference, so the reason is logged.
         tracing::error!("gemini: no candidate in reply: {}", kit::snippet(&v.to_string()));
-        LlmError::Unavailable
+        LlmError::Unavailable("gemini sent a reply with no answer in it".into())
     })?;
 
     let mut text = String::new();

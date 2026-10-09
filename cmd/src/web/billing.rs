@@ -71,6 +71,7 @@ pub fn routes() -> Router<App> {
         .route("/billing/credits/confirm", post(credits_confirm))
         .route("/billing/webhook", post(webhook))
         .route("/billing/card", delete(remove_card))
+        .route("/billing/auto-reload", axum::routing::put(put_auto_reload))
 }
 
 /// Cards and payments need the credits cap. Role defaults give it to the
@@ -193,8 +194,18 @@ async fn billing(State(state): State<App>, AuthUser(acc): AuthUser) -> Result<Js
         "production": crate::config::is_production(),
         "has_card": has_card,
         "has_credits": usage.credits_usd > 0.0,
+        // Whether a run needs a card right now: not while free credit an
+        // operator added is left (runner::start holds the same rule).
+        "card_required": !has_card && !store::spends_free_credit(&state.db, acc.tenant()).await?,
+        // Running on free credit, no card: say so, and that a card comes later.
+        "free_credit": !has_card && store::spends_free_credit(&state.db, acc.tenant()).await?,
+        // That free credit is gone and there is still no card: the prompt says why.
+        "free_credit_spent": !has_card && usage.credits_usd <= 0.0 && store::has_granted_credit(&state.db, acc.tenant()).await?,
         "credits_usd": usage.credits_usd,
         "card": if has_card { card_json(pm) } else { Value::Null },
+        "auto_reload": store::get_auto_reload(&state.db, acc.tenant()).await?,
+        "auto_reload_terms": AUTO_RELOAD_TERMS,
+        "auto_reload_max_per_day": AUTO_RELOAD_MAX_PER_DAY,
     })))
 }
 
@@ -300,6 +311,9 @@ async fn remove_card(State(state): State<App>, AuthUser(acc): AuthUser) -> Resul
     require_payer(&state, &acc).await?;
     let payment_ref = customer_ref(&state, acc.tenant()).await?;
     store::set_payment_method(&state.db, acc.tenant(), &payment_ref, "", "", "").await?;
+    // Nothing left to charge: auto-reload goes off with the card, and has to
+    // be agreed to again for the next one.
+    store::disable_auto_reload(&state.db, acc.tenant(), "turned off because the card was removed").await?;
     Ok(Json(json!({"has_card": false, "card": Value::Null})))
 }
 
@@ -403,7 +417,7 @@ pub async fn purchase_credits(
         }
         let ref_id = format!("mock_{}_{}", acc.tenant(), purchase_id);
         if store::apply_credit_purchase(&state.db, acc.tenant(), micros, &ref_id).await? {
-            announce_credit(&state.db, acc.tenant(), micros, false, "").await;
+            announce_credit(&state.db, acc.tenant(), micros, crate::mail::CreditKind::Purchase, "").await;
         }
         let usage = store::ensure_usage(&state.db, acc.tenant()).await?;
         return Ok(Json(json!({"mocked": true, "credits_usd": usage.credits_usd, "usage": usage})));
@@ -497,7 +511,7 @@ async fn apply_payment_intent(state: &App, account_id: i64, micros: i64, pi: &Va
     // `false` when this payment was already applied (the browser retried, or
     // the 3-D Secure confirm raced the first call) — one email per payment.
     if store::apply_credit_purchase(&state.db, account_id, micros, id).await? {
-        announce_credit(&state.db, account_id, micros, false, "").await;
+        announce_credit(&state.db, account_id, micros, crate::mail::CreditKind::Purchase, "").await;
     }
     let usage = store::ensure_usage(&state.db, account_id).await?;
     Ok(Json(json!({"credits_usd": usage.credits_usd, "usage": usage})))
@@ -506,15 +520,19 @@ async fn apply_payment_intent(state: &App, account_id: i64, micros: i64, pi: &Va
 /// Email the workspace's owner that credit landed — bought, or added free by
 /// an operator (`granted`, with their note). Queued, never sent inline, and a
 /// failure to queue is logged rather than failing the credit, which is done.
-pub async fn announce_credit(db: &store::Db, account_id: i64, usd_micros: i64, granted: bool, note: &str) {
+pub async fn announce_credit(db: &store::Db, account_id: i64, usd_micros: i64, kind: crate::mail::CreditKind, note: &str) {
     let Ok(Some(owner)) = store::get_account(db, account_id).await else { return };
     let balance = store::ensure_usage(db, account_id).await.map(|u| u.credits_usd).unwrap_or(0.0);
     let link = crate::config::get("HUNTWELL_PUBLIC_URL")
         .map(|b| b.trim().trim_end_matches('/').to_string())
         .filter(|b| !b.is_empty())
         .map(|b| format!("{b}/app/usage"));
-    let msg = crate::mail::credits_added(usd_micros as f64 / 1e6, balance, granted, note, link.as_deref());
-    let kind = if granted { "credit_grant" } else { "credit_purchase" };
+    let msg = crate::mail::credits_added(usd_micros as f64 / 1e6, balance, kind, note, link.as_deref());
+    let kind = match kind {
+        crate::mail::CreditKind::Grant => "credit_grant",
+        crate::mail::CreditKind::Purchase => "credit_purchase",
+        crate::mail::CreditKind::AutoReload { .. } => "credit_auto",
+    };
     if let Err(e) = store::queue_mail(db, Some(account_id), &owner.email, kind, &msg).await {
         tracing::warn!(account_id, "credit email not queued: {e:#}");
     }
@@ -683,9 +701,255 @@ async fn read(res: reqwest::Response) -> Result<Value, ApiError> {
     Ok(body)
 }
 
+// ---- auto-reload ----------------------------------------------------------------
+//
+// "When my balance falls below $10, add $50." The website's own loop watches
+// balances and charges the saved card off-session — the only process that
+// holds the Stripe key (workers never do). It charges only what the payer
+// agreed to, recorded with the wording's version; at most
+// AUTO_RELOAD_MAX_PER_DAY times a day; and a card that fails turns it off and
+// says so by email, rather than trying again and again.
+
+/// The version of the wording the payer agrees to. The text itself is on the
+/// Usage page (`AutoReloadCard`); change both together, and bump this, and
+/// everyone agrees again the next time they save.
+pub const AUTO_RELOAD_TERMS: &str = "auto-reload-v1";
+/// A runaway (a looping plan, a stolen session) cannot charge more than this.
+pub const AUTO_RELOAD_MAX_PER_DAY: i64 = 3;
+const AUTO_RELOAD_TICK: std::time::Duration = std::time::Duration::from_secs(20);
+/// A claim older than this is a crash mid-charge, and is taken again.
+const AUTO_RELOAD_LEASE_SECS: i64 = 600;
+/// Never two reloads within this of each other, nor a retry sooner.
+const AUTO_RELOAD_GAP_SECS: i64 = 120;
+
+static AUTO_RELOAD_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[derive(Deserialize)]
+struct AutoReloadBody {
+    enabled: bool,
+    below_usd: f64,
+    amount_usd: f64,
+    /// The payer ticked the box agreeing to be charged. Needed whenever it is
+    /// turned on or its numbers change.
+    #[serde(default)]
+    agree: bool,
+}
+
+/// Whole dollars from $5 to $500 for the threshold; the amount is a credit
+/// pack, and at least $10 so a reload is worth a card charge.
+fn auto_reload_numbers(below: f64, amount: f64) -> Result<(i64, i64), ApiError> {
+    if !below.is_finite() || below.fract() != 0.0 || !(5.0..=500.0).contains(&below) {
+        return Err(bad_request("the balance to reload at is between $5 and $500 in whole dollars"));
+    }
+    if !amount.is_finite() || amount.fract() != 0.0 || !(10.0..=500.0).contains(&amount) {
+        return Err(bad_request("the amount to add is between $10 and $500 in whole dollars"));
+    }
+    Ok(((below * 1e6) as i64, (amount * 1e6) as i64))
+}
+
+async fn put_auto_reload(State(state): State<App>, AuthUser(acc): AuthUser, Json(b): Json<AutoReloadBody>) -> Result<Json<Value>, ApiError> {
+    require_payer(&state, &acc).await?;
+    let (below, amount) = auto_reload_numbers(b.below_usd, b.amount_usd)?;
+    let current = store::get_auto_reload(&state.db, acc.tenant()).await?;
+    let mut agreed = None;
+    if b.enabled {
+        if store::payment_method(&state.db, acc.tenant()).await?.is_none() {
+            return Err(bad_request("add a card before turning on auto-reload"));
+        }
+        // What was agreed to is the numbers and the wording; any change to
+        // either is a new agreement.
+        let same = current.enabled
+            && (current.below_usd * 1e6).round() as i64 == below
+            && (current.amount_usd * 1e6).round() as i64 == amount
+            && current.terms == AUTO_RELOAD_TERMS;
+        if !same {
+            if !b.agree {
+                return Err(bad_request("agree to be charged automatically to turn on auto-reload"));
+            }
+            agreed = Some((acc.account_id, AUTO_RELOAD_TERMS));
+        }
+    }
+    store::set_auto_reload(&state.db, acc.tenant(), b.enabled, below, amount, agreed).await?;
+    if b.enabled {
+        tracing::info!(account_id = acc.tenant(), by = acc.account_id, below, amount, "auto-reload on");
+        // Already below the line: reload now rather than at the next tick.
+        AUTO_RELOAD_WAKE.notify_one();
+    }
+    Ok(Json(json!({ "auto_reload": store::get_auto_reload(&state.db, acc.tenant()).await? })))
+}
+
+/// Start the loop. Nothing to do on a server that cannot charge a card.
+pub fn spawn_auto_reload(db: store::Db) {
+    if !configured() && !mock_allowed() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            reload_due(&db).await;
+            let _ = tokio::time::timeout(AUTO_RELOAD_TICK, AUTO_RELOAD_WAKE.notified()).await;
+        }
+    });
+}
+
+/// How a charge went, as far as what to do next.
+#[derive(Debug)]
+enum Charge {
+    /// Credited (`true`), or this exact charge was already applied (`false`).
+    Done(bool),
+    /// The card or the bank said no, or wants the payer present. Retrying
+    /// will not help; auto-reload turns off.
+    Declined(String),
+    /// Stripe or the network failed. Tried again after the gap.
+    Retry(String),
+}
+
+async fn reload_due(db: &store::Db) {
+    let due = match store::claim_auto_reloads(db, AUTO_RELOAD_LEASE_SECS, AUTO_RELOAD_GAP_SECS, 20).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("auto-reload: claiming: {e:#}");
+            return;
+        }
+    };
+    for (account_id, amount, below) in due {
+        if store::auto_reloads_today(db, account_id).await.unwrap_or(0) >= AUTO_RELOAD_MAX_PER_DAY {
+            let why = format!("paused: it already reloaded {AUTO_RELOAD_MAX_PER_DAY} times in the last 24 hours — it resumes after that, or buy credit by hand");
+            let _ = store::finish_auto_reload(db, account_id, &why, true).await;
+            continue;
+        }
+        match charge_saved_card(db, account_id, amount).await {
+            Charge::Done(fresh) => {
+                let _ = store::finish_auto_reload(db, account_id, "", true).await;
+                if fresh {
+                    tracing::info!(account_id, usd = amount as f64 / 1e6, "auto-reload charged");
+                    announce_credit(db, account_id, amount, crate::mail::CreditKind::AutoReload { below_usd: below as f64 / 1e6 }, "").await;
+                }
+            }
+            Charge::Declined(why) => {
+                tracing::warn!(account_id, "auto-reload declined, turning it off: {why}");
+                let _ = store::disable_auto_reload(db, account_id, &format!("turned off: {why}")).await;
+                announce_reload_failed(db, account_id, amount, &why).await;
+            }
+            Charge::Retry(why) => {
+                tracing::warn!(account_id, "auto-reload will retry: {why}");
+                let _ = store::finish_auto_reload(db, account_id, &format!("will try again shortly: {why}"), true).await;
+            }
+        }
+    }
+}
+
+/// Charge the card on file `micros`, off-session, and credit the wallet.
+async fn charge_saved_card(db: &store::Db, account_id: i64, micros: i64) -> Charge {
+    let pm = match store::payment_method(db, account_id).await {
+        Ok(Some(pm)) => pm,
+        Ok(None) => return Charge::Declined("there is no card on file".into()),
+        Err(e) => return Charge::Retry(format!("{e:#}")),
+    };
+    // Numbered, so a retry of this reload is the same charge at Stripe and
+    // the next reload is a new one.
+    let n = match store::auto_reload_count(db, account_id).await {
+        Ok(n) => n + 1,
+        Err(e) => return Charge::Retry(format!("{e:#}")),
+    };
+    let Some(key) = secret_key() else {
+        if !mock_allowed() {
+            return Charge::Declined("card payments are not set up on this server".into());
+        }
+        return match store::apply_credit_auto_reload(db, account_id, micros, &format!("mock_auto_{account_id}_{n}")).await {
+            Ok(fresh) => Charge::Done(fresh),
+            Err(e) => Charge::Retry(format!("{e:#}")),
+        };
+    };
+    if !pm.payment_ref.starts_with("cus_") {
+        return Charge::Declined("there is no card on file".into());
+    }
+    let mut card = pm.card_pm.clone();
+    if card.is_empty() {
+        card = match first_card_pm(&key, &pm.payment_ref).await {
+            Ok(c) if !c.is_empty() => c,
+            Ok(_) => return Charge::Declined("there is no card on file at Stripe".into()),
+            Err(e) => return Charge::Retry(e.1),
+        };
+    }
+    let cents = (micros / 10_000).to_string();
+    let account = account_id.to_string();
+    let res = reqwest::Client::new()
+        .post(format!("{}/payment_intents", api_base()))
+        .bearer_auth(&key)
+        .header("Idempotency-Key", format!("huntwell-auto-{account_id}-{n}"))
+        .form(&[
+            ("amount", cents.as_str()),
+            ("currency", "usd"),
+            ("customer", pm.payment_ref.as_str()),
+            ("payment_method", card.as_str()),
+            ("confirm", "true"),
+            ("off_session", "true"),
+            ("description", "Huntwell auto-reload"),
+            ("metadata[account_id]", account.as_str()),
+            ("metadata[kind]", "auto_reload"),
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await;
+    let res = match res {
+        Ok(r) => r,
+        Err(_) => return Charge::Retry("could not reach Stripe".into()),
+    };
+    let status = res.status();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg = body.pointer("/error/message").and_then(Value::as_str).unwrap_or("the payment failed").to_string();
+        // A card error (402) is the card's answer; anything else may pass.
+        let card_error = status.as_u16() == 402 || body.pointer("/error/type").and_then(Value::as_str) == Some("card_error");
+        return if card_error { Charge::Declined(msg) } else { Charge::Retry(format!("Stripe: {msg}")) };
+    }
+    match body.get("status").and_then(Value::as_str).unwrap_or("") {
+        "succeeded" => {}
+        "processing" => return Charge::Retry("the payment is still processing".into()),
+        "requires_action" | "requires_source_action" => {
+            return Charge::Declined("your bank asked to confirm the charge yourself, which auto-reload can't do — buy credit by hand once to confirm the card".into())
+        }
+        other => return Charge::Declined(format!("the payment did not complete ({other})")),
+    }
+    let id = body.get("id").and_then(Value::as_str).unwrap_or_default();
+    let amount = body.get("amount").and_then(Value::as_i64).unwrap_or(0).saturating_mul(10_000);
+    let owner = body.pointer("/metadata/account_id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() || amount != micros || body.get("currency").and_then(Value::as_str) != Some("usd") || owner != account {
+        tracing::error!(account_id, "auto-reload: Stripe's payment does not match what was asked for");
+        return Charge::Declined("the payment details did not match".into());
+    }
+    match store::apply_credit_auto_reload(db, account_id, micros, id).await {
+        Ok(fresh) => Charge::Done(fresh),
+        // Charged but not yet credited: the same idempotency key on the next
+        // try returns this payment, and `payment_ref` credits it once.
+        Err(e) => Charge::Retry(format!("{e:#}")),
+    }
+}
+
+/// Tell the owner auto-reload failed and is now off.
+async fn announce_reload_failed(db: &store::Db, account_id: i64, micros: i64, why: &str) {
+    let Ok(Some(owner)) = store::get_account(db, account_id).await else { return };
+    let link = crate::config::get("HUNTWELL_PUBLIC_URL")
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+        .map(|b| format!("{b}/app/usage"));
+    let msg = crate::mail::auto_reload_failed(micros as f64 / 1e6, why.trim_end_matches('.'), link.as_deref());
+    if let Err(e) = store::queue_mail(db, Some(account_id), &owner.email, "auto_reload_failed", &msg).await {
+        tracing::warn!(account_id, "auto-reload failure email not queued: {e:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_reload_numbers_are_bounded_whole_dollars() {
+        assert_eq!(auto_reload_numbers(10.0, 50.0).ok(), Some((10_000_000, 50_000_000)));
+        for (below, amount) in [(4.0, 50.0), (10.5, 50.0), (10.0, 5.0), (10.0, 501.0), (f64::NAN, 50.0), (10.0, 49.99)] {
+            assert!(auto_reload_numbers(below, amount).is_err(), "{below} {amount}");
+        }
+    }
 
     fn ok(raw: &str) -> Option<String> {
         return_url(raw).ok()

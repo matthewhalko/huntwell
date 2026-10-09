@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { SkeletonFields } from '../components/Skeleton'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { api, AuthConfig, InvitationInfo } from '../api'
 import { useAuth } from '../auth'
@@ -255,7 +256,7 @@ export function Signup() {
   if (!cfg || (invite && !info && !inviteErr)) {
     return (
       <Shell title="Create your account">
-        <p className="muted">Loading…</p>
+        <SkeletonFields fields={3} />
       </Shell>
     )
   }

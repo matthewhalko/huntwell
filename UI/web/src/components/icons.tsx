@@ -171,3 +171,18 @@ export function CardBrandIcon({ brand, size = 38 }: { brand?: string | null; siz
     </svg>
   )
 }
+
+/** Gmail's envelope mark, for "Open in Gmail". Its colours are brand tokens
+ *  (--gmail-*, styles.css): the mark looks the same in both themes. */
+export function GmailIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden style={{ flex: 'none' }}>
+      <path style={{ fill: 'var(--gmail-green)' }} d="M45 16.2l-5 2.75-5 4.75L35 40h7c1.66 0 3-1.34 3-3V16.2z" />
+      <path style={{ fill: 'var(--gmail-blue)' }} d="M3 16.2l3.61 1.71L13 23.7V40H6c-1.66 0-3-1.34-3-3V16.2z" />
+      <polygon style={{ fill: 'var(--gmail-red)' }} points="35,11.2 24,19.45 13,11.2 12,17 13,23.7 24,31.95 35,23.7 36,17" />
+      <path style={{ fill: 'var(--gmail-red-deep)' }} d="M3 12.3v3.9l10 7.5V11.2L9.88 8.86C9.13 8.3 8.21 8 7.27 8 4.91 8 3 9.91 3 12.27z" />
+      <path style={{ fill: 'var(--gmail-yellow)' }} d="M45 12.3v3.9l-10 7.5V11.2l3.12-2.34C38.87 8.3 39.79 8 40.73 8 43.09 8 45 9.91 45 12.27z" />
+    </svg>
+  )
+}
+

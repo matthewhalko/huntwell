@@ -69,7 +69,11 @@ pub fn sha1_hex(s: &str) -> String {
 /// One tracing setup for every executable, so they all honour RUST_LOG the
 /// same way and default to the same level.
 pub fn init_tracing() {
+    // Colour codes only for a person at a terminal: a run's output is piped
+    // into its log in the database, where they would show as junk.
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "huntwell=info,tower_http=warn".into()),

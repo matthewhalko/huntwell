@@ -293,7 +293,7 @@ async fn every_adapter_honours_the_contract() {
             let got = match e {
                 LlmError::Unauthorized => "unauthorized",
                 LlmError::RateLimited { .. } => "ratelimited",
-                LlmError::Unavailable => "unavailable",
+                LlmError::Unavailable(_) => "unavailable",
                 LlmError::ContextTooLong => "contexttoolong",
                 LlmError::BadRequest(_) => "badrequest",
             };

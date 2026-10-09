@@ -3,6 +3,7 @@ import type { ColDef } from 'ag-grid-community'
 import { api, Artifact, can, FieldSpec, fmtDate, usd } from '../api'
 import { useAuth } from '../auth'
 import { ResultDialog } from './ResultDialog'
+import { useDraftOutreach } from '../pages/Outreach'
 import { Loading } from './ui'
 import Grid, { LINK_COLUMN, useNarrow } from './Grid'
 
@@ -14,6 +15,7 @@ const NUMERIC = (t: string) => t === 'money' || t === 'number'
 export function ArtifactTable({ planId }: { planId: number }) {
   const { me } = useAuth()
   const write = can(me, 'plans')
+  const outreach = useDraftOutreach()
   const [rows, setRows] = useState<Artifact[] | null>(null)
   const [schema, setSchema] = useState<FieldSpec[]>([])
   const [total, setTotal] = useState(0)
@@ -192,6 +194,16 @@ export function ArtifactTable({ planId }: { planId: number }) {
             ['First seen', fmtDate(open.first_seen_utc)],
           ]}
           onClose={() => setOpen(null)}
+          actions={
+            write && (
+              <span className="row outreach-go">
+                {outreach.picker}
+                <button className="btn primary sm" onClick={() => outreach.start({ artifact_id: open.artifact_id })} disabled={outreach.busy}>
+                  {outreach.busy ? 'Writing…' : 'Draft outreach'}
+                </button>
+              </span>
+            )
+          }
           onDelete={
             write
               ? async () => {

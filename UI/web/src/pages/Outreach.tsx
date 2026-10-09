@@ -16,7 +16,7 @@ import {
 import { useAuth } from '../auth'
 import Grid, { useNarrow } from '../components/Grid'
 import { CopyHover, Empty, Field, Loading, Modal, useConfirm, useToast } from '../components/ui'
-import { CopyIcon } from '../components/icons'
+import { CopyIcon, GmailIcon } from '../components/icons'
 
 /// Copy to the clipboard and say so — or say why not. True when it worked.
 function useCopy() {
@@ -68,10 +68,13 @@ export function useDraftOutreach() {
         ))}
       </select>
     ) : null
-  const start = async (prospectId: number) => {
+  /// A prospect, or a custom-columns result (`{ artifact_id }`), whose Email
+  /// column then fills the To.
+  const start = async (target: number | { artifact_id: number }) => {
     setBusy(true)
     try {
-      const r = await api.post<{ outreach: Draft }>('/api/outreach', { prospect_id: prospectId, ...(designId ? { design_id: designId } : {}) })
+      const to = typeof target === 'number' ? { prospect_id: target } : target
+      const r = await api.post<{ outreach: Draft }>('/api/outreach', { ...to, ...(designId ? { design_id: designId } : {}) })
       nav(`/app/outreach?open=${r.outreach.outreach_id}`)
     } catch (e: any) {
       toast(e.message, true)
@@ -512,6 +515,20 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
   const mailto = o
     ? `mailto:${encodeURIComponent(o.recipient_email)}?subject=${encodeURIComponent(o.subject)}&body=${encodeURIComponent(outreachBody(o))}`
     : ''
+  // Gmail's own compose window in a new tab, filled in, from whichever Google
+  // account is signed in there. Nothing is sent and nothing is connected:
+  // the person reads it and presses Send themselves. Without an address the
+  // To field is simply left for them.
+  const gmail = o
+    ? // encodeURIComponent, not URLSearchParams: a space must arrive as %20,
+      // never as a "+" that could show up in the subject or body.
+      'https://mail.google.com/mail/?view=cm&fs=1' +
+      (o.recipient_email ? `&to=${encodeURIComponent(o.recipient_email)}` : '') +
+      `&su=${encodeURIComponent(o.subject)}&body=${encodeURIComponent(outreachBody(o))}`
+    : ''
+  // Google cuts a compose link somewhere past 8,000 characters; past that,
+  // copying is the way out rather than a link that loses the end of the email.
+  const gmailFits = gmail.length < 7500
 
   return (
     <Modal title={title} onClose={onClose} className="outreach-dialog">
@@ -527,6 +544,16 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
             <button className="btn primary sm" onClick={() => copy(outreachEmail(o), 'Email')}>
               <CopyIcon size={14} /> Copy email
             </button>
+            <a
+              className={'btn sm' + (gmailFits ? '' : ' disabled')}
+              href={gmailFits ? gmail : undefined}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-disabled={!gmailFits}
+              title={gmailFits ? 'Opens Gmail in a new tab with this email filled in. You send it.' : 'Too long for a Gmail link — copy the email instead'}
+            >
+              <GmailIcon /> Open in Gmail
+            </a>
             {o.recipient_email && mailto.length < 1900 && (
               <a className="btn sm" href={mailto}>
                 Open in mail app

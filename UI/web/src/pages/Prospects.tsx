@@ -401,11 +401,15 @@ function UnifiedResults({ q }: { q: string }) {
           }
           actions={
             write &&
-            open.kind === 'prospect' &&
+            (open.kind === 'prospect' || open.kind === 'artifact') &&
             open.id > 0 && (
               <span className="row outreach-go">
                 {outreach.picker}
-                <button className="btn primary sm" onClick={() => outreach.start(open.id)} disabled={outreach.busy}>
+                <button
+                  className="btn primary sm"
+                  onClick={() => outreach.start(open.kind === 'artifact' ? { artifact_id: open.id } : open.id)}
+                  disabled={outreach.busy}
+                >
                   {outreach.busy ? 'Writing…' : 'Draft outreach'}
                 </button>
               </span>

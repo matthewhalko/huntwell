@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { AuthSkeleton } from '../components/Skeleton'
 import { Navigate, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api'
 import { useAuth } from '../auth'
@@ -25,7 +26,7 @@ export default function Join() {
       .catch((e) => setErr(e.message || 'This invitation is no longer valid'))
   }, [token])
 
-  if (loading) return <div className="auth">Loading…</div>
+  if (loading) return <AuthSkeleton />
   if (!me) return <Navigate to="/login" state={{ from: `/join/${token}` }} replace />
 
   const accept = async () => {

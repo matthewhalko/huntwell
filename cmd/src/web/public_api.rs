@@ -1197,6 +1197,7 @@ fn outreach_json(o: &store::OutreachRow) -> Value {
         // The plan whose own outreach it was written to; null = the workspace's.
         "plan_id": o.plan_id,
         "design_id": o.design_id,
+        "artifact_id": o.artifact_id,
         "campaign": o.campaign,
         "recipient": {
             "name": o.recipient_name,

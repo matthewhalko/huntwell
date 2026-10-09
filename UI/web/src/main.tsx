@@ -7,7 +7,11 @@ import { AuthProvider } from './auth'
 import { ConfirmProvider, ToastProvider } from './components/ui'
 import './styles.css'
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+// public/skeleton.js filled #root with a skeleton and marked it busy; React's
+// first render replaces the skeleton, and the page is no longer loading.
+const root = document.getElementById('root')!
+root.removeAttribute('aria-busy')
+ReactDOM.createRoot(root).render(
   <React.StrictMode>
     <ThemeProvider>
       <AuthProvider>

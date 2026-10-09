@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ago, api, can, FieldSpec, fmtDate, fmtTokens, Plan, Run, scheduleLabel, fmtDuration } from '../api'
 import { useAuth } from '../auth'
 import { Badge, Empty, Loading, Modal, ModalBackdrop, Spinner, StatusBadge, useConfirm, useToast } from '../components/ui'
+import { PageSkeleton } from '../components/Skeleton'
 import { CheckIcon, ClockIcon } from '../components/icons'
 import { SearchSeeds } from '../components/SearchSeeds'
 import { ArtifactTable } from '../components/ArtifactTable'
@@ -82,7 +83,7 @@ export default function PlanDetail() {
     nav(loc.pathname, { replace: true, state: {} })
   }, [locState.welcome, plan?.Status, plan?.PlanId, loc.pathname, nav])
 
-  if (!plan) return <Loading />
+  if (!plan) return <PageSkeleton kind="detail" />
   const active = runs.find((r) => r.status === 'running' || r.status === 'queued')
 
   const save = async (p: Plan) => {

@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from 'react'
+import { AutoReloadCard } from '../components/AutoReloadCard'
+import { SkeletonRows } from '../components/Skeleton'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ago, api, Billing, can, fmtDate, fmtTokens, money, Overview, Prospect, Run, Usage as UsageT, usd } from '../api'
 import { useAuth } from '../auth'
@@ -15,6 +17,8 @@ export default function Usage() {
   const [data, setData] = useState<Overview | null>(null)
   const [usage, setUsage] = useState<UsageT | null>(null)
   const [billing, setBilling] = useState<Billing | null>(null)
+  // The first load failed: show the page as it is rather than a skeleton forever.
+  const [loadFailed, setLoadFailed] = useState(false)
   const [runs, setRuns] = useState<Run[] | null>(null)
   const [chartUnit, setChartUnit] = useState<ChartUnit>('tokens')
   const [lookback, setLookback] = useState(100)
@@ -100,8 +104,8 @@ export default function Usage() {
     }
   }
   useEffect(() => {
-    load()
-    const t = setInterval(load, 10000)
+    load().catch(() => setLoadFailed(true))
+    const t = setInterval(() => load().catch(() => {}), 10000)
     return () => clearInterval(t)
   }, [])
 
@@ -149,6 +153,28 @@ export default function Usage() {
         </div>
       )}
 
+      {(billing === null || usage === null) && !loadFailed ? (
+        // Until the card and the balance are known: their shape, not an "Add
+        // payment method" button that vanishes a moment later.
+        <div aria-busy="true" aria-label="Loading">
+          <div className="skel-card" style={{ marginBottom: '1.4rem' }} aria-hidden>
+            <span className="skel" />
+            <span className="skel" />
+            <span className="skel" />
+          </div>
+          <div className="skel-cards" style={{ marginBottom: '1.4rem' }} aria-hidden>
+            {[0, 1, 2].map((i) => (
+              <div className="skel-card" key={i}>
+                <span className="skel" />
+                <span className="skel" />
+                <span className="skel" />
+              </div>
+            ))}
+          </div>
+          <SkeletonRows />
+        </div>
+      ) : (
+        <>
       <div className="card" style={{ marginBottom: '1.4rem' }}>
         <div className="row between">
           <h3 style={{ margin: 0 }}>Payment method</h3>
@@ -176,7 +202,11 @@ export default function Usage() {
           </div>
         ) : (
           <p className="muted" style={{ margin: '0.35rem 0 0' }}>
-            No card on file — runs are paused until one is added.
+            {billing?.free_credit
+              ? "No card on file — you're running on free credit we added. Add a card before it runs out to keep going without a pause."
+              : billing?.free_credit_spent
+                ? 'No card on file, and your free credit is used up — add a card to keep running searches.'
+                : 'No card on file — runs are paused until one is added.'}
             {billing?.production && !billing.stripe
               ? ' Stripe is not configured on this server, so a card cannot be added yet.'
               : billing && !billing.stripe
@@ -230,6 +260,8 @@ export default function Usage() {
           </div>
         )
       })()}
+
+      {billing && <AutoReloadCard billing={billing} canPay={pay} onSaved={() => load().catch(() => {})} />}
 
       {runs && runs.length > 0 && (
         <div className="card" style={{ marginBottom: '1.4rem' }}>
@@ -391,6 +423,8 @@ export default function Usage() {
               : undefined
           }
         />
+      )}
+        </>
       )}
     </>
   )

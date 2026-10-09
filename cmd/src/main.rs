@@ -306,6 +306,9 @@ async fn dispatch(cmd: Cmd) -> Result<i32> {
             Ok(0)
         }
         Cmd::Run { execution_id } | Cmd::RunWorker { execution_id } => {
+            // Without this a run's warnings — a provider's own reason for
+            // failing, above all — went nowhere. Its stdout is the run's log.
+            huntwell::init_tracing();
             huntwell::boot_bus("worker").await;
             let db = store::connect(&config::service_database_url()?, 4).await?;
             Ok(pipeline::execution_by_id(&db, execution_id).await)

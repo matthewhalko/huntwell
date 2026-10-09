@@ -20,11 +20,14 @@ import Join from './pages/Join'
 import { Privacy, Terms } from './pages/Legal'
 import { Pricing, Product, UseCases } from './pages/Site'
 import { RouteMeta } from './components/Site'
+import { AppSkeleton } from './components/Skeleton'
 
 function RequireAuth({ children }: { children: React.ReactElement }) {
   const { me, loading } = useAuth()
   const loc = useLocation()
-  if (loading) return <div style={{ padding: '3rem', textAlign: 'center' }}>Loading…</div>
+  // The app's own frame with a skeleton in it, not a blank "Loading…" page
+  // that the purple chrome then snaps in over.
+  if (loading) return <AppSkeleton />
   if (!me) return <Navigate to="/login" state={{ from: loc.pathname }} replace />
   // Signed in, but the address is not proven yet: nothing else will answer.
   if (!me.email_verified) return <Navigate to="/verify" replace />

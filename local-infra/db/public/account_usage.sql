@@ -56,3 +56,21 @@ CREATE TABLE IF NOT EXISTS public.account_usage (
 	CONSTRAINT account_usage_credit_debt_nonnegative CHECK (credit_debt_usd_micros >= 0),
 	CONSTRAINT account_usage_billed_nonnegative CHECK (billed_usd_micros >= 0)
 );
+
+-- Auto-reload (2026-10-06): when spendable credit falls below
+-- auto_reload_below_micros, the card on file is charged
+-- auto_reload_amount_micros, off-session, by the website's reload loop
+-- (billing::spawn_auto_reload). Only with the payer's recorded agreement:
+-- who agreed, when, and to which wording (auto_reload_terms) — a changed
+-- amount or threshold asks again. A declined card turns it off.
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload boolean NOT NULL DEFAULT false;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_below_micros bigint NOT NULL DEFAULT 0;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_amount_micros bigint NOT NULL DEFAULT 0;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_agreed_at timestamptz;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_agreed_by bigint;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_terms varchar(40) NOT NULL DEFAULT '';
+-- A charge in flight: set when the loop claims the account, cleared when it
+-- finishes. A stale one (a crash mid-charge) is reclaimed after a lease.
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_started_at timestamptz;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_last_at timestamptz;
+ALTER TABLE public.account_usage ADD COLUMN IF NOT EXISTS auto_reload_last_error text NOT NULL DEFAULT '';

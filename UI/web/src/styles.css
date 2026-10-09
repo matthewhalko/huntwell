@@ -16,6 +16,17 @@
   --accent-deep: #00604a;
   --accent-soft: #e6f3ee;
   --accent-text: #ffffff;
+  /* skeleton placeholders: a faint wash of the text colour with a moving
+     sheen; defined once, they follow the theme because --text/--surface do */
+  --skel: color-mix(in srgb, var(--text) 8%, transparent);
+  --skel-shine: color-mix(in srgb, var(--surface) 45%, transparent);
+  --skel-chrome: rgba(255, 255, 255, 0.13);
+  /* Gmail's mark (Open in Gmail): a brand's own colours, same in both themes */
+  --gmail-red: #e53935;
+  --gmail-red-deep: #c62828;
+  --gmail-blue: #1e88e5;
+  --gmail-green: #4caf50;
+  --gmail-yellow: #fbc02d;
   /* the Slack-logo rainbow — for the ✦ spark, busy shimmer, progress fills.
      Split into stops so an SVG gradient can be built from the same four. */
   --brand-sky: #36c5f0;
@@ -96,6 +107,9 @@
 }
 
 * { box-sizing: border-box; }
+/* The page's own colour from the first paint — before any script runs, and
+   under iOS's overscroll bounce — so a load never flashes white. */
+html { background: var(--bg); }
 html, body, #root { height: 100%; }
 body {
   margin: 0;
@@ -359,6 +373,8 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 1.2rem 0; }
 .btn:hover { text-decoration: none; border-color: var(--text-3); box-shadow: var(--shadow); }
 .btn:active { transform: scale(0.965); }
 .btn:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+/* a link styled as a button cannot be :disabled */
+.btn.disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
 .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 .btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
 .btn.dark { background: var(--chrome); color: #fff; border-color: var(--chrome); }
@@ -586,7 +602,9 @@ textarea.code { font-family: var(--mono); font-size: 0.83rem; min-height: 220px;
 .outreach-fallback { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.6rem 0.8rem; }
 .outreach-fallback summary { cursor: pointer; }
 .outreach-rules { white-space: pre-wrap; font-family: inherit; font-size: 0.85rem; color: var(--text-2); margin: 0.5rem 0 0; }
-.info { background: var(--info-bg); color: var(--text); padding: 0.7rem 0.9rem; border-radius: var(--radius-sm); margin-bottom: 0.9rem; }
+/* A notice box. Not a badge: `.badge.info` is the blue pill, and this rule,
+   later in the file, used to give it a notice's padding and square corners. */
+.info:not(.badge) { background: var(--info-bg); color: var(--text); padding: 0.7rem 0.9rem; border-radius: var(--radius-sm); margin-bottom: 0.9rem; }
 
 /* ---------- tabs ---------- */
 .tabs { display: flex; gap: 0.2rem; border-bottom: 1px solid var(--border); margin-bottom: 1.2rem; overflow-x: auto; }
@@ -830,11 +848,14 @@ tr.run-barren td:first-child a { color: var(--bad); }
 /* ---------- knowledge graph ----------
    The whole tab is one canvas you pan and zoom. Chrome sits on the map. */
 .content:has(.graph) { max-width: none; }
-.graph { min-height: calc(100vh - 12.5rem); }
+/* The graph fills what the window has left below the plan's header and tabs
+   (about 15.5rem of it), so the whole picture is on screen without scrolling;
+   the layout then wraps itself to this box's shape (KnowledgeGraph). */
 .graph-stage {
   position: relative;
-  height: calc(100vh - 12.5rem);
-  min-height: 420px;
+  height: calc(100vh - 15.5rem);
+  height: calc(100dvh - 15.5rem);
+  min-height: 360px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
@@ -1600,3 +1621,83 @@ details summary { cursor: pointer; font-weight: 700; }
 .run-limits .field { margin-bottom: 0.4rem; }
 .run-limit-note { margin-top: 0; }
 @media (max-width: 480px) { .run-limits { grid-template-columns: 1fr; } }
+
+/* ---- skeletons -------------------------------------------------------------
+   Placeholders shaped like what is coming, shown while it loads: before the
+   script runs (static markup in index.html), while the session is checked
+   (AppSkeleton) and while a page fetches its data (Loading / PageSkeleton).
+   The same classes in all three, so one hands over to the next without a jump. */
+.skel { display: block; position: relative; overflow: hidden; background: var(--skel); border-radius: 6px; height: 0.9rem; }
+.skel::after {
+  content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--skel-shine), transparent);
+  animation: skel-sheen 1.5s ease-in-out infinite;
+}
+@keyframes skel-sheen { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .skel::after { animation: none; } }
+.skel-title { height: 1.9rem; width: min(260px, 60%); }
+.skel-sub { height: 0.85rem; width: min(420px, 85%); margin-top: 0.55rem; }
+.skel-btn { height: 2.3rem; width: 7.5rem; border-radius: var(--radius-sm); flex: none; }
+.skel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1.4rem; }
+.skel-head > div { flex: 1; min-width: 0; }
+.skel-tabs { display: flex; gap: 1.2rem; padding-bottom: 0.7rem; margin-bottom: 1.2rem; border-bottom: 1px solid var(--border); }
+.skel-tabs .skel { width: 4.2rem; }
+.skel-rows { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+.skel-row { display: flex; align-items: center; gap: 1.2rem; padding: 0.95rem 1rem; }
+.skel-row + .skel-row { border-top: 1px solid var(--border); }
+.skel-row .skel:nth-child(1) { flex: 2.2; }
+.skel-row .skel:nth-child(2) { flex: 1.4; }
+.skel-row .skel:nth-child(3) { flex: 1; }
+.skel-row .skel:nth-child(4) { flex: 0.8; }
+.skel-row.head .skel { height: 0.65rem; opacity: 0.7; }
+.skel-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.skel-card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 1.2rem 1.3rem; display: grid; gap: 0.7rem; }
+.skel-card .skel:first-child { height: 1.1rem; width: 45%; }
+.skel-card .skel:nth-child(3) { width: 85%; }
+.skel-card .skel:last-child { width: 60%; }
+@media (max-width: 760px) {
+  .skel-row .skel:nth-child(n + 3) { display: none; }
+}
+/* on the purple chrome: the rail's icon tiles */
+.rail .skel { background: var(--skel-chrome); }
+.rail .skel::after { display: none; }
+.rail-item .tile.skel { width: 36px; height: 36px; border-radius: 8px; }
+.rail-item .rlbl.skel { width: 30px; height: 0.45rem; margin-top: 0.3rem; }
+/* the public site's hero, before the landing page arrives */
+.skel-hero { max-width: 1100px; margin: 0 auto; padding: 4rem 2.5rem 3rem; display: grid; gap: 1rem; }
+.skel-hero .skel-title { height: 3.2rem; width: min(560px, 90%); }
+.skel-hero .skel-title + .skel-title { width: min(380px, 70%); }
+.skel-hero .skel-sub { width: min(520px, 92%); }
+.skel-hero .skel-btn { width: 10rem; height: 2.8rem; margin-top: 0.8rem; }
+.skel-nav { display: flex; gap: 1.2rem; margin: 0 auto; }
+.skel-nav .skel { width: 4.5rem; }
+@media (max-width: 760px) {
+  .skel-hero { padding: 2.5rem 1.2rem; }
+  .skel-nav { display: none; }
+}
+/* sign-in pages: the card, empty */
+.skel-auth { min-height: 100%; display: grid; place-items: center; padding: 1.5rem; }
+.skel-auth .card { width: min(420px, 100%); display: grid; gap: 0.9rem; }
+.skel-auth .skel { height: 2.6rem; }
+.skel-auth .skel.skel-title { height: 1.6rem; width: 55%; }
+
+.skel-fields { display: grid; gap: 0.9rem; margin-top: 0.4rem; }
+.skel-fields .skel-field { height: 2.6rem; }
+.skel-fields .skel-btn { width: 100%; height: 2.6rem; }
+.skel-auth .skel.skel-btn { width: 100%; }
+.site-head > .skel-btn { margin-left: auto; }
+/* the phone's bottom rail shows five tiles and a More; the skeleton too */
+@media (max-width: 760px) {
+  .rail-nav > .rail-item:has(> .tile.skel):nth-child(n + 6) { display: none; }
+}
+
+/* auto-reload: the rule reads as a sentence, with the two amounts inline */
+.auto-reload-form { margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px solid var(--border); }
+.auto-reload-rule { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+.money-input { display: inline-flex; align-items: center; gap: 0.25rem; font-weight: 700; }
+.money-input input { width: 5.5rem; }
+.auto-reload-terms { align-items: flex-start; margin-top: 0.9rem; padding: 0.7rem 0.8rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); line-height: 1.5; font-weight: 400; }
+.auto-reload-terms input { margin-top: 0.2rem; flex: none; }
+.auto-reload .notice { margin: 0.2rem 0 0.7rem; }
+.graph-fit { margin-left: auto; }
+.graph-fit + .graph-tokens { margin-left: 0.4rem; }

@@ -30,6 +30,12 @@ sqlx) on Postgres, React UI embedded in the binary, one process per run.
   except `global.example`. Hook: `git config core.hooksPath .githooks`.
 - UI theme: tokens on `:root` and `:root[data-theme='dark']` in `UI/web/src/styles.css`;
   never hard-code a colour in a component.
+- **No inline `<script>` in `index.html`**: the CSP is `script-src 'self'`, so
+  an inline script silently never runs (the theme script once didn't, and
+  dark-mode phones flashed white). Put it in `UI/web/public/*.js` — `theme.js`
+  (before paint) and `skeleton.js` (pre-script skeleton) live there.
+- Loading states are skeletons (`components/Skeleton.tsx`, `.skel*` in
+  styles.css), never a blank page or "Loading…". `Loading` (block) is one.
 
 ## Public API auth (`cmd/src/web/signing.rs`)
 
@@ -139,8 +145,11 @@ Cursor CLI, unchanged. `pipeline::agent_call` routes on `direct::handles`.
 
 ## Outreach (`cmd/src/outreach.rs`, `cmd/src/web/outreach.rs`, `pages/Outreach.tsx`)
 
-Cold emails drafted to a prospect or a hand-entered person — drafted, never
-sent; the person copies them into their own mail. One `llm` call per draft or
+Cold emails drafted to a prospect, a custom-columns result (`artifact_id`:
+`outreach::recipient_from_record` reads it by column names — an Email-like
+column, else any address in it, fills the To) or a hand-entered person —
+drafted, never sent; the person copies them into their own mail, or opens
+them in Gmail (a compose link, `Outreach.tsx`) or their mail app. One `llm` call per draft or
 revision (no tools), model = admin stage **outreach** (`model_outreach`), else
 the newest Claude Sonnet from Anthropic's live model list — never the plan
 drafter's model. Cursor ids cannot serve it. Current Claude models reject
@@ -203,6 +212,25 @@ Credit lands through `store::apply_credit` only: `apply_credit_purchase`
 `payment_ref` already applied; only a `true` calls
 `billing::announce_credit`, which queues the owner's "credit added" email —
 so a retried payment or repeated webhook never credits or emails twice.
+
+**Free credit runs without a card.** A workspace an operator granted credit
+to (`kind='grant'`) may run with no card while it has credit left
+(`store::spends_free_credit`, checked in `runner::start`); once spent, the
+card is asked for, with "your free credit is used up". `/api/billing` says
+`card_required` / `free_credit` / `free_credit_spent` — the UI gates on
+`card_required`, never on `has_card`.
+
+Auto-reload (`billing.rs`, "auto-reload"; `AutoReloadCard.tsx`): when spendable
+credit falls below `auto_reload_below_micros`, the **website's** loop
+(`spawn_auto_reload`, 20s, the only process with the Stripe key) charges the
+saved card off-session and credits it as `kind='auto'`. Only with a recorded
+agreement (`auto_reload_agreed_at/by`, `auto_reload_terms` = `AUTO_RELOAD_TERMS`;
+the wording is in `AutoReloadCard` — change both, bump the version); any change
+to the numbers asks again. Claims are atomic with a lease; the Stripe
+idempotency key is `huntwell-auto-{account}-{n}`, so a retry is the same
+charge. At most `AUTO_RELOAD_MAX_PER_DAY` (3) per 24h. A card error or a
+bank wanting 3-D Secure turns it off and emails the owner; removing the card
+turns it off.
 
 ## Spending less (`cmd/src/thrift/`)
 

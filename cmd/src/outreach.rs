@@ -127,6 +127,79 @@ fn recipient_block(to: &Recipient, extra: &[(&str, &str)]) -> String {
     out
 }
 
+/// The first address-shaped token in `text`, if any: `a@b.c`, no spaces,
+/// bounded. Found by shape, so "Email: sam@acme.com (sales)" yields the
+/// address and "n/a" yields nothing.
+pub fn find_email(text: &str) -> Option<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '<' | '>' | '(' | ')' | '"' | '\'' | '[' | ']'))
+        .map(|t| t.trim_matches(|c: char| matches!(c, '.' | ':')).trim_start_matches("mailto:"))
+        .find(|t| {
+            let Some((user, host)) = t.split_once('@') else { return false };
+            !user.is_empty()
+                && host.contains('.')
+                && !host.starts_with('.')
+                && !host.ends_with('.')
+                && !host.contains('@')
+                && t.len() <= 320
+                && t.chars().all(|c| c.is_ascii_alphanumeric() || "@._%+-".contains(c))
+        })
+        .map(|t| t.to_ascii_lowercase())
+}
+
+/// Who a custom-schema row is, for a draft: its columns read by what they are
+/// called. An "Email"-like column (else any value that is an address) fills
+/// the To; a contact/owner/name column the name; a company/business-like one
+/// (else the row's own title) the company; a title/role column the title. The
+/// rest becomes notes, "Label: value", for the drafter to write from — it is
+/// scraped, and `recipient_block` treats it as such.
+pub fn recipient_from_record(title: &str, fields: &Value, cols: &[crate::artifact::FieldSpec]) -> Recipient {
+    let has = |label: &str, words: &[&str]| words.iter().any(|w| label.contains(w));
+    const ORG: &[&str] = &["company", "business", "practice", "store", "shop", "firm", "organization", "organisation", "brand", "restaurant", "hotel", "agency", "clinic", "employer"];
+    let value = |key: &str| match fields.get(key) {
+        Some(Value::String(v)) => v.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    };
+    let mut to = Recipient::default();
+    let mut notes: Vec<String> = Vec::new();
+    for f in cols {
+        let label = if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() };
+        let l = label.to_ascii_lowercase();
+        let v = value(&f.key);
+        if v.is_empty() {
+            continue;
+        }
+        if to.email.is_empty() && has(&l, &["email", "e-mail"]) {
+            if let Some(e) = find_email(&v) {
+                to.email = e;
+                continue;
+            }
+        }
+        if to.company.is_empty() && has(&l, ORG) && !has(&l, &["email", "url", "website", "phone", "address", "size", "type"]) {
+            to.company = v.chars().take(200).collect();
+            continue;
+        }
+        if to.title.is_empty() && has(&l, &["title", "role", "position", "job"]) && !has(&l, ORG) {
+            to.title = v.chars().take(200).collect();
+            continue;
+        }
+        if to.name.is_empty() && has(&l, &["contact", "owner", "person", "founder", "name", "manager", "director"]) && !has(&l, &["email", "user", "file", "domain"]) {
+            to.name = v.chars().take(200).collect();
+            continue;
+        }
+        notes.push(format!("{label}: {v}"));
+    }
+    if to.email.is_empty() {
+        to.email = cols.iter().find_map(|f| find_email(&value(&f.key))).unwrap_or_default();
+    }
+    if to.company.is_empty() && to.name.is_empty() {
+        to.company = title.trim().chars().take(200).collect();
+    }
+    to.notes = notes.join("\n").chars().take(2000).collect();
+    to
+}
+
 /// The first message: who is writing, what they sell, how to write, the
 /// campaign when the plan has its own outreach, and who to.
 ///
@@ -338,6 +411,44 @@ mod tests {
         own.design.product = "Guest messaging".into();
         let p = prompt(&ws, Some(&own), "Sam", &to, &[]);
         assert!(p.contains("SENDER'S PRODUCT:\nGuest messaging") && !p.contains("Room software"));
+    }
+
+    #[test]
+    fn an_address_is_found_by_its_shape() {
+        assert_eq!(find_email("Email: Sam@Acme.com (sales)").as_deref(), Some("sam@acme.com"));
+        assert_eq!(find_email("mailto:hello@coast-hotels.co.uk.").as_deref(), Some("hello@coast-hotels.co.uk"));
+        for none in ["n/a", "@acme.com", "sam@", "sam@acme", "sam at acme dot com", ""] {
+            assert_eq!(find_email(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn a_record_becomes_a_recipient_by_its_column_names() {
+        let cols = crate::artifact::columns_to_schema(&[
+            crate::artifact::ColumnRequest { name: "Practice name".into(), prompt: String::new() },
+            crate::artifact::ColumnRequest { name: "Owner".into(), prompt: String::new() },
+            crate::artifact::ColumnRequest { name: "Contact email".into(), prompt: String::new() },
+            crate::artifact::ColumnRequest { name: "Role".into(), prompt: String::new() },
+            crate::artifact::ColumnRequest { name: "City".into(), prompt: String::new() },
+        ]);
+        let key = |i: usize| cols[i].key.clone();
+        let fields = serde_json::json!({
+            key(0): "Bright Smiles Dental", key(1): "Dr. Ana Ruiz", key(2): "Front desk: ana@brightsmiles.example",
+            key(3): "Owner-dentist", key(4): "Akron, OH",
+        });
+        let to = recipient_from_record("Bright Smiles", &fields, &cols);
+        assert_eq!(to.email, "ana@brightsmiles.example");
+        assert_eq!(to.company, "Bright Smiles Dental");
+        assert_eq!(to.name, "Dr. Ana Ruiz");
+        assert_eq!(to.title, "Owner-dentist");
+        assert_eq!(to.notes, "City: Akron, OH");
+
+        // No email column: an address anywhere is used; no name or company
+        // column: the row's title is the company.
+        let cols = crate::artifact::columns_to_schema(&[crate::artifact::ColumnRequest { name: "Details".into(), prompt: String::new() }]);
+        let fields = serde_json::json!({ cols[0].key.clone(): "Write to info@lakeview.example for bookings" });
+        let to = recipient_from_record("Lakeview Inn", &fields, &cols);
+        assert_eq!((to.email.as_str(), to.company.as_str()), ("info@lakeview.example", "Lakeview Inn"));
     }
 
     #[test]

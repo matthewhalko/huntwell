@@ -51,6 +51,8 @@ export default function Dashboard() {
   // Raised by Go now when there is nothing to bill; cleared by the dialog,
   // which then starts the run that was interrupted.
   const [needCard, setNeedCard] = useState(false)
+  // Why the card is being asked for: a first search, or free credit used up.
+  const [freeSpent, setFreeSpent] = useState(false)
   // The welcome. Raised by Go now / Build plan on an account that has not been
   // through setup — never on arrival — and it carries on with whatever it
   // interrupted. Holds the action to resume, or null when closed.
@@ -108,7 +110,10 @@ export default function Dashboard() {
     // what they were doing, and the search they typed carries on afterwards.
     try {
       const b = await api.get<Billing>('/api/billing')
-      if (!b.has_card) {
+      // Free credit an operator added runs without a card; the card is only
+      // needed once that is spent (the server holds the same rule).
+      if (b.card_required ?? !b.has_card) {
+        setFreeSpent(!!b.free_credit_spent)
         if (!can(me, 'credits')) {
           toast('Ask an admin to add a payment method before you can start a search.', true)
           return
@@ -277,7 +282,11 @@ export default function Dashboard() {
 
       {needCard && (
         <CardDialog
-          reason="Executions cost money, so we need a card before the first one. Add it here and your search starts straight away."
+          reason={
+            freeSpent
+              ? "Your free credit is used up. Add a card to keep searching — then buy credits as you need them. Your search starts as soon as it's added."
+              : 'Executions cost money, so we need a card before the first one. Add it here and your search starts straight away.'
+          }
           onClose={() => setNeedCard(false)}
           onDone={() => {
             setNeedCard(false)

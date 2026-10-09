@@ -6,8 +6,12 @@ import { seedLabel } from './SearchSeeds'
  * A plan's knowledge graph: nodes and edges on a canvas.
  *
  * Searches, pages and results (and the seeds that started them) are the
- * nodes; the trail edges are what led to what. A small spring layout
- * settles the picture. Drag to pan, scroll to zoom, drag a node to pin it.
+ * nodes; the trail edges are what led to what. Laid out left to right —
+ * seeds → searches → pages → results — with a long group wrapping into more
+ * columns rather than one tall one, the wrap chosen so the whole picture has
+ * the stage's own proportions: wide on a wide screen, so it is readable
+ * without scrolling. Nodes ease into place as the graph grows. Drag to pan,
+ * scroll to zoom, drag a node to pin it where you put it.
  */
 type Kind = 'seed' | 'query' | 'page' | 'result'
 
@@ -19,8 +23,9 @@ interface Node {
   tokens: number
   x: number
   y: number
-  vx: number
-  vy: number
+  /** Where the layout wants it; the node eases there. */
+  tx: number
+  ty: number
   r: number
 }
 
@@ -52,6 +57,69 @@ interface Palette {
 }
 
 type Pt = { x: number; y: number }
+
+const ORDER: Kind[] = ['seed', 'query', 'page', 'result']
+/** World units: a row is a node plus its label; a column fits a label. */
+const ROW = 46
+const COL = 170
+/** Between one kind's columns and the next kind's. */
+const BAND_GAP = 120
+
+/**
+ * Place every visible node on a left-to-right grid of kinds. Each kind fills
+ * columns top to bottom, `rows` deep; `rows` is the depth whose overall
+ * width:height is closest to `aspect`, so the picture fills the stage instead
+ * of becoming a tall strip. Within a kind, nodes are ordered by the nodes
+ * they came from, so edges mostly run straight across.
+ */
+function layout(nodes: Node[], edges: Edge[], aspect: number) {
+  const groups = ORDER.map((k) => nodes.filter((n) => n.kind === k)).filter((g) => g.length)
+  if (!groups.length) return
+  // Order each kind by where its parents sit, so lines cross less.
+  const rank = new Map<string, number>()
+  const parents = new Map<string, string[]>()
+  for (const e of edges) parents.set(e.to, [...(parents.get(e.to) || []), e.from])
+  for (const g of groups) {
+    const keyed = g.map((n, i) => {
+      const ps = (parents.get(n.id) || []).map((p) => rank.get(p)).filter((r): r is number => r !== undefined)
+      return { n, key: ps.length ? Math.min(...ps) : Infinity, i }
+    })
+    keyed.sort((a, b) => a.key - b.key || a.i - b.i)
+    g.splice(0, g.length, ...keyed.map((k) => k.n))
+    g.forEach((n, i) => rank.set(n.id, i))
+  }
+  const largest = Math.max(...groups.map((g) => g.length))
+  const size = (rows: number) => {
+    const cols = groups.reduce((sum, g) => sum + Math.ceil(g.length / rows), 0)
+    const w = cols * COL + (groups.length - 1) * BAND_GAP
+    const h = Math.min(rows, largest) * ROW
+    return { w, h }
+  }
+  let rows = Math.min(largest, 4)
+  let best = Infinity
+  for (let r = Math.min(largest, 4); r <= largest; r++) {
+    const { w, h } = size(r)
+    const off = Math.abs(Math.log(w / h / aspect))
+    if (off < best - 1e-9) {
+      best = off
+      rows = r
+    }
+  }
+  const { w } = size(rows)
+  let x = -w / 2 + COL / 2
+  for (const g of groups) {
+    const cols = Math.ceil(g.length / rows)
+    g.forEach((n, i) => {
+      const col = Math.floor(i / rows)
+      // The last column of a kind holds what is left; centre it like the rest.
+      const inCol = col === cols - 1 ? g.length - col * rows : rows
+      const row = i % rows
+      n.tx = x + col * COL
+      n.ty = (row - (inCol - 1) / 2) * ROW
+    })
+    x += cols * COL + BAND_GAP
+  }
+}
 
 function pageId(p: GraphData['pages'][number]) {
   return p.url_key || p.url
@@ -90,10 +158,13 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
   const nodesRef = useRef<Node[]>([])
   const edgesRef = useRef<Edge[]>([])
   const posRef = useRef<Map<string, Pt>>(new Map())
-  const alphaRef = useRef(0.35)
+  /** Nodes a person dragged somewhere: they stay there. */
+  const pinnedRef = useRef<Set<string>>(new Set())
   const viewRef = useRef({ x: 0, y: 0, k: 1 })
-  const dragRef = useRef<{ x: number; y: number; node: Node | null } | null>(null)
-  const fittedRef = useRef(false)
+  const dragRef = useRef<{ x: number; y: number; node: Node | null; moved: boolean } | null>(null)
+  /** Refit to the layout until the person pans or zooms themselves. */
+  const userViewRef = useRef(false)
+  const layoutDirtyRef = useRef(true)
 
   useEffect(() => {
     const sample = () => setPal(readPalette(wrapRef.current))
@@ -119,7 +190,9 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
 
   useEffect(() => {
     posRef.current = new Map()
-    fittedRef.current = false
+    pinnedRef.current = new Set()
+    userViewRef.current = false
+    layoutDirtyRef.current = true
     viewRef.current = { x: 0, y: 0, k: 1 }
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -145,10 +218,10 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
         label,
         sub,
         tokens,
-        x: at ? at.x : 0,
-        y: at ? at.y : 0,
-        vx: 0,
-        vy: 0,
+        x: at ? at.x : NaN,
+        y: at ? at.y : NaN,
+        tx: 0,
+        ty: 0,
         r: Math.min(18, 5 + Math.sqrt(Math.max(weight, 1)) * 2),
       })
     }
@@ -189,27 +262,26 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
       if (from && to && from !== to) edges.push({ from, to, weight: e.weight || 1 })
     }
 
-    // New nodes start in columns, already spaced, instead of a random cloud
-    // that the springs then fling apart. A node that was already on screen
-    // keeps the place it settled.
-    const band: Record<Kind, number> = { seed: -240, query: -80, page: 80, result: 240 }
-    for (const kind of ['seed', 'query', 'page', 'result'] as Kind[]) {
-      const group = nodes.filter((n) => n.kind === kind && !seen.has(n.id))
-      group.forEach((n, i) => {
-        n.x = band[kind]
-        n.y = (i - (group.length - 1) / 2) * 42
-      })
-    }
-
-    const first = seen.size === 0 && nodes.length > 0
-    const grew = nodes.length !== nodesRef.current.length
     nodesRef.current = nodes
     edgesRef.current = edges
-    // A small nudge, not a restart: reheating the whole layout throws nodes
-    // that had already settled.
-    if (first) alphaRef.current = 0.28
-    else if (grew) alphaRef.current = Math.max(alphaRef.current, 0.12)
+    layoutDirtyRef.current = true
   }, [data])
+
+  // Hiding a kind closes up the space it took.
+  useEffect(() => {
+    layoutDirtyRef.current = true
+  }, [show])
+
+  // A different shape of stage wants a different wrap.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ro = new ResizeObserver(() => {
+      layoutDirtyRef.current = true
+    })
+    ro.observe(canvas)
+    return () => ro.disconnect()
+  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -217,7 +289,8 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
       const k = viewRef.current.k * (e.deltaY < 0 ? 1.1 : 0.9)
-      viewRef.current.k = Math.min(3.2, Math.max(0.2, k))
+      viewRef.current.k = Math.min(3.2, Math.max(0.15, k))
+      userViewRef.current = true
     }
     canvas.addEventListener('wheel', onWheel, { passive: false })
     return () => canvas.removeEventListener('wheel', onWheel)
@@ -234,56 +307,49 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
       const edges = edgesRef.current.filter((e) => visible.has(e.from) && visible.has(e.to))
       const byId = new Map(nodes.map((n) => [n.id, n]))
 
-      if (nodes.length && alphaRef.current > 0.004) {
-        const a0 = alphaRef.current
-        for (let i = 0; i < nodes.length; i++) {
-          const a = nodes[i]
-          for (let j = i + 1; j < nodes.length; j++) {
-            const b = nodes[j]
-            let dx = b.x - a.x
-            let dy = b.y - a.y
-            const d2 = dx * dx + dy * dy || 1
-            if (d2 > 90000) continue
-            // Capped: an overlapping pair used to add hundreds of pixels of
-            // velocity in a single frame and throw the picture off screen.
-            const f = Math.min(1.6, (160 * a0) / d2)
-            const d = Math.sqrt(d2)
-            dx /= d
-            dy /= d
-            a.vx -= dx * f
-            a.vy -= dy * f
-            b.vx += dx * f
-            b.vy += dy * f
-          }
-        }
-        for (const e of edges) {
-          const a = byId.get(e.from)!
-          const b = byId.get(e.to)!
-          const dx = b.x - a.x
-          const dy = b.y - a.y
-          const d = Math.sqrt(dx * dx + dy * dy) || 1
-          const f = ((d - 130) * 0.012 * a0) / d
-          a.vx += dx * f
-          a.vy += dy * f
-          b.vx -= dx * f
-          b.vy -= dy * f
-        }
-        const maxStep = 4
+      const cw = canvas.clientWidth
+      const ch = canvas.clientHeight
+      if (layoutDirtyRef.current && nodes.length && cw > 0 && ch > 0) {
+        // The space the bar on top leaves, so the picture fits under it.
+        layout(nodes, edges, cw / Math.max(1, ch - 70))
         for (const n of nodes) {
-          n.vx += -n.x * 0.001 * a0
-          n.vy += -n.y * 0.001 * a0
-          n.vx *= 0.8
-          n.vy *= 0.8
-          const speed = Math.hypot(n.vx, n.vy)
-          if (speed > maxStep) {
-            n.vx *= maxStep / speed
-            n.vy *= maxStep / speed
+          const at = pinnedRef.current.has(n.id) ? posRef.current.get(n.id) : undefined
+          if (at) {
+            n.tx = at.x
+            n.ty = at.y
           }
-          n.x += n.vx
-          n.y += n.vy
-          posRef.current.set(n.id, { x: n.x, y: n.y })
+          if (Number.isNaN(n.x)) {
+            // New: appear at its place, not fly in from the middle.
+            n.x = n.tx
+            n.y = n.ty
+          }
         }
-        alphaRef.current *= 0.97
+        layoutDirtyRef.current = false
+        if (!userViewRef.current) {
+          let minX = Infinity
+          let maxX = -Infinity
+          let minY = Infinity
+          let maxY = -Infinity
+          for (const n of nodes) {
+            minX = Math.min(minX, n.tx)
+            maxX = Math.max(maxX, n.tx)
+            minY = Math.min(minY, n.ty)
+            maxY = Math.max(maxY, n.ty)
+          }
+          const bw = maxX - minX + COL
+          const bh = maxY - minY + ROW * 1.6
+          const k = Math.min(1.4, (cw * 0.94) / bw, (ch - 80) / bh)
+          viewRef.current.k = k
+          viewRef.current.x = -((minX + maxX) / 2) * k
+          // Centred in the space below the bar.
+          viewRef.current.y = -((minY + maxY) / 2) * k + 30
+        }
+      }
+      for (const n of nodes) {
+        if (dragRef.current?.node === n) continue
+        n.x += (n.tx - n.x) * 0.16
+        n.y += (n.ty - n.y) * 0.16
+        posRef.current.set(n.id, { x: n.x, y: n.y })
       }
 
       const dpr = window.devicePixelRatio || 1
@@ -297,25 +363,6 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.fillStyle = pal.surface
       ctx.fillRect(0, 0, w, h)
-
-      if (!fittedRef.current && nodes.length) {
-        let minX = Infinity
-        let maxX = -Infinity
-        let minY = Infinity
-        let maxY = -Infinity
-        for (const n of nodes) {
-          minX = Math.min(minX, n.x)
-          maxX = Math.max(maxX, n.x)
-          minY = Math.min(minY, n.y)
-          maxY = Math.max(maxY, n.y)
-        }
-        const bw = Math.max(240, maxX - minX + 160)
-        const bh = Math.max(180, maxY - minY + 140)
-        viewRef.current.k = Math.min(1.2, (w * 0.86) / bw, (h * 0.8) / bh)
-        viewRef.current.x = -((minX + maxX) / 2) * viewRef.current.k
-        viewRef.current.y = -((minY + maxY) / 2) * viewRef.current.k
-        fittedRef.current = true
-      }
 
       const view = viewRef.current
       ctx.save()
@@ -343,12 +390,15 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
         ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2)
         ctx.fillStyle = color
         ctx.fill()
-        if (view.k > 0.7 && (n.kind !== 'page' || n.r > 7 || hover?.id === n.id)) {
+        // Labels while they can be read; a column is COL wide, so they are
+        // cut to fit it rather than run into the next one.
+        if (view.k > 0.45 || hover?.id === n.id) {
           ctx.fillStyle = pal.text
           ctx.font = `500 11px ${pal.font}`
           ctx.textAlign = 'center'
           ctx.textBaseline = 'top'
-          const label = n.label.length > 28 ? n.label.slice(0, 28) + '…' : n.label
+          const max = 24
+          const label = n.label.length > max ? n.label.slice(0, max - 1) + '…' : n.label
           ctx.fillText(label, n.x, n.y + n.r + 5)
         }
         ctx.globalAlpha = 1
@@ -399,6 +449,16 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
               <span className="dot" /> live
             </span>
           )}
+          <button
+            className="graph-key graph-fit"
+            title="Show the whole graph again"
+            onClick={() => {
+              userViewRef.current = false
+              layoutDirtyRef.current = true
+            }}
+          >
+            Fit
+          </button>
           <span className="graph-tokens">{data ? `${fmtTokens(data.totals.tokens)} tokens across ${data.totals.executions} execution(s)` : ''}</span>
         </div>
         <canvas
@@ -407,23 +467,23 @@ export function KnowledgeGraph({ planId, live: runLive }: { planId: number; live
             const p = toWorld(e)
             const d = dragRef.current
             if (d?.node) {
-              d.node.x = p.x
-              d.node.y = p.y
-              d.node.vx = 0
-              d.node.vy = 0
+              d.node.x = d.node.tx = p.x
+              d.node.y = d.node.ty = p.y
+              pinnedRef.current.add(d.node.id)
               posRef.current.set(d.node.id, { x: p.x, y: p.y })
               return
             }
             if (d) {
               viewRef.current.x += e.clientX - d.x
               viewRef.current.y += e.clientY - d.y
-              dragRef.current = { x: e.clientX, y: e.clientY, node: null }
+              userViewRef.current = true
+              dragRef.current = { x: e.clientX, y: e.clientY, node: null, moved: true }
               return
             }
             setHover(nodeAt(p))
           }}
           onMouseDown={(e) => {
-            dragRef.current = { x: e.clientX, y: e.clientY, node: nodeAt(toWorld(e)) }
+            dragRef.current = { x: e.clientX, y: e.clientY, node: nodeAt(toWorld(e)), moved: false }
           }}
           onMouseUp={() => (dragRef.current = null)}
           onMouseLeave={() => {

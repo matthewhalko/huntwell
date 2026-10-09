@@ -1162,7 +1162,7 @@ async fn grant_credits(State(state): State<Admin>, headers: HeaderMap, Path(id):
     store::get_account(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
     let micros = (req.usd * 100.0).round() as i64 * 10_000;
     store::apply_credit_grant(&state.db, id, micros, note, &who).await.map_err(internal)?;
-    crate::web::billing::announce_credit(&state.db, id, micros, true, note).await;
+    crate::web::billing::announce_credit(&state.db, id, micros, crate::mail::CreditKind::Grant, note).await;
     let usage = store::ensure_usage(&state.db, id).await.map_err(internal)?;
     tracing::warn!(operator = %who, account = id, usd = micros as f64 / 1e6, "free credit added");
     Ok(Json(json!({ "ok": true, "credits_usd": usage.credits_usd })))

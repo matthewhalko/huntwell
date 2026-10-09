@@ -2771,6 +2771,19 @@ pub struct ArtifactFilter {
     pub offset: i64,
 }
 
+/// One custom-schema row, in its workspace only.
+pub async fn get_artifact(db: &Db, account_id: i64, artifact_id: i64) -> Result<Option<ArtifactRow>> {
+    let row = sqlx::query(&format!(
+        r#"SELECT {ARTIFACT_COLS} FROM artifact a JOIN plan p ON p.plan_id = a.plan_id
+           WHERE a.account_id = $1 AND a.artifact_id = $2"#
+    ))
+    .bind(account_id)
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.as_ref().map(ArtifactRow::from_row).transpose()?)
+}
+
 pub async fn list_artifacts(db: &Db, account_id: i64, f: &ArtifactFilter) -> Result<(Vec<ArtifactRow>, i64)> {
     let pattern = format!("%{}%", f.search.trim().to_lowercase());
     let where_clause = r#"a.account_id = $1
@@ -4742,6 +4755,28 @@ pub async fn apply_credit_purchase(db: &Db, account_id: i64, usd_micros: i64, pa
     apply_credit(db, account_id, usd_micros, payment_ref, "purchase", "", "").await
 }
 
+/// Whether this workspace was ever given free credit by an operator.
+pub async fn has_granted_credit(db: &Db, account_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar(r#"SELECT EXISTS (SELECT 1 FROM credit_purchase WHERE account_id=$1 AND kind='grant')"#)
+        .bind(account_id)
+        .fetch_one(db)
+        .await?)
+}
+
+/// A workspace with no card may still spend credit an operator gave it: there
+/// is nothing to charge, so there is nothing a card is for yet. True while any
+/// of that credit is left; once it is spent, the card is asked for as usual.
+pub async fn spends_free_credit(db: &Db, account_id: i64) -> Result<bool> {
+    Ok(has_granted_credit(db, account_id).await? && account_credit_micros(db, account_id).await? > 0)
+}
+
+/// Credit bought by auto-reload: a real card charge (revenue, like a
+/// purchase), recorded as `auto` so the history and the daily cap can tell
+/// it from one a person made.
+pub async fn apply_credit_auto_reload(db: &Db, account_id: i64, usd_micros: i64, payment_ref: &str) -> Result<bool> {
+    apply_credit(db, account_id, usd_micros, payment_ref, "auto", "", "").await
+}
+
 /// Free credit an operator adds by hand. The same wallet path as a purchase
 /// (debt is repaid first), recorded as a grant so it is never read as revenue.
 pub async fn apply_credit_grant(db: &Db, account_id: i64, usd_micros: i64, note: &str, operator: &str) -> Result<bool> {
@@ -4793,6 +4828,144 @@ async fn apply_credit(db: &Db, account_id: i64, usd_micros: i64, payment_ref: &s
     }
     tx.commit().await?;
     Ok(inserted)
+}
+
+/// A workspace's auto-reload settings and how the last one went.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AutoReload {
+    pub enabled: bool,
+    pub below_usd: f64,
+    pub amount_usd: f64,
+    pub agreed_at: Option<DateTime<Utc>>,
+    pub terms: String,
+    pub last_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+}
+
+pub async fn get_auto_reload(db: &Db, account_id: i64) -> Result<AutoReload> {
+    ensure_usage(db, account_id).await?;
+    let r = sqlx::query(
+        r#"SELECT auto_reload, auto_reload_below_micros, auto_reload_amount_micros, auto_reload_agreed_at,
+                  auto_reload_terms, auto_reload_last_at, auto_reload_last_error
+           FROM account_usage WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await?;
+    Ok(AutoReload {
+        enabled: r.get(0),
+        below_usd: r.get::<i64, _>(1) as f64 / 1e6,
+        amount_usd: r.get::<i64, _>(2) as f64 / 1e6,
+        agreed_at: r.get(3),
+        terms: r.get(4),
+        last_at: r.get(5),
+        last_error: r.get(6),
+    })
+}
+
+/// Turn auto-reload on with these numbers, recording who agreed to which
+/// terms and when, or off (the numbers are kept to show next time).
+pub async fn set_auto_reload(
+    db: &Db,
+    account_id: i64,
+    enabled: bool,
+    below_micros: i64,
+    amount_micros: i64,
+    agreed: Option<(i64, &str)>,
+) -> Result<()> {
+    ensure_usage(db, account_id).await?;
+    sqlx::query(
+        r#"UPDATE account_usage SET auto_reload=$2, auto_reload_below_micros=$3, auto_reload_amount_micros=$4,
+                  auto_reload_agreed_at = CASE WHEN $5::bigint IS NOT NULL THEN now() ELSE auto_reload_agreed_at END,
+                  auto_reload_agreed_by = coalesce($5, auto_reload_agreed_by),
+                  auto_reload_terms = coalesce($6, auto_reload_terms),
+                  auto_reload_last_error = CASE WHEN $2 THEN '' ELSE auto_reload_last_error END,
+                  updated_at=now()
+           WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .bind(enabled)
+    .bind(below_micros)
+    .bind(amount_micros)
+    .bind(agreed.map(|(by, _)| by))
+    .bind(agreed.map(|(_, t)| t))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Switch it off and say why — a declined card, a removed card.
+pub async fn disable_auto_reload(db: &Db, account_id: i64, why: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE account_usage SET auto_reload=false, auto_reload_started_at=NULL, auto_reload_last_error=$2, updated_at=now()
+           WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .bind(why.chars().take(300).collect::<String>())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Workspaces owed a reload now, claimed so no two passes charge one twice:
+/// on, below the threshold, a card on file, not mid-charge (a claim older
+/// than `lease_secs` is a crash and is taken again), and not reloaded in the
+/// last `gap_secs`. Returns (account_id, amount_micros, below_micros).
+pub async fn claim_auto_reloads(db: &Db, lease_secs: i64, gap_secs: i64, limit: i64) -> Result<Vec<(i64, i64, i64)>> {
+    Ok(sqlx::query_as(
+        r#"UPDATE account_usage SET auto_reload_started_at=now()
+           WHERE account_id IN (
+               SELECT account_id FROM account_usage
+               WHERE auto_reload AND auto_reload_amount_micros > 0
+                 AND credit_usd_micros < auto_reload_below_micros
+                 AND card_last4 <> ''
+                 AND (auto_reload_started_at IS NULL OR auto_reload_started_at < now() - make_interval(secs => $1::double precision))
+                 AND (auto_reload_last_at IS NULL OR auto_reload_last_at < now() - make_interval(secs => $2::double precision))
+               ORDER BY account_id LIMIT $3
+               FOR UPDATE SKIP LOCKED
+           )
+           RETURNING account_id, auto_reload_amount_micros, auto_reload_below_micros"#,
+    )
+    .bind(lease_secs as f64)
+    .bind(gap_secs as f64)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// A claimed reload is done: release the claim and record the outcome
+/// ("" = it worked). `charged` stamps the time the gap is measured from.
+pub async fn finish_auto_reload(db: &Db, account_id: i64, err: &str, charged: bool) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE account_usage SET auto_reload_started_at=NULL, auto_reload_last_error=$2,
+                  auto_reload_last_at = CASE WHEN $3 THEN now() ELSE auto_reload_last_at END
+           WHERE account_id=$1"#,
+    )
+    .bind(account_id)
+    .bind(err.chars().take(300).collect::<String>())
+    .bind(charged)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Auto-reloads ever charged to this workspace: numbers the next one, so its
+/// Stripe idempotency key is the same on a retry and new for the next reload.
+pub async fn auto_reload_count(db: &Db, account_id: i64) -> Result<i64> {
+    Ok(sqlx::query_scalar(r#"SELECT count(*) FROM credit_purchase WHERE account_id=$1 AND kind='auto'"#)
+        .bind(account_id)
+        .fetch_one(db)
+        .await?)
+}
+
+/// How many auto-reloads charged this workspace in the last day — the cap.
+pub async fn auto_reloads_today(db: &Db, account_id: i64) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"SELECT count(*) FROM credit_purchase WHERE account_id=$1 AND kind='auto' AND created_at > now() - interval '24 hours'"#,
+    )
+    .bind(account_id)
+    .fetch_one(db)
+    .await?)
 }
 
 /// Applies Stripe's cumulative refunded/disputed amount exactly once. Credits
@@ -6036,6 +6209,8 @@ pub struct OutreachRow {
     pub plan_id: Option<i64>,
     /// The saved profile it was written with, if any.
     pub design_id: Option<i64>,
+    /// The custom-schema row it was written to, if not a prospect.
+    pub artifact_id: Option<i64>,
     /// What it was written for: the profile's name, or the plan's.
     pub campaign: Option<String>,
 }
@@ -6043,7 +6218,7 @@ pub struct OutreachRow {
 const OUTREACH_COLS: &str = r#"o.outreach_id, o.created_by, o.prospect_id, o.recipient_name, o.recipient_email,
 o.recipient_title, o.recipient_company, o.recipient_notes, o.subject, o.body, o.footer, o.version,
 o.created_at, o.updated_at, coalesce(nullif(a.display_name,''), a.email, '') AS created_by_name, o.plan_id,
-o.design_id,
+o.design_id, o.artifact_id,
 coalesce((SELECT d.name FROM outreach_design d WHERE d.design_id=o.design_id AND d.account_id=o.account_id),
          (SELECT p.source FROM plan p WHERE p.plan_id=o.plan_id AND p.account_id=o.account_id AND p.outreach_custom)) AS campaign"#;
 
@@ -6090,6 +6265,7 @@ pub async fn create_outreach(
     account_id: i64,
     by: i64,
     prospect_id: Option<i64>,
+    artifact_id: Option<i64>,
     campaign: Option<&Campaign>,
     to: &Recipient,
     footer: &str,
@@ -6098,8 +6274,8 @@ pub async fn create_outreach(
     let mut tx = db.begin().await?;
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO outreach (account_id, created_by, prospect_id, recipient_name, recipient_email, recipient_title,
-                                 recipient_company, recipient_notes, subject, body, footer, plan_id, design_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING outreach_id"#,
+                                 recipient_company, recipient_notes, subject, body, footer, plan_id, design_id, artifact_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING outreach_id"#,
     )
     .bind(account_id)
     .bind(by)
@@ -6114,6 +6290,7 @@ pub async fn create_outreach(
     .bind(footer)
     .bind(campaign.and_then(|c| c.plan_id))
     .bind(campaign.and_then(|c| c.design_id))
+    .bind(artifact_id)
     .fetch_one(&mut *tx)
     .await?;
     insert_outreach_version(&mut tx, account_id, id, 1, by, text).await?;
@@ -6419,7 +6596,7 @@ mod purge_tests {
         let a: i64 = sqlx::query_scalar("INSERT INTO account (email) VALUES ($1) RETURNING account_id").bind(&email).fetch_one(&db).await.unwrap();
 
         assert!(apply_credit_grant(&db, a, 100_000_000, "Welcome aboard", "ops@huntwell.test").await.unwrap());
-        crate::web::billing::announce_credit(&db, a, 100_000_000, true, "Welcome aboard").await;
+        crate::web::billing::announce_credit(&db, a, 100_000_000, crate::mail::CreditKind::Grant, "Welcome aboard").await;
         let (kind, note, by): (String, String, String) =
             sqlx::query_as("SELECT kind, note, granted_by FROM credit_purchase WHERE account_id=$1").bind(a).fetch_one(&db).await.unwrap();
         assert_eq!((kind.as_str(), note.as_str(), by.as_str()), ("grant", "Welcome aboard", "ops@huntwell.test"));

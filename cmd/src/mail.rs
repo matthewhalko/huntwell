@@ -402,14 +402,37 @@ pub fn new_records(plan: &str, noun: &str, found: i64, total: i64, samples: &[St
 /// Sent when credit lands in a workspace's wallet: a card purchase, or free
 /// credit an operator added (`granted`, with the operator's note if any).
 /// Amount and new balance up top; the link goes to Usage & billing.
-pub fn credits_added(usd: f64, balance_usd: f64, granted: bool, note: &str, link: Option<&str>) -> Email {
+/// How credit came to land, for what the email says about it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreditKind {
+    /// Bought by a person, on the Usage page.
+    Purchase,
+    /// Added free by an operator.
+    Grant,
+    /// Charged automatically: the balance fell below `below_usd`.
+    AutoReload { below_usd: f64 },
+}
+
+pub fn credits_added(usd: f64, balance_usd: f64, kind: CreditKind, note: &str, link: Option<&str>) -> Email {
     let amount = money(usd);
     let balance = money(balance_usd);
-    let headline = if granted { format!("{amount} in free credit added") } else { format!("{amount} in credit added") };
-    let lead = if granted {
-        format!("We've added {amount} of credit to your Huntwell account, free of charge. Your balance is now {balance}.")
+    let headline = match kind {
+        CreditKind::Grant => format!("{amount} in free credit added"),
+        CreditKind::Purchase => format!("{amount} in credit added"),
+        CreditKind::AutoReload { .. } => format!("Auto-reload: {amount} in credit added"),
+    };
+    let lead = match kind {
+        CreditKind::Grant => format!("We've added {amount} of credit to your Huntwell account, free of charge. Your balance is now {balance}."),
+        CreditKind::Purchase => format!("Your purchase of {amount} in credit went through. Your balance is now {balance}."),
+        CreditKind::AutoReload { below_usd } => format!(
+            "Your balance fell below {}, so your card on file was charged {amount}, as you set up with auto-reload. Your balance is now {balance}.",
+            money(below_usd)
+        ),
+    };
+    let note = if let CreditKind::AutoReload { .. } = kind {
+        "You can change the amount or turn auto-reload off any time under Usage & billing."
     } else {
-        format!("Your purchase of {amount} in credit went through. Your balance is now {balance}.")
+        note
     };
     let note = note.trim();
     let note_html = if note.is_empty() {
@@ -438,6 +461,28 @@ pub fn credits_added(usd: f64, balance_usd: f64, granted: bool, note: &str, link
             if note.is_empty() { String::new() } else { format!("\n{note}\n") },
             link.map(|l| format!("\nUsage & billing:\n{l}\n")).unwrap_or_default(),
         ),
+    }
+}
+
+/// Auto-reload could not charge the card, and has been switched off so it
+/// does not keep trying. Says what happened in our words and what to do.
+pub fn auto_reload_failed(usd: f64, reason: &str, link: Option<&str>) -> Email {
+    let amount = money(usd);
+    let headline = "Auto-reload couldn't charge your card".to_string();
+    let lead = format!("We tried to add {amount} of credit with auto-reload, but the charge didn't go through: {reason}.");
+    let next = "Auto-reload is now off, so nothing more will be charged. Your searches stop when your credit runs out — update your card or buy credit under Usage & billing, then turn auto-reload back on.";
+    let body = format!(
+        "{}{}{}{}{}",
+        h1(&headline),
+        p(&lead),
+        p(next),
+        link.map(|l| button("Go to usage & billing", l)).unwrap_or_default(),
+        link.map(fallback).unwrap_or_default(),
+    );
+    Email {
+        subject: headline.clone(),
+        html: layout("Auto-reload is off until you fix the card.", &body),
+        text: format!("{headline}\n\n{lead}\n\n{next}\n{}", link.map(|l| format!("\n{l}\n")).unwrap_or_default()),
     }
 }
 
@@ -556,16 +601,21 @@ mod tests {
 
     #[test]
     fn credit_emails_say_how_much_and_the_new_balance() {
-        let m = credits_added(100.0, 112.5, true, "Welcome aboard <b>Ana</b>\nEnjoy", Some("https://huntwell.test/app/usage"));
+        let m = credits_added(100.0, 112.5, CreditKind::Grant, "Welcome aboard <b>Ana</b>\nEnjoy", Some("https://huntwell.test/app/usage"));
         assert_eq!(m.subject, "$100.00 in free credit added");
         assert!(m.text.contains("Your balance is now $112.50.") && m.text.contains("free of charge"));
         // The operator's note is escaped, and keeps its line breaks.
         assert!(m.html.contains("Welcome aboard &lt;b&gt;Ana&lt;/b&gt;<br>Enjoy"), "{}", m.html);
         assert!(m.html.contains("https://huntwell.test/app/usage"));
-        let bought = credits_added(1250.0, 1250.0, false, "", None);
+        let bought = credits_added(1250.0, 1250.0, CreditKind::Purchase, "", None);
         assert_eq!(bought.subject, "$1,250.00 in credit added");
         assert!(bought.text.contains("Your purchase of $1,250.00"));
         assert!(!bought.html.contains("See usage"), "no link without a public URL");
+        let auto = credits_added(50.0, 58.2, CreditKind::AutoReload { below_usd: 10.0 }, "", None);
+        assert_eq!(auto.subject, "Auto-reload: $50.00 in credit added");
+        assert!(auto.text.contains("fell below $10.00") && auto.text.contains("turn auto-reload off"));
+        let failed = auto_reload_failed(50.0, "the card was declined", None);
+        assert!(failed.text.contains("$50.00") && failed.text.contains("the card was declined") && failed.text.contains("now off"));
     }
 
     /// Both parts carry the link, because either one may be what gets read.

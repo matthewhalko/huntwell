@@ -37,3 +37,6 @@ ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS plan_id bigint REFERENCES p
 -- The saved profile a draft was written with, if one (2026-09-27). Pinned like
 -- plan_id so a revision stays on it.
 ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS design_id bigint REFERENCES public.outreach_design (design_id) ON DELETE SET NULL;
+-- The custom-schema row a draft was written to (2026-10-06): any result can
+-- be drafted to, not only a prospect, and its Email column fills the To.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS artifact_id bigint REFERENCES public.artifact (artifact_id) ON DELETE SET NULL;

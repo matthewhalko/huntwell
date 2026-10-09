@@ -180,8 +180,10 @@ pub enum LlmError {
     /// operator problem: retrying will not fix it.
     Unauthorized,
     /// The provider is down, timed out, or answered with something
-    /// unparseable. Worth retrying.
-    Unavailable,
+    /// unparseable. Worth retrying. The text is *our* description of what
+    /// happened ("HTTP 529 from anthropic", "anthropic timed out") — never the
+    /// provider's own words, which stay in the log.
+    Unavailable(String),
     /// We built a request the provider will not accept. A bug in an adapter or
     /// an unknown model id, so the detail is kept — it is ours, not theirs.
     BadRequest(String),
@@ -195,7 +197,7 @@ impl std::fmt::Display for LlmError {
         match self {
             LlmError::RateLimited { .. } => write!(f, "the model provider is rate-limiting this account — try again shortly"),
             LlmError::Unauthorized => write!(f, "the model provider refused our credentials — check the API key for this provider"),
-            LlmError::Unavailable => write!(f, "the model provider is unavailable — try again in a few minutes"),
+            LlmError::Unavailable(why) => write!(f, "the model provider is unavailable ({why}) — try again in a few minutes"),
             LlmError::BadRequest(why) => write!(f, "the model provider rejected the request: {why}"),
             LlmError::ContextTooLong => write!(f, "the conversation grew past what this model can hold"),
         }
@@ -207,7 +209,7 @@ impl std::error::Error for LlmError {}
 impl LlmError {
     /// Whether waiting and asking again could work.
     pub fn retryable(&self) -> bool {
-        matches!(self, LlmError::RateLimited { .. } | LlmError::Unavailable)
+        matches!(self, LlmError::RateLimited { .. } | LlmError::Unavailable(_))
     }
 }
 

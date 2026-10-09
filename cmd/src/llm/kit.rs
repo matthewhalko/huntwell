@@ -89,11 +89,11 @@ pub async fn post_json(
     body: &Value,
 ) -> Result<Value, LlmError> {
     let gate = gate(provider);
-    let _permit = gate.acquire().await.map_err(|_| LlmError::Unavailable)?;
+    let _permit = gate.acquire().await.map_err(|_| LlmError::Unavailable(format!("{provider}: this process is shutting down")))?;
 
     let attempts = attempts();
     let mut wait = Duration::from_millis(500);
-    let mut last = LlmError::Unavailable;
+    let mut last = LlmError::Unavailable(format!("{provider} was not tried"));
     for attempt in 1..=attempts {
         match try_once(provider, url, &headers, body).await {
             Ok(v) => return Ok(v),
@@ -127,7 +127,16 @@ async fn try_once(provider: &'static str, url: &str, headers: &[(&'static str, S
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("{provider}: {e}");
-            return Err(if e.is_timeout() { LlmError::Unavailable } else { LlmError::Unavailable });
+            // What kind of failure, in our words: the error text itself can
+            // carry the URL, and the URL some providers' keys.
+            let why = if e.is_timeout() {
+                format!("{provider} did not answer in time")
+            } else if e.is_connect() {
+                format!("could not connect to {provider}")
+            } else {
+                format!("the connection to {provider} failed")
+            };
+            return Err(LlmError::Unavailable(why));
         }
     };
     let status = resp.status();
@@ -144,7 +153,7 @@ async fn try_once(provider: &'static str, url: &str, headers: &[(&'static str, S
     if status.is_success() {
         return serde_json::from_str(&text).map_err(|e| {
             tracing::error!("{provider}: unparseable reply ({e}): {}", snippet(&text));
-            LlmError::Unavailable
+            LlmError::Unavailable(format!("{provider} sent a reply we could not read"))
         });
     }
     Err(classify(provider, status.as_u16(), &text, retry_after))
@@ -160,14 +169,14 @@ pub async fn get_json(provider: &'static str, url: &str, headers: Vec<(&'static 
     }
     let resp = req.send().await.map_err(|e| {
         tracing::warn!("{provider}: listing models: {e}");
-        LlmError::Unavailable
+        LlmError::Unavailable(format!("could not reach {provider} to list its models"))
     })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(classify(provider, status.as_u16(), &text, None));
     }
-    serde_json::from_str(&text).map_err(|_| LlmError::Unavailable)
+    serde_json::from_str(&text).map_err(|_| LlmError::Unavailable(format!("{provider} sent a model list we could not read")))
 }
 
 /// An HTTP failure as one of the classes the loop reacts to.
@@ -203,8 +212,21 @@ pub fn classify(provider: &str, status: u16, body: &str, retry_after: Option<Dur
         }
         _ => {
             tracing::warn!("{provider}: HTTP {status}: {}", snippet(body));
-            LlmError::Unavailable
+            LlmError::Unavailable(format!("HTTP {status}{} from {provider}", status_word(status)))
         }
+    }
+}
+
+/// The standard meaning of a status a provider fails with, for the message a
+/// person reads: "HTTP 529 (overloaded) from anthropic".
+fn status_word(status: u16) -> &'static str {
+    match status {
+        500 => " (server error)",
+        502 => " (bad gateway)",
+        503 => " (service unavailable)",
+        504 => " (gateway timeout)",
+        529 => " (overloaded)",
+        _ => "",
     }
 }
 
@@ -247,8 +269,8 @@ mod tests {
         assert!(matches!(classify("p", 429, "slow down", Some(Duration::from_secs(7))), LlmError::RateLimited { retry_after: Some(d) } if d.as_secs() == 7));
         assert!(matches!(classify("p", 401, "bad key", None), LlmError::Unauthorized));
         assert!(matches!(classify("p", 403, "no access", None), LlmError::Unauthorized));
-        assert!(matches!(classify("p", 500, "oops", None), LlmError::Unavailable));
-        assert!(matches!(classify("p", 503, "", None), LlmError::Unavailable));
+        assert!(matches!(classify("p", 500, "oops", None), LlmError::Unavailable(_)));
+        assert!(matches!(classify("p", 503, "", None), LlmError::Unavailable(_)));
         assert!(matches!(classify("p", 400, r#"{"error":{"message":"bad tool schema"}}"#, None), LlmError::BadRequest(_)));
         for body in ["maximum context length exceeded", "prompt is too long: 250000 tokens", "The input token count exceeds"] {
             assert!(matches!(classify("p", 400, body, None), LlmError::ContextTooLong), "{body}");

@@ -484,6 +484,7 @@ export const ENDPOINTS: Endpoint[] = [
                  "notes": "Opened a second hotel in Lincoln City this spring" } }`,
     fields: [
       ['prospect_id', 'integer', 'A prospect in this workspace. Its name, title, company, industry, location, website and notes are used.'],
+      ['artifact_id', 'integer', 'Instead of a prospect: a result from a custom-columns plan. Who it is to is read from its columns — an Email column (or any address in it) fills the To.'],
       ['recipient', 'object', 'Instead of a prospect: name, email, title, company, notes. Name or company required.'],
       ['plan_id', 'integer', 'Optional. Write it to this plan\'s own outreach (its campaign brief, offer and rules). A prospect uses its own plan\'s when this is left out; a plan without its own outreach uses the workspace\'s.'],
       ['design_id', 'integer', 'Optional. Write it with this saved outreach profile (Outreach → Profiles) — for any prospect or recipient. Wins over any plan\'s outreach.'],

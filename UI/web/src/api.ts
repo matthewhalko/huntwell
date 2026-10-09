@@ -154,7 +154,29 @@ export interface Billing {
   has_card: boolean
   has_credits?: boolean
   credits_usd?: number
+  /** A run needs a card now. False while free credit an operator added is left. */
+  card_required?: boolean
+  /** No card, running on free credit an operator added. */
+  free_credit?: boolean
+  /** That free credit is used up and there is still no card. */
+  free_credit_spent?: boolean
   card: { brand: string; last4: string; added_at: string | null } | null
+  auto_reload?: AutoReload
+  /** The version of the wording agreed to; the wording is AutoReloadCard's. */
+  auto_reload_terms?: string
+  auto_reload_max_per_day?: number
+}
+
+/** When the balance falls below `below_usd`, charge the card `amount_usd`. */
+export interface AutoReload {
+  enabled: boolean
+  below_usd: number
+  amount_usd: number
+  agreed_at: string | null
+  terms: string
+  last_at: string | null
+  /** Why the last attempt failed or paused; "" when it worked. */
+  last_error: string
 }
 
 // A saved authenticated login (a Browserbase Context connection).

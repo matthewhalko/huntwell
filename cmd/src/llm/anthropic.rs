@@ -190,7 +190,7 @@ fn is_results(m: &Value) -> bool {
 pub fn parse(v: &Value) -> Result<Reply, LlmError> {
     let blocks = v.get("content").and_then(Value::as_array).ok_or_else(|| {
         tracing::error!("anthropic: reply carried no content: {}", kit::snippet(&v.to_string()));
-        LlmError::Unavailable
+        LlmError::Unavailable("anthropic sent a reply with no content".into())
     })?;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -307,6 +307,6 @@ mod tests {
 
     #[test]
     fn a_shapeless_reply_is_the_provider_being_unavailable() {
-        assert!(matches!(parse(&json!({ "type": "error" })), Err(LlmError::Unavailable)));
+        assert!(matches!(parse(&json!({ "type": "error" })), Err(LlmError::Unavailable(_))));
     }
 }

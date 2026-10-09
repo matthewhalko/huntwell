@@ -255,6 +255,10 @@ pub(crate) struct CreateBody {
     pub prospect_id: Option<i64>,
     #[serde(default)]
     pub recipient: Option<Recipient>,
+    /// A custom-schema result: who it is to is read from its columns, and an
+    /// Email column fills the To (`outreach::recipient_from_record`).
+    #[serde(default)]
+    pub artifact_id: Option<i64>,
     /// Write it to this plan's outreach design. A prospect's own plan is used
     /// when this is absent.
     #[serde(default)]
@@ -332,7 +336,20 @@ fn prospect_extra(p: &store::ProspectRow) -> Vec<(&str, &str)> {
 
 /// Draft a new email. Validates who it is to before anything is spent.
 pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<store::OutreachRow, ApiError> {
+    // The plan a record came from, for its outreach design.
+    let mut record_plan: Option<i64> = None;
+    let mut artifact_id: Option<i64> = None;
     let (prospect, to) = match (b.prospect_id, b.recipient) {
+        (None, _) if b.artifact_id.is_some() => {
+            let id = b.artifact_id.unwrap_or_default();
+            let a = store::get_artifact(&state.db, w.workspace, id).await?.ok_or_else(|| not_found("result not found"))?;
+            let plan = store::get_plan(&state.db, w.workspace, a.plan_id).await?.ok_or_else(|| not_found("result not found"))?;
+            let cols = crate::artifact::output_columns(&crate::artifact::parse_schema(&plan.fields_schema_json));
+            let to = draft::recipient_from_record(&a.title, &a.fields, &cols);
+            record_plan = Some(a.plan_id);
+            artifact_id = Some(a.artifact_id);
+            (None, to)
+        }
         (Some(id), _) => {
             let p = store::get_prospect(&state.db, w.workspace, id).await?.ok_or_else(|| not_found("prospect not found"))?;
             let to = Recipient {
@@ -372,7 +389,13 @@ pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<
             return Err(not_found("outreach profile not found"));
         }
     }
-    let campaign = store::outreach_campaign(&state.db, w.workspace, b.design_id, b.plan_id.or(prospect.as_ref().map(|p| p.plan_id))).await?;
+    let campaign = store::outreach_campaign(
+        &state.db,
+        w.workspace,
+        b.design_id,
+        b.plan_id.or(prospect.as_ref().map(|p| p.plan_id)).or(record_plan),
+    )
+    .await?;
     let model = paid_call_checks(state, w.workspace).await?;
     let profile = store::get_outreach_profile(&state.db, w.workspace).await?;
     let footer = store::get_outreach_footer(&state.db, w.person).await?;
@@ -381,7 +404,7 @@ pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<
     let d = draft::draft(&model, &prompt, None, None).await.map_err(model_failed)?;
     bill(state, w.workspace, &d).await;
     let text = OutreachText { subject: &d.subject, body: &d.body, source: "draft", feedback: "", model: &model, usage: d.usage };
-    Ok(store::create_outreach(&state.db, w.workspace, w.person, prospect.map(|p| p.prospect_id), campaign.as_ref(), &to, &footer, &text).await?)
+    Ok(store::create_outreach(&state.db, w.workspace, w.person, prospect.map(|p| p.prospect_id), artifact_id, campaign.as_ref(), &to, &footer, &text).await?)
 }
 
 /// Rewrite a draft from feedback.
@@ -505,7 +528,7 @@ mod tests {
         assert_eq!(status(anyhow::anyhow!(draft::Unusable("cut off".into()))), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status(anyhow::Error::from(LlmError::RateLimited { retry_after: None })), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(status(anyhow::Error::from(LlmError::Unauthorized)), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(status(anyhow::Error::from(LlmError::Unavailable)), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status(anyhow::Error::from(LlmError::Unavailable("test".into()))), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(status(anyhow::anyhow!("anything else")), StatusCode::SERVICE_UNAVAILABLE);
         let setup = model_failed(anyhow::Error::from(LlmError::BadRequest("unknown model".into())));
         assert!(setup.1.contains("model setup") && !setup.1.contains("unknown model"), "provider detail stays in the log: {}", setup.1);
