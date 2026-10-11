@@ -595,8 +595,11 @@ fn draft_artifact_from_brief(req: &PlanDraftRequest, icp: &str) -> Result<Source
         );
         b.push_str(&base.fields_schema_json);
         b.push_str("\n\nWhat each column means (use this to write the ScrapePrompt):\n");
-        for (spec, req_col) in wanted.iter().zip(req.columns.iter()) {
-            let note = req_col.prompt.trim();
+        for spec in wanted.iter().filter(|f| !f.is_internal()) {
+            // A note may run to several lines now; they stay under their
+            // column's bullet instead of reading as new ones.
+            let note = spec.note.clone();
+            let note = note.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n    ");
             if note.is_empty() {
                 b.push_str(&format!("- {}: {}\n", spec.key, spec.label));
             } else {

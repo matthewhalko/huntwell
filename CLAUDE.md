@@ -263,6 +263,17 @@ the agent. Nothing here may be site-specific; rules are about standards
 
 PG 6511 · API 8611 · Admin 7611 · UI 5611 · MinIO 9611 (console 9612) · Chrome DevTools 20611 + account_id
 
+## Editing a plan's columns (`web/api.rs` `column_edit`, `PlanSettings.tsx`)
+
+Each column keeps what the person said goes in it (`FieldSpec.note`, set by
+`columns_to_schema`); the planner reads it, a rebuild reuses it, and the Edit
+tab shows the same `ColumnsEditor` as the home page (drag to reorder,
+multi-line descriptions). Saving: the same columns in a new order are applied
+in place, keeping each column's spec (no rebuild); added, removed, renamed or
+redescribed columns are refused unless `rebuild` is on, and rebuild from them
+(and mark the plan's columns the person's own). Results are keyed by column
+name, so a renamed column is empty for rows found before.
+
 ## Plan kinds
 
 `Plan.Kind` decides what a run produces; `store::PlanKind` + `store::plan_ready`

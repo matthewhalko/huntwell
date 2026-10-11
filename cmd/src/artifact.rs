@@ -42,6 +42,11 @@ pub struct FieldSpec {
     /// when the person's own columns have none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub internal: bool,
+    /// What the person said goes in this column, when they typed the columns
+    /// (2026-10-09). Kept so the plan's Edit tab can show and change it, and
+    /// so a rebuild writes from it again instead of from the name alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 impl FieldSpec {
@@ -392,7 +397,8 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
         if key.is_empty() || out.iter().any(|f| f.key == key) {
             continue;
         }
-        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new(), min: None, max: None, internal: false });
+        let note: String = c.prompt.trim().chars().take(2000).collect();
+        out.push(FieldSpec { key, label: c.name.trim().to_string(), ftype: guess_type(&c.name).into(), role: String::new(), min: None, max: None, internal: false, note });
     }
     if out.is_empty() {
         return out;
@@ -405,7 +411,7 @@ pub fn columns_to_schema(cols: &[ColumnRequest]) -> Vec<FieldSpec> {
         None => {
             // Not asked for, so not an output column: it carries the row's
             // identity and link, and the table, CSV and API leave it out.
-            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new(), min: None, max: None, internal: true });
+            out.push(FieldSpec { key: "url".into(), label: "Link".into(), ftype: "url".into(), role: String::new(), min: None, max: None, internal: true, note: String::new() });
             "url".into()
         }
     };

@@ -525,22 +525,22 @@ select option, select optgroup { background: var(--surface); color: var(--text);
 /* ---------- column editor (advanced options) ---------- */
 .cols-field { grid-column: 1 / -1; width: 100%; display: flex; flex-direction: column; align-items: stretch; gap: 0.45rem; }
 .cols-hint { margin: 0 0 0.1rem; }
+/* The website row (and anything else simple): an input and a button. */
 .col-row { display: flex; gap: 0.45rem; align-items: center; }
-.col-row input:first-child { flex: 0 0 11rem; }
-.col-row input:nth-child(2) { flex: 1; min-width: 0; }
+.col-row > input { flex: 0 0 14rem; min-width: 0; }
+/* One column: drag handle, name and remove button on a line, the description
+   as wide as the options area underneath, growing as it is typed. */
+.col-row.col-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0.4rem 0.45rem; align-items: center; position: relative;
+  padding: 0.55rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.col-item > input { width: 100%; max-width: 22rem; min-width: 0; }
 .col-row .iconbtn { flex: none; font-size: 1.1rem; line-height: 1; }
+.col-item .col-prompt { grid-column: 2 / -1; width: 100%; min-height: 3.6rem; resize: vertical; line-height: 1.45; font: inherit; }
 .cols-field > .btn { align-self: flex-start; }
 .site-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 .site-chip { display: inline-flex; align-items: center; gap: 0.35rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.35rem 0.2rem 0.65rem; font-size: 0.85rem; font-weight: 600; }
 .site-chip button { border: 0; background: none; color: var(--text-3); cursor: pointer; font-size: 1rem; line-height: 1; padding: 0 0.15rem; }
 .site-chip button:hover { color: var(--bad); }
-.cols-field .col-row input { flex: 0 0 14rem; }
 .kind-field { min-width: 15rem; }
-@media (max-width: 560px) {
-  .col-row { flex-wrap: wrap; }
-  .col-row input:first-child { flex: 1 1 100%; }
-  .col-row input:nth-child(2) { flex: 1 1 auto; }
-}
 
 /* ---------- Picker: the dropdown we draw ourselves ----------
    Used where a native select's popup would break the theme (timezone, plan
@@ -1701,3 +1701,10 @@ details summary { cursor: pointer; font-weight: 700; }
 .auto-reload .notice { margin: 0.2rem 0 0.7rem; }
 .graph-fit { margin-left: auto; }
 .graph-fit + .graph-tokens { margin-left: 0.4rem; }
+/* the reorder handle, and the column being dragged: lifted above the rest */
+.col-handle { display: grid; place-items: center; width: 1.6rem; height: 2.2rem; padding: 0; border: 0; border-radius: var(--radius-sm);
+  background: none; color: var(--text-3); cursor: grab; touch-action: none; }
+.col-handle:hover, .col-handle:focus-visible { color: var(--text); background: var(--surface); }
+.col-item.dragging { z-index: 5; box-shadow: var(--shadow); border-color: var(--border-strong); cursor: grabbing; }
+.col-item.dragging .col-handle { cursor: grabbing; color: var(--text); }
+

@@ -130,6 +130,16 @@ fn public_plan(p: &SourceConfig) -> Value {
         // Whether it can run at all, so the UI can say so without being told
         // which prompt is missing.
         "Ready": store::plan_ready(p).is_ok(),
+        // A custom-columns plan's output columns, in order, with what the
+        // person said goes in each — the Edit tab's column editor.
+        "Columns": if p.kind_of() == store::PlanKind::Artifacts {
+            crate::artifact::output_columns(&crate::artifact::parse_schema(&p.fields_schema_json))
+                .into_iter()
+                .map(|f| json!({ "name": if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() }, "prompt": f.note }))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
         // The owner-chosen models. Prompts stay hidden; these do not — they
         // are a setting the person picked, not machinery the drafter wrote.
         "Models": {
@@ -1104,6 +1114,52 @@ struct PlanUpdateBody {
     /// With `rebuild`: let the planner write a new title too.
     #[serde(default)]
     retitle: bool,
+    /// A custom-columns plan's columns, in order. Only reordered: applied as
+    /// is. Added, removed, renamed or redescribed: the plan has to be rebuilt
+    /// from them (`rebuild`), since its search was written for the old ones.
+    #[serde(default)]
+    columns: Option<Vec<crate::artifact::ColumnRequest>>,
+}
+
+/// What changing a plan's columns to `wanted` takes.
+enum ColumnEdit {
+    Same,
+    /// The same columns in another order: the new schema, ready to save.
+    Reorder(String),
+    /// Different columns: a rebuild from them.
+    Rebuild(Vec<crate::artifact::ColumnRequest>),
+}
+
+fn column_edit(sc: &SourceConfig, wanted: &[crate::artifact::ColumnRequest]) -> Result<ColumnEdit, ApiError> {
+    let wanted: Vec<_> = wanted.iter().filter(|c| !c.name.trim().is_empty()).cloned().collect();
+    let next = crate::artifact::output_columns(&crate::artifact::columns_to_schema(&wanted));
+    if next.is_empty() {
+        return Err(bad_request("a custom-columns plan needs at least one column"));
+    }
+    if next.len() != wanted.len() {
+        return Err(bad_request("two columns have the same name — give each its own"));
+    }
+    let schema = crate::artifact::parse_schema(&sc.fields_schema_json);
+    let current = crate::artifact::output_columns(&schema);
+    let ident = |f: &crate::artifact::FieldSpec| (f.key.clone(), f.label.trim().to_string(), f.note.trim().to_string());
+    let now: Vec<_> = current.iter().map(ident).collect();
+    let then: Vec<_> = next.iter().map(ident).collect();
+    if now == then {
+        return Ok(ColumnEdit::Same);
+    }
+    let mut a = now.clone();
+    let mut b = then.clone();
+    a.sort();
+    b.sort();
+    if a == b {
+        // Reordered only: the plan's own column specs (types, roles, limits)
+        // in the new order, internal columns kept at the end.
+        let mut ordered: Vec<crate::artifact::FieldSpec> =
+            next.iter().filter_map(|n| current.iter().find(|c| c.key == n.key).cloned()).collect();
+        ordered.extend(schema.into_iter().filter(|f| f.is_internal()));
+        return Ok(ColumnEdit::Reorder(serde_json::to_string(&ordered).unwrap_or_default()));
+    }
+    Ok(ColumnEdit::Rebuild(wanted))
 }
 
 /// Per-stage model ids. Absent keeps the value the plan already has; "" is
@@ -1151,6 +1207,22 @@ async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
     if let Some(models) = &body.models {
         apply_plan_models(&mut sc, models).map_err(bad_request)?;
     }
+    let mut new_columns: Option<Vec<crate::artifact::ColumnRequest>> = None;
+    if let Some(cols) = &body.columns {
+        if sc.kind_of() != store::PlanKind::Artifacts {
+            return Err(bad_request("only a custom-columns plan has columns to edit"));
+        }
+        match column_edit(&sc, cols)? {
+            ColumnEdit::Same => {}
+            ColumnEdit::Reorder(schema) => sc.fields_schema_json = schema,
+            ColumnEdit::Rebuild(cols) => {
+                if !body.rebuild {
+                    return Err(bad_request("changing the columns rebuilds the plan — save with “Rebuild” on"));
+                }
+                new_columns = Some(cols);
+            }
+        }
+    }
     if body.rebuild {
         agent_available()?;
         if store::draft_in_progress(&sc.draft_status) {
@@ -1164,7 +1236,11 @@ async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
     store::save_plan(&state.db, acc.tenant(), &sc).await?;
     store::refresh_schedule(&state.db, id).await?;
     if body.rebuild {
-        rebuild_from_description(&state, acc.tenant(), &sc, body.retitle).await?;
+        if new_columns.is_some() {
+            // Typed here, so the person's own from now on.
+            store::set_custom_columns(&state.db, acc.tenant(), id, true).await?;
+        }
+        rebuild_from_description(&state, acc.tenant(), &sc, body.retitle, new_columns).await?;
     }
     let plan = store::get_plan(&state.db, acc.tenant(), id).await?.ok_or_else(|| not_found("plan not found"))?;
     Ok(Json(public_plan(&plan)))
@@ -1175,7 +1251,13 @@ async fn update_plan(State(state): State<App>, AuthUser(acc): AuthUser, Path(id)
 /// kind is decided again from the brief, the columns and the search are
 /// written afresh. The queued next searches were planned for the old brief,
 /// so they go; results already found stay.
-async fn rebuild_from_description(state: &App, workspace: i64, sc: &SourceConfig, retitle: bool) -> Result<(), ApiError> {
+async fn rebuild_from_description(
+    state: &App,
+    workspace: i64,
+    sc: &SourceConfig,
+    retitle: bool,
+    columns: Option<Vec<crate::artifact::ColumnRequest>>,
+) -> Result<(), ApiError> {
     let id = sc.plan_id;
     // What this workspace may build — plus what this plan already is, so a
     // plan whose kind was since switched off can still be rebuilt as itself.
@@ -1200,12 +1282,17 @@ async fn rebuild_from_description(state: &App, workspace: i64, sc: &SourceConfig
         target_prospects: sc.target_prospects as i64,
         // Columns the person typed are theirs through a rebuild too; the
         // planner designs new ones only for a plan whose columns it chose.
-        columns: if sc.has_custom_columns() {
+        // Columns just edited win; else the person's own, with what they
+        // said goes in each. The planner designs new ones only for a plan
+        // whose columns it chose.
+        columns: if let Some(cols) = columns {
+            cols
+        } else if sc.has_custom_columns() {
             crate::artifact::output_columns(&crate::artifact::parse_schema(&sc.fields_schema_json))
                 .into_iter()
                 .map(|f| crate::artifact::ColumnRequest {
                     name: if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() },
-                    prompt: String::new(),
+                    prompt: f.note,
                 })
                 .collect()
         } else {
@@ -2029,5 +2116,47 @@ mod login_session_tests {
         assert!(!super::take_login_session("sess-unknown", 1), "a session this server never started");
         assert!(super::take_login_session("sess-a", 1));
         assert!(!super::take_login_session("sess-a", 1), "once only");
+    }
+}
+
+#[cfg(test)]
+mod column_edit_tests {
+    use super::*;
+    use crate::artifact::ColumnRequest;
+
+    fn col(n: &str, p: &str) -> ColumnRequest {
+        ColumnRequest { name: n.into(), prompt: p.into() }
+    }
+
+    #[test]
+    fn a_column_edit_is_a_reorder_or_a_rebuild() {
+        let mut sc = SourceConfig::default();
+        sc.kind = "artifacts".into();
+        sc.fields_schema_json =
+            serde_json::to_string(&crate::artifact::columns_to_schema(&[col("Practice name", ""), col("Owner email", "not info@"), col("Price", "")])).unwrap();
+        let original = crate::artifact::parse_schema(&sc.fields_schema_json);
+
+        assert!(matches!(column_edit(&sc, &[col("Practice name", ""), col("Owner email", "not info@"), col("Price", "")]), Ok(ColumnEdit::Same)));
+
+        // Same columns, new order: the plan's own specs reordered, the
+        // internal link kept, nothing rebuilt.
+        let Ok(ColumnEdit::Reorder(json)) = column_edit(&sc, &[col("Price", ""), col("Practice name", ""), col("Owner email", "not info@")]) else {
+            panic!("expected a reorder")
+        };
+        let reordered = crate::artifact::parse_schema(&json);
+        assert_eq!(reordered.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(), ["price", "practice_name", "owner_email", "url"]);
+        let price = |s: &[crate::artifact::FieldSpec]| s.iter().find(|f| f.key == "price").cloned().unwrap();
+        assert_eq!(price(&reordered).ftype, price(&original).ftype, "a reorder keeps each column's own spec");
+
+        // A new description, a rename or a new column: rebuild.
+        for cols in [
+            vec![col("Practice name", ""), col("Owner email", "the owner's own address"), col("Price", "")],
+            vec![col("Practice", ""), col("Owner email", "not info@"), col("Price", "")],
+            vec![col("Practice name", ""), col("Owner email", "not info@"), col("Price", ""), col("City", "")],
+        ] {
+            assert!(matches!(column_edit(&sc, &cols), Ok(ColumnEdit::Rebuild(_))));
+        }
+        assert!(column_edit(&sc, &[col("City", ""), col("city", "")]).is_err(), "two columns with one name");
+        assert!(column_edit(&sc, &[col("  ", "")]).is_err(), "no columns");
     }
 }

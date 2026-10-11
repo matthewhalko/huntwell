@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { api, Effort, EFFORTS, Plan } from '../api'
 import { Field, useToast } from '../components/ui'
+import { ColumnsEditor, newCol, PlanAskCol } from '../components/PlanAskOptions'
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
@@ -28,12 +29,24 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
   const [days, setDays] = useState(plan.ScheduleDays)
   const [alert, setAlert] = useState(!!plan.AlertEmail)
   const [busy, setBusy] = useState(false)
+  // A custom-columns plan's columns. Reordering alone is saved as is; any
+  // other change (a new, removed, renamed or redescribed column) rebuilds
+  // the plan, because its search was written for the old columns.
+  const hasCols = plan.Kind === 'artifacts'
+  const [cols, setCols] = useState<PlanAskCol[]>(() => (plan.Columns || []).map((c) => ({ ...newCol(), name: c.name, prompt: c.prompt })))
+  const sig = (cs: { name: string; prompt: string }[]) =>
+    cs.filter((c) => c.name.trim()).map((c) => `${c.name.trim().toLowerCase()}\u0000${c.prompt.trim()}`)
+  const before = sig(plan.Columns || [])
+  const after = sig(cols)
+  const colsChanged = hasCols && [...before].sort().join('\u0001') !== [...after].sort().join('\u0001')
+  const colsReordered = hasCols && !colsChanged && before.join('\u0001') !== after.join('\u0001')
   const described = description.trim() !== (plan.Description || '').trim()
   const renamed = name.trim() !== (plan.Source || '').trim()
   // Rebuilding follows the description: on as soon as it changes, and the
   // person can still turn it off (or on, to rebuild an unchanged plan).
   const [rebuildChoice, setRebuildChoice] = useState<boolean | null>(null)
-  const rebuild = rebuildChoice ?? described
+  // Changed columns cannot be saved without one, so it is on and stays on.
+  const rebuild = colsChanged || (rebuildChoice ?? described)
   const [retitleChoice, setRetitle] = useState(false)
   // A name typed here is theirs; asking for a new one would overwrite it.
   const retitle = rebuild && retitleChoice && !renamed
@@ -83,9 +96,10 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
         alert_email: alert,
         rebuild,
         retitle,
+        ...(colsChanged || colsReordered ? { columns: cols.filter((c) => c.name.trim()).map(({ name, prompt }) => ({ name, prompt })) } : {}),
       })
       onSaved(saved)
-      toast(rebuild ? 'Saved — rebuilding the plan from your description' : 'Saved')
+      toast(rebuild ? 'Saved — rebuilding the plan' : colsReordered ? 'Saved — columns reordered' : 'Saved')
     } catch (err: any) {
       toast(err.message || 'Could not save', true)
     } finally {
@@ -101,14 +115,27 @@ export function PlanSettings({ plan, onSaved }: { plan: Plan; onSaved: (p: Plan)
       <Field label="What this plan looks for" hint="In your own words. Huntwell works out how to find it.">
         <textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} maxLength={600} />
       </Field>
+      {hasCols && (
+        <Field
+          label="Columns"
+          hint="Drag ⠿ to reorder — that alone is saved as is. Adding, removing, renaming or redescribing a column rebuilds the plan."
+        >
+          <div className="cols-field">
+            <ColumnsEditor cols={cols} setCols={setCols} />
+          </div>
+        </Field>
+      )}
       <div className="rebuild-box">
-        <label className="check">
-          <input type="checkbox" checked={rebuild} onChange={(e) => setRebuildChoice(e.target.checked)} /> Rebuild the plan from this
-          description
+        <label className="check" title={colsChanged ? 'Changed columns need a rebuild' : undefined}>
+          <input type="checkbox" checked={rebuild} disabled={colsChanged} onChange={(e) => setRebuildChoice(e.target.checked)} /> Rebuild the
+          plan from this description{hasCols ? ' and these columns' : ''}
+          {colsChanged ? ' (needed — the columns changed)' : ''}
         </label>
         <p className="muted sm">
           {rebuild
-            ? 'Huntwell recreates the plan from scratch, the same way it did when you made it: what it finds, the columns and how it searches. Your target, effort, schedule and alerts stay as set. Results already found are kept.'
+            ? hasCols
+              ? 'Huntwell recreates the plan from scratch with your columns, in this order: what it finds and how it searches for each. Your target, effort, schedule and alerts stay as set. Results already found are kept; a renamed column starts empty for them.'
+              : 'Huntwell recreates the plan from scratch, the same way it did when you made it: what it finds, the columns and how it searches. Your target, effort, schedule and alerts stay as set. Results already found are kept.'
             : 'Off: only the settings on this page change; the plan searches the way it already does.'}
         </p>
         {rebuild && (

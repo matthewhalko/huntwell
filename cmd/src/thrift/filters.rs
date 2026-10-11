@@ -64,7 +64,7 @@ mod tests {
     use super::*;
 
     fn price(max: Option<f64>, min: Option<f64>) -> Vec<FieldSpec> {
-        vec![FieldSpec { key: "price".into(), label: "Price".into(), ftype: "money".into(), role: String::new(), min, max, internal: false }]
+        vec![FieldSpec { key: "price".into(), label: "Price".into(), ftype: "money".into(), role: String::new(), min, max, internal: false, note: String::new() }]
     }
     fn row(v: Value) -> Row {
         Row::from([("price".to_string(), v)])

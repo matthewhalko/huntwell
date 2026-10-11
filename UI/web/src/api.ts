@@ -298,6 +298,8 @@ export interface Plan {
   Ready: boolean
   /// Per-stage Cursor model ids. Empty means the install default / Cursor.
   Models?: PlanStageModels
+  /** A custom-columns plan's output columns, in order, with what goes in each. */
+  Columns?: { name: string; prompt: string }[]
 }
 
 export interface PlanStageModels {
