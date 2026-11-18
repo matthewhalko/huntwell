@@ -93,3 +93,16 @@ ALTER TABLE public.account ADD COLUMN IF NOT EXISTS sell_usd_per_mtoken double p
 -- The sign-off this person's outreach drafts end with, verbatim (name, role,
 -- phone, a link). Per person, not per workspace: everyone signs their own mail.
 ALTER TABLE public.account ADD COLUMN IF NOT EXISTS outreach_footer text NOT NULL DEFAULT '';
+
+-- Optional modules an operator has switched on for this workspace (admin →
+-- Users → Modules), comma-separated: `crm` is the built-in CRM. Empty — the
+-- default — means none: a module is something a workspace is given, not
+-- something everyone gets the day it ships. See store::MODULES.
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS modules text NOT NULL DEFAULT '';
+
+-- The reset email's link: SHA-256 of a long random token (not the six-digit
+-- code — a link that sits in an inbox for a day must not be guessable). Sent
+-- with the code, good for as long (store::RESET_VALID_HOURS), and spent with
+-- it: using either clears both. Text, not char(64), so blank is ''.
+ALTER TABLE public.account ADD COLUMN IF NOT EXISTS reset_link_hash text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS account_reset_link_idx ON public.account (reset_link_hash) WHERE reset_link_hash <> '';

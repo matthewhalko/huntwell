@@ -56,8 +56,8 @@ pub const PAGES: &[Page] = &[
     },
     Page {
         path: "/pricing",
-        title: "Pricing — pay for the tokens a run spends | Huntwell",
-        description: "Huntwell charges by how many tokens a browse uses. Prepaid credits, no seat fee, and a cap on every run.",
+        title: "Pricing — one flat rate, pay for what you use | Huntwell",
+        description: "One flat price per million AI tokens. Pay only for what you use: no subscription, no seat fees, no tiers, and a cap on every run.",
         changefreq: "monthly",
         priority: "0.9",
     },

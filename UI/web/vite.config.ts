@@ -14,6 +14,14 @@ export default defineConfig({
     proxy: {
       '/api': { target: api, changeOrigin: false },
       '/dl': { target: api, changeOrigin: false },
+      // Claude's MCP connector (web/mcp_api.rs), so the URL the API access
+      // page shows works against the dev server too.
+      '/mcp': { target: api, changeOrigin: false },
+      // Huntwell for Chrome's own endpoints (web/extension.rs), so the extension
+      // can sign in against the dev server on this port.
+      '/ext': { target: api, changeOrigin: false },
+      // Slack's Events API (support chat replies), for a tunnel to this port.
+      '/slack': { target: api, changeOrigin: false },
       '/healthz': { target: api },
     },
   },

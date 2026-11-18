@@ -28,6 +28,10 @@ pub fn router() -> Router<App> {
         .merge(team_routes())
         .merge(super::billing::routes())
         .merge(super::outreach::routes())
+        .merge(super::crm::routes())
+        .merge(super::contacts::routes())
+        .merge(super::extension::routes())
+        .merge(super::support::routes())
         .merge(overview_routes())
         .merge(plans_routes())
         .merge(runs_routes())
@@ -72,6 +76,7 @@ pub fn auth_routes() -> Router<App> {
         .route("/auth/mfa/disable", post(auth::mfa_disable))
         .route("/auth/forgot", post(auth::forgot))
         .route("/auth/reset", post(auth::reset))
+        .route("/auth/reset/{token}", get(auth::reset_link_info))
         .route("/auth/resend", post(auth::resend))
 }
 
@@ -2052,11 +2057,14 @@ struct CreateKeyBody {
     expires_in_days: i64,
     #[serde(default)]
     allow_cidr: String,
+    /// "mcp" for a key Claude uses at /mcp; anything else is a signed API key.
+    #[serde(default)]
+    kind: String,
 }
 
 async fn create_key(State(state): State<App>, AuthUser(acc): AuthUser, Json(b): Json<CreateKeyBody>) -> Result<Json<store::ApiKeyRow>, ApiError> {
     require_cap(&state, &acc, store::CAP_KEYS).await?;
-    let key = store::create_api_key(&state.db, acc.tenant(), Some(acc.account_id), &b.label, b.plan_id, b.expires_in_days, &b.allow_cidr).await?;
+    let key = store::create_api_key(&state.db, acc.tenant(), Some(acc.account_id), &b.label, b.plan_id, b.expires_in_days, &b.allow_cidr, b.kind == "mcp").await?;
     Ok(Json(key))
 }
 

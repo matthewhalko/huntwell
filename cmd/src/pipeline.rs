@@ -248,9 +248,10 @@ pub async fn execution_by_id(db: &Db, execution_id: i64) -> i32 {
 /// Emails the plan's owner that a run found something new.
 ///
 /// Best-effort by design: an alert that cannot be sent must not fail a run that
-/// worked. Every failure here is a log line, never an error return. Without
-/// `HUNTWELL_PUBLIC_URL` there is nowhere to link to, so nothing is sent —
-/// an email whose only call to action is a dead link is worse than silence.
+/// worked. Every failure here is a log line, never an error return. The link
+/// needs `HUNTWELL_PUBLIC_URL`, which a worker VM does not have: it queues the
+/// alert with `mail::PUBLIC_URL_MARK` and the notification service fills it in
+/// (it used to return here, silently, so no pooled run ever sent an alert).
 /// Tell whoever asked that a run found something new: the owner's email, and
 /// the plan's Slack channel. Slack is only queued here — the notification
 /// service renders the post from this run's rows and sends it, because the
@@ -260,7 +261,7 @@ async fn announce_new(db: &Db, sc: &SourceConfig, run: &store::ExecutionRecord, 
         return;
     }
     if sc.alert_email {
-        alert_new_records(db, sc, new).await;
+        alert_new_records(db, sc, run, new).await;
     }
     match store::queue_slack_post(db, sc.account_id, sc.plan_id, run.execution_id, run.started_at).await {
         Ok(Some(_)) => println!("[slack] {new} new result(s) queued for the plan's Slack channel"),
@@ -269,10 +270,10 @@ async fn announce_new(db: &Db, sc: &SourceConfig, run: &store::ExecutionRecord, 
     }
 }
 
-async fn alert_new_records(db: &Db, sc: &SourceConfig, new: i64) {
-    let Some(base) = crate::config::get("HUNTWELL_PUBLIC_URL") else {
-        return;
-    };
+async fn alert_new_records(db: &Db, sc: &SourceConfig, run: &store::ExecutionRecord, new: i64) {
+    // A worker VM has no HUNTWELL_PUBLIC_URL; the link then carries a mark
+    // the notification service fills in when it sends.
+    let base = crate::mail::link_base();
     let Ok(Some(acc)) = store::get_account(db, sc.account_id).await else {
         return;
     };
@@ -284,9 +285,35 @@ async fn alert_new_records(db: &Db, sc: &SourceConfig, new: i64) {
         _ => "results",
     };
     let total = store::plan_row_count(db, sc.plan_id, &kind).await;
-    let samples = store::recent_labels(db, sc.plan_id, &kind, new.min(5)).await;
-    let link = format!("{}/app/plans/{}", base.trim_end_matches('/'), sc.plan_id);
-    let msg = crate::mail::new_records(&sc.source, noun, new, total, &samples, &link);
+    // This run's new rows as cards, with the plan's columns: what was first
+    // seen since the run started. A failed read sends the alert without them.
+    let (since, until, max) = (run.started_at, chrono::Utc::now(), crate::mail::ALERT_CARDS as i64);
+    let cards: Vec<crate::mail::AlertCard> = match kind.as_str() {
+        "artifacts" => {
+            let cols = crate::artifact::output_columns(&crate::artifact::parse_schema(&sc.fields_schema_json));
+            store::artifacts_found_between(db, sc.account_id, sc.plan_id, since, until, max)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| crate::mail::AlertCard::from_artifact(r, &cols))
+                .collect()
+        }
+        "report" | "assets" => store::titles_found_between(db, sc.account_id, sc.plan_id, &kind, since, until, max)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| crate::mail::AlertCard::titled(t))
+            .collect(),
+        _ => store::prospects_found_between(db, sc.account_id, sc.plan_id, since, until, max)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(crate::mail::AlertCard::from_prospect)
+            .collect(),
+    };
+    let link = format!("{base}/app/plans/{}", sc.plan_id);
+    let msg = crate::mail::new_records(&sc.source, noun, new, total, &cards, &link);
     // Queued, not sent: this is the tail end of a run, and a slow mail provider
     // must not hold the process open or lose the alert if it fails.
     if let Err(e) = store::queue_mail(db, Some(sc.account_id), &acc.email, "new_records", &msg).await {

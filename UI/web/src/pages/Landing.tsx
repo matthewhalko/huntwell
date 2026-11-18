@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { SiteFooter, SiteHeader } from '../components/Site'
 import { useAuth } from '../auth'
 import { useAuthConfig } from './Auth'
+import LiveDemo from '../components/LiveDemo'
 
 /// What Huntwell does, in the order someone new cares about it: the thing it
 /// builds, the three shapes that thing comes in, and the fact that it is not a
@@ -229,6 +230,16 @@ export default function Landing() {
             </text>
           </svg>
         </div>
+      </section>
+
+      {/* Watch it work: the hero says what comes back; this shows a search
+          being typed, the browser reading pages and rows arriving. */}
+      <section className="see">
+        <h2>
+          Watch it <span className="grad-text">work</span>.
+        </h2>
+        <p className="see-lede">Type what you want. Huntwell opens the pages, reads them and fills the table.</p>
+        <LiveDemo />
       </section>
 
       {/* What it does. Six things, each one sentence past the headline, because

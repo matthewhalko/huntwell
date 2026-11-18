@@ -253,6 +253,14 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
+# Links in emails (run alerts, invitations) need the site's address, and so does
+# the admin (Support → Slack shows the Request URL from it). Unset in
+# local-infra/global, the local app is it — otherwise the notification service
+# holds every alert back, which looks exactly like "alerts don't work".
+if [[ -z "${HUNTWELL_PUBLIC_URL:-}" ]] && ! grep -qE '^HUNTWELL_PUBLIC_URL=.+' "$GLOBAL"; then
+  export HUNTWELL_PUBLIC_URL="http://localhost:$UI_PORT"
+fi
+
 # --- admin control plane -----------------------------------------------------
 # The admin signs operators in through their own Cognito pool and refuses to
 # start without one. Most dev boxes have none, and the app runs fine without
@@ -262,6 +270,9 @@ trap cleanup INT TERM EXIT
 ADMIN_PID=""
 if "$SERVER_BIN" config get ADMIN_COGNITO_USER_POOL_ID >/dev/null 2>&1 \
    && "$SERVER_BIN" config get ADMIN_COGNITO_CLIENT_ID >/dev/null 2>&1; then
+  ADMIN_POOL=1
+fi
+if [[ -n "${ADMIN_POOL:-}" ]]; then
   step "Starting admin control plane on http://$ADMIN_ADDR (local pool of ${LOCAL_POOL:-2} workers)"
   HUNTWELL_LOCAL_POOL="${LOCAL_POOL:-2}" "$SERVER_BIN" admin --addr "$ADMIN_ADDR" &
   ADMIN_PID=$!
@@ -271,8 +282,14 @@ if "$SERVER_BIN" config get ADMIN_COGNITO_USER_POOL_ID >/dev/null 2>&1 \
   # the same placement path production uses. RUN_DISPATCH=local ./dev.sh opts out.
   RUN_DISPATCH="${RUN_DISPATCH:-pool}"
 else
-  warn "admin console skipped — no operators' Cognito pool (ADMIN_COGNITO_USER_POOL_ID / _CLIENT_ID in $GLOBAL)"
-  printf "   the app and the public site run without it; plans run in this process (RUN_DISPATCH=local)\n"
+  # No operators' pool: the console still runs, for settings like Support →
+  # Slack, signing in as the dev operator (email "test", no password). It
+  # places no runs, so plans run in this process (RUN_DISPATCH=local).
+  step "Starting admin console on http://$ADMIN_ADDR (no operators' pool: sign in with email test, no password)"
+  HUNTWELL_DEV=1 HUNTWELL_LOCAL_POOL=0 "$SERVER_BIN" admin --addr "$ADMIN_ADDR" &
+  ADMIN_PID=$!
+  write_pid "$ADMIN_PID_FILE" "$ADMIN_PID"
+  wait_for "$ADMIN_PORT" "admin" "$ADMIN_PID"
   RUN_DISPATCH=local
 fi
 export RUN_DISPATCH
@@ -313,7 +330,11 @@ open_lan_firewall
 printf '\n  Ready — open these:\n\n'
 [[ "$WITH_UI" == "1" ]] && printf '    App (HMR)      http://127.0.0.1:%s\n' "$UI_PORT"
 printf '    Server         http://127.0.0.1:%s   (embedded UI, no HMR)\n' "$API_PORT"
-[[ -n "$ADMIN_PID" ]] && printf '    Admin          http://127.0.0.1:%s   (sign in with an operator from the admin Cognito pool)\n' "$ADMIN_PORT"
+if [[ -n "$ADMIN_PID" && -n "${ADMIN_POOL:-}" ]]; then
+  printf '    Admin          http://127.0.0.1:%s   (sign in with an operator from the admin Cognito pool)\n' "$ADMIN_PORT"
+elif [[ -n "$ADMIN_PID" ]]; then
+  printf '    Admin          http://127.0.0.1:%s   (email test, no password)\n' "$ADMIN_PORT"
+fi
 printf '    Health         http://127.0.0.1:%s/healthz\n' "$API_PORT"
 if [[ "$UI_HOST" == "0.0.0.0" ]]; then
   printf '\n'

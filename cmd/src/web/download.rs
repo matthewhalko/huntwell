@@ -142,7 +142,7 @@ fn presented_token(headers: &HeaderMap, q: &HashMap<String, String>) -> Option<S
     q.get("token").map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+pub(crate) fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     super::client_ip(headers, peer)
 }
 
@@ -245,11 +245,13 @@ pub(crate) async fn authenticate(
     };
     if let Ok(Ok(key)) = store::authenticate_api_key(&state.db, &token, Some(ip)).await {
         note_failure(ip);
-        let outcome = if key.secret_sealed.is_some() { "unsigned" } else { "legacy-key" };
+        let outcome = if key.kind == "mcp" { "mcp-key" } else if key.secret_sealed.is_some() { "unsigned" } else { "legacy-key" };
         let _ = store::record_api_audit(&state.db, Some(key.account_id), Some(key.key_id), &ip.to_string(), outcome, path).await;
         return Err((
             StatusCode::UNAUTHORIZED,
-            if key.secret_sealed.is_some() {
+            if key.kind == "mcp" {
+                "this is an MCP key — it works only at /mcp, for Claude. Use an API key with a signing secret here\n"
+            } else if key.secret_sealed.is_some() {
                 "sign this request — send X-HW-KEY, X-HW-TS, X-HW-NONCE and X-HW-SIGN over METHOD\\nPATH\\nQUERY\\nTIMESTAMP\\nNONCE\\nSHA256(BODY)\n"
             } else {
                 "this key predates request signing and no longer works — create a new key, which comes with a signing secret\n"

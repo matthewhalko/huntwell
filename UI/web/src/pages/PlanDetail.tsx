@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ago, api, can, FieldSpec, fmtDate, fmtTokens, Plan, Run, scheduleLabel, fmtDuration } from '../api'
 import { useAuth } from '../auth'
 import { Badge, Empty, Loading, Modal, ModalBackdrop, Spinner, StatusBadge, useConfirm, useToast } from '../components/ui'
-import { PageSkeleton } from '../components/Skeleton'
+import { PageSkeleton, useLoadView } from '../components/Skeleton'
 import { CheckIcon, ClockIcon } from '../components/icons'
 import { SearchSeeds } from '../components/SearchSeeds'
 import { ArtifactTable } from '../components/ArtifactTable'
@@ -12,6 +12,7 @@ import { ReportView } from '../components/ReportView'
 import { AssetGrid } from '../components/AssetGrid'
 import { PlanSettings } from './PlanSettings'
 import { SlackSettings } from '../components/SlackSettings'
+import { PlanCrmSettings } from '../components/PlanCrmSettings'
 import { PlanOutreachSettings } from '../components/PlanOutreachSettings'
 import { ProspectTable } from './Prospects'
 
@@ -83,7 +84,8 @@ export default function PlanDetail() {
     nav(loc.pathname, { replace: true, state: {} })
   }, [locState.welcome, plan?.Status, plan?.PlanId, loc.pathname, nav])
 
-  if (!plan) return <PageSkeleton kind="detail" />
+  const planView = useLoadView(plan !== null)
+  if (!plan || planView !== 'ready') return planView === 'skeleton' ? <PageSkeleton kind="detail" /> : null
   const active = runs.find((r) => r.status === 'running' || r.status === 'queued')
 
   const save = async (p: Plan) => {
@@ -208,6 +210,7 @@ export default function PlanDetail() {
       )}
       {tab === 'edit' && <PlanOutreachSettings planId={plan.PlanId} canWrite={write} />}
       {tab === 'edit' && <SlackSettings planId={plan.PlanId} canWrite={write} />}
+      {tab === 'edit' && <PlanCrmSettings planId={plan.PlanId} canWrite={write} />}
 
       {runModal && <RunModal plan={plan} first={runModal === 'first'} onClose={() => setRunModal(null)} />}
     </>
@@ -226,7 +229,8 @@ function Overview({ runs }: { runs: Run[] }) {
 /// way to when each run finished and how long it took.
 export function RunsTab({ runs, loading, inPlan }: { runs: Run[]; loading?: boolean; inPlan?: boolean }) {
   const nav = useNavigate()
-  if (loading) return <Loading />
+  const runsView = useLoadView(!loading)
+  if (runsView !== 'ready') return runsView === 'skeleton' ? <Loading /> : null
   if (!runs.length) return <Empty title="No executions yet" />
   const tokens = runs.reduce((a, r) => a + (r.tokens || 0), 0)
   const found = runs.reduce((a, r) => a + (r.new_prospects || 0), 0)
@@ -312,7 +316,8 @@ function TrailTab({ planId }: { planId: number }) {
   useEffect(() => {
     load()
   }, [planId])
-  if (!t) return <Loading />
+  const trailView = useLoadView(!!t)
+  if (!t || trailView !== 'ready') return trailView === 'skeleton' ? <Loading /> : null
   return (
     <div className="stack trail">
       <div className="two">

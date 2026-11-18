@@ -34,8 +34,19 @@ sqlx) on Postgres, React UI embedded in the binary, one process per run.
   an inline script silently never runs (the theme script once didn't, and
   dark-mode phones flashed white). Put it in `UI/web/public/*.js` — `theme.js`
   (before paint) and `skeleton.js` (pre-script skeleton) live there.
+- Tables are `components/Grid.tsx`: AG Grid on a wide screen, **cards on a
+  phone** (`useNarrow`, ≤ 860px). Cards reuse each column's own
+  valueGetter/field, valueFormatter and cellRenderer — first column the title,
+  titled columns as label/value (empty left out), untitled ones (links,
+  delete) in the corner — so a page describes its columns once. Don't drop
+  columns at phone width any more; the cards have room for them.
 - Loading states are skeletons (`components/Skeleton.tsx`, `.skel*` in
   styles.css), never a blank page or "Loading…". `Loading` (block) is one.
+  **Gate every skeleton with `useLoadView(ready)`** so it never flickers: a
+  load under 150ms shows no skeleton, and a shown one stays ≥ 700ms
+  (`SKELETON_DELAY_MS` / `SKELETON_MIN_MS`). `FirstLoadHold` (main.tsx) keeps
+  the first paint's skeleton until 700ms after page start while the app mounts
+  hidden underneath.
 
 ## Public API auth (`cmd/src/web/signing.rs`)
 
@@ -75,6 +86,101 @@ refused, including on `/dl/`.
   password earned the challenge (`identity::mfa_challenge_account`), never
   from the request, and the Cognito subject must match the bound one.
 
+## MCP for the user's own Claude (`cmd/src/web/mcp_api.rs`)
+
+`/mcp` is an MCP server (Streamable HTTP, JSON-RPC POST, plain-JSON answers;
+GET is 405) that a workspace adds to its own Claude as a custom connector, so
+Claude — the Chrome side panel included — reads results and drafts while it
+works in their browser. Not to be confused with `cmd/src/mcp.rs`, the
+read-only server for Huntwell's own scraping agent.
+
+- **Its own key kind**: `api_key.kind='mcp'` (`hwm_…`, no secret), made under
+  API access → "Claude (MCP)". Claude cannot sign, so it is a bearer token —
+  `Authorization: Bearer` or in the URL (`/mcp/{key}`, for Claudes without
+  header support). Refused on `/v1`/`/dl`; a signed key is refused on `/mcp`.
+  Otherwise a normal key: workspace, plan pin, maker's caps, audit, revocation.
+- `/mcp` is merged **after** the TraceLayer in `serve_app` so a key in a URL is
+  never logged; the audit records `/mcp <tool>`, never the path. JSON bodies
+  only (415 otherwise).
+- Tools: `list_plans`, `search_results`, `list_outreach_profiles`,
+  `draft_outreach` (paid; needs the maker's plans cap, like `/v1`),
+  `list_drafts`, `get_draft` (Gmail/Outlook compose links, LinkedIn profile).
+  Outreach tools refuse plan-pinned keys. Nothing sends: the user does.
+  Results are scraped — every tool and the server instructions say "data".
+- Claude on the web connects from Anthropic's cloud: a local server needs a
+  tunnel (or use Claude Code). The dev server proxies `/mcp` (vite.config.ts).
+
+## Huntwell for Chrome (`extension/`, `cmd/src/web/extension.rs`)
+
+An MV3 side-panel extension that sends queued outreach on LinkedIn and Reddit:
+it opens the person's page, fills the message in and points at Send — **the
+person presses Send; nothing in it ever clicks Send, submits or presses Enter**
+(LinkedIn's terms, Reddit's spam rules, the Web Store's policy). Keep it so.
+
+- **Sign-in** is authorization code + PKCE via `chrome.identity.launchWebAuthFlow`:
+  `/app/extension/authorize` (consent page) → `POST /api/extension/authorize`
+  (redirect must be `https://<id>.chromiumapp.org/…` of an allowed id:
+  `HUNTWELL_EXTENSION_IDS`, default the manifest key's `BUILT_IN_ID`; any id
+  in dev) → a 5-minute single-use code (`extension_grant`, hash only, claimed
+  before the verifier is checked) → `POST /ext/v1/token` → its own key,
+  `api_key.kind='ext'` (`hwx_…`, 180 days, its approver as maker, listed and
+  revocable under API access). Works only at `/ext/v1`.
+- **Queue** = `outreach.send_channel` (`linkedin`|`reddit`) + `queued_at`; sent
+  = `sent_at`/`sent_via`, by the extension or "Mark sent" in the draft dialog,
+  and a CRM activity when the module is on. `recipient_reddit` via
+  `store::reddit_username`.
+- `/ext/v1`: `me`, `queue`, `outreach/{id}/sent`, `outreach/{id}/unqueue`,
+  `signout` (revokes the key). Writes need the maker's plans cap.
+- Content scripts fill via a paste event (then `insertText`), detect a send by
+  the box emptying after the person's click/Enter, and fall back to the
+  banner's Copy / Mark sent / Skip. Branded Chrome ignores `--load-extension`,
+  so test them against mock pages with a stubbed `chrome.*`.
+- Branding mirrors the app: `panel.css` and the banner in `content/common.js`
+  copy `styles.css`'s tokens (keep them in step); Lato is bundled in `fonts/`.
+
+## CRM sync (`cmd/src/crm/`, `cmd/src/web/crm.rs`)
+
+A workspace connects a CRM (`crm_connection`, Settings → CRM integrations; the
+credential sealed with `signing::seal_secret`); a plan sends its results to it
+(`plan_crm`, the plan's Edit tab). The **website's** sync loop
+(`web::crm::spawn_sync`, 45s or woken) pushes every row a plan has that the
+ledger (`crm_push`, unique per connection+row) does not — so runs on workers
+know nothing of CRMs and a missed pass loses nothing. A row becomes a
+`crm::Contact` (from a prospect, or a custom row read by column names), then
+an adapter's records. Errors: `Auth` pauses the connection, `Retry` leaves the
+row for the next pass, `Rejected` records it failed (retried 3× after 10 min).
+
+- **Adding a CRM** = a file beside `crm/pipedrive.rs` (`connect`, `push`), a
+  `crm::Provider` variant, and its credential's name in the providers list.
+- **Pipedrive**: personal API token as `api_token`; the company domain comes
+  from `/v1/users/me`, so only the token is pasted. Organization by exact name
+  (else created), person matched by exact email (else created, v2 API), an
+  escaped HTML note with everything else, an optional lead (v1). Hosts are
+  only `*.pipedrive.com`; `HUNTWELL_PIPEDRIVE_API_BASE` points it at a stand-in,
+  honoured only with `HUNTWELL_DEV`.
+
+## Modules and the built-in CRM (`web/contacts.rs`, `pages/Crm.tsx`)
+
+`account.modules` (comma-separated, `store::MODULES`) is what an operator
+switches on per workspace — admin → Users → Modules, saved on tick
+(`PUT /admin/api/accounts/{id}/modules`). Unknown ids are dropped; off is the
+default. `/api/me` carries `modules`; the UI gates with `hasModule(me, …)`, the
+API with `store::has_module` on **every** route, reads included. Add a module
+= a `MODULES` entry + its gate.
+
+`crm` is a deliberately simple CRM (modelled on Park River's, minus everything
+advisor-specific): `contact` (fixed stages `CONTACT_STAGES`: lead → contacted →
+qualified → customer / lost, a follow-up date, `last_touch_at`) and
+`contact_activity` (note/email/call/meeting/linkedin, `occurred_at`; logged by
+people, nothing is sent). Contacts come by hand, from a whole plan
+(`/api/contacts/import {plan_id}`, ≤ 2000) or one result's "Add to CRM". A
+result goes through `crm::Contact::from_prospect`/`from_artifact` — the same
+reading the CRM *integrations* use — and imports once: same result again =
+`Already` (unique `(account, source_kind, source_id)`), same email =
+`Linked` (blanks filled, nothing doubled). Columns with no field land in
+`notes`. Not to be confused with `crm_connection`/`crm_push`, which push to
+someone else's CRM.
+
 ## Invite-only sign-up (`web/auth.rs`, `store` waitlist fns, `waitlist.sql`)
 
 Closed by default: `HUNTWELL_OPEN_SIGNUP=1` opens it; the first account on an
@@ -96,6 +202,74 @@ account-keyed table to its list), refused while a run is queued or running,
 then the asset bytes and the Cognito user. The operator must type the address;
 the server checks it too. `purge_tests` (ignored; dev DB) fails if any
 `account_id`-like column still points at a deleted account.
+
+**Dev sign-in**: a dev server (`--dev`, never production) signs email `test`
+with an empty password in as `test@huntwell.test` (made on first use;
+`web::auth::dev_login`), because a dev box has no Cognito pool. The sign-in
+form relaxes its fields when `/api/auth/config` says `dev_login`. The admin does the same
+(`admin::api::dev_login_allowed`, `HUNTWELL_DEV`, as `test@huntwell.test`), so `dev.sh` starts the
+console even without an operators' Cognito pool (then with no worker pool, and runs stay local).
+
+## Password reset (`web/auth.rs` `issue_password_reset`, `pages/Auth.tsx` `Forgot`)
+
+"Forgot your password?" and admin → Users → **Send password reset** send the
+same email: a one-click link (`/forgot?token=hwr_…`, its own 192-bit token,
+hash in `account.reset_link_hash`) and a six-digit code for another device,
+both good for `store::RESET_VALID_HOURS` (24). Using either spends both; a new
+reset replaces the last. The link page strips the token from the URL, shows
+whose account it is, and asks only for the new password (twice). The password
+is checked against the pool's rule **before** the link or code is spent, and a
+claimed link is restored if Cognito then refuses — a failed reset never costs
+the person their email. Never put the code in a link.
+
+## Support chat (`web/support.rs`, `admin/api.rs` support, `crate::support`, `components/SupportChat.tsx`)
+
+A "Help" bubble on every page (public site, sign-in, the app) opens a chat;
+operators answer in admin → **Support** (inbox, the chat, who the person is in
+Huntwell: workspace, credit, recent runs). Tables `support_conversation` /
+`support_message`; not tenant data, like `waitlist`.
+
+- **Ways in, never a bare id**: signed in, the session (`/api/support/mine`,
+  one current chat per person); a visitor, a `hwc_` token from `/support/start`, kept
+  in localStorage, sent in JSON bodies only. A visitor's **first step is their
+  name (required), email and Cloudflare Turnstile**; it opens an empty chat,
+  and only the first message posts to Slack (an empty chat is not in the
+  inbox). **No Turnstile secret, no public chat**: `/support/start` refuses and
+  `/api/auth/config` says `support_chat: false` (dev excepted). The row holds its SHA-256 and a
+  sealed copy so a reply email can link back: `/#support=<token>` (a fragment,
+  so no server log sees it); signed-in people get `/app#support`.
+- **Like Alpha Tech's terminal** (`~/Desktop/projects/atech`, `servers/ui_support.rs`): a person has one
+  chat at a time, can **end** it (status `ended`: read-only to them, in "Earlier chats"; an answer still
+  arrives and does not reopen it; not the operator's to reopen) and start a new one. Signed in: the current
+  chat is the newest not ended (`/support/mine`, `?id=` for an earlier one, checked against the account).
+  A visitor: one `hwc_` token per chat; the bubble keeps earlier tokens (`huntwell.support.past`) and
+  `/support/history` lists those. An operator's "Close" is different: writing again reopens it.
+- **Screenshots, and only screenshots** (as in Alpha Tech): the camera button captures the tab
+  (`supportShots.ts`, `getDisplayMedia`; https or localhost, not phones) and `SnapshotRegion` drags out
+  an area. No file upload, no paste. ≤ 4 per message, ≤ 4 MB, type sniffed from the bytes
+  (`store::support_image_type`), kept in `support_attachment`. The bubble fetches one by POST
+  (`/api/support/image`, the visitor's token in the body, never a URL); the admin by
+  `/admin/api/support/image/{id}`. Each is uploaded into the Slack thread (`files:write`), best effort;
+  images posted in Slack do not come back.
+- **Every chat is a Slack thread, both ways** (`support/slack.rs`): a Slack app, set on the Support page
+  (bot token `xoxb-` and the app's **signing secret**, both **sealed** in `control_setting`, and a
+  channel id; the page shows the app manifest with the exact scopes and the Request URL). The parent is
+  "*Name (email)* needs support:" with their words quoted; each later message of theirs is quoted into the
+  thread **and broadcast to the channel**; an answer typed in the admin goes into the thread too
+  (`support_message.slack_ts` empty = still owed; the notification service drains every 2s with the mail
+  backoff). Ending a chat posts "_Name ended this conversation._". A **reply in the thread** is the
+  operator answering: Slack's **Events API** calls `POST /slack/events` on the website
+  (`HUNTWELL_PUBLIC_URL` + that path; Vite proxies `/slack` for a tunnel), `slack::verify_signature`
+  checks it (5-minute window) before anything is read, and it is answered at once and delivered after. It
+  is recorded once per Slack ts, reaches the bubble, is emailed if they are away, and gets a ✅ (plus 📧
+  when emailed). Replies starting `//` stay in Slack; bots, edits and other threads are ignored. Anyone
+  in the channel can answer customers. Everything the person typed is `slack::escape`d; Slack's markup
+  is turned back into plain text (`support::slack::plain`). `HUNTWELL_SLACK_API_BASE` points it at a
+  stand-in, honoured only with `HUNTWELL_DEV` (`support::slack::two_way_tests`).
+- A reply is emailed (`mail::support_reply`) only when the person has not had
+  the chat open for 2 minutes. Starting is `SUPPORT_CHATS` (5/h per address);
+  messages `SUPPORT_MESSAGES` (20 per 10 min per chat). `purge_account` takes a
+  person's chats. Test: `admin::api::support_tests` (ignored; dev DB).
 
 ## Public site and SEO (`cmd/src/web/seo.rs`, `UI/web/src/components/Site.tsx`)
 
@@ -148,8 +322,12 @@ Cursor CLI, unchanged. `pipeline::agent_call` routes on `direct::handles`.
 Cold emails drafted to a prospect, a custom-columns result (`artifact_id`:
 `outreach::recipient_from_record` reads it by column names — an Email-like
 column, else any address in it, fills the To) or a hand-entered person —
-drafted, never sent; the person copies them into their own mail, or opens
-them in Gmail (a compose link, `Outreach.tsx`) or their mail app. One `llm` call per draft or
+drafted, never sent by Huntwell: the person sends them. The draft dialog's
+buttons hand a draft over ready to send — Gmail and Outlook on the web
+(compose links), the mail app (mailto), and LinkedIn (no compose link exists:
+the body is copied and their profile, `outreach.recipient_linkedin` from
+`outreach::linkedin_url`, or a people search opens). No mailbox is connected
+and nothing is automated on LinkedIn — deliberately (its terms forbid it). One `llm` call per draft or
 revision (no tools), model = admin stage **outreach** (`model_outreach`), else
 the newest Claude Sonnet from Anthropic's live model list — never the plan
 drafter's model. Cursor ids cannot serve it. Current Claude models reject
@@ -197,11 +375,27 @@ Webhooks cannot attach files, so there is no CSV in Slack by design.
 - A permanent Slack refusal is written to `plan.slack_last_error` and shown in
   the plan's settings; transient ones retry with the mail backoff.
 
+## Mail (`cmd/src/mail.rs`, `notification.rs`, `mail_outbox`)
+
+Everything is queued (`store::queue_mail`) and the **notification service**
+sends it through Resend (`RESEND_API_KEY`, `HUNTWELL_MAIL_FROM` on a domain
+verified in Resend); without a key it is logged, not sent. A link is built
+with `mail::link_base()`: `HUNTWELL_PUBLIC_URL` where the process has it, else
+`mail::PUBLIC_URL_MARK`, which the service fills in at send — workers never
+have the URL (a run's "new results" alert used to be dropped there, silently).
+No URL on the service either → the mail is held with that reason on its row.
+`dev.sh` sets `http://localhost:$UI_PORT` when global has none.
+A run's alert (`mail::new_records`) shows its new rows as cards
+(`mail::AlertCard`, ≤ 10, ≤ 8 columns each, labels over values so a phone
+never scrolls sideways); everything in a card is scraped, so escaped, and a
+value is a link only if `safe_url`/`safe_email`. `cargo test dump_mail_samples
+-- --ignored` writes every message to `cmd/target/mail-samples/` to look at.
+
 ## Billing rate
 
 Customers pay per million billable (input + output) tokens. The rate is the
 workspace's own `account.sell_usd_per_mtoken` when an operator set one (admin →
-Users → Rate), else `HUNTWELL_SELL_USD_PER_MTOKEN` (default $5). Always price
+Users → Rate), else `HUNTWELL_SELL_USD_PER_MTOKEN` (default $1, the price the Pricing page quotes from `/api/auth/config`). Always price
 through `store::sell_rate` / `effective_sell_rate` — never read the config rate
 directly — so the wallet debit, the live limit, run costs and the admin's
 Charged column agree. A change applies to tokens billed from then on.
@@ -274,6 +468,17 @@ redescribed columns are refused unless `rebuild` is on, and rebuild from them
 (and mark the plan's columns the person's own). Results are keyed by column
 name, so a renamed column is empty for rows found before.
 
+## Admin → Schedule (`admin/api.rs` `schedule` / `schedule_view`)
+
+Every scheduled plan in the installation and its runs in the next 24h / 3d /
+7d, as a list and a Gantt timeline. Run times come from
+`store::fires_between`, which steps `next_fire` — the scheduler's own rule
+(account timezone, chosen days) — so the page cannot disagree with the
+scheduler. A bar's length is the plan's average over its last ten finished
+runs, else a default for its effort (quick 5m, normal 15, thorough 30,
+exhaustive 60). The "runs at once" strip and the peak are held against
+`store::run_capacity` (local pool children + running worker VMs' slots).
+
 ## Plan kinds
 
 `Plan.Kind` decides what a run produces; `store::PlanKind` + `store::plan_ready`
@@ -303,4 +508,4 @@ provider; Slack posts are delivered). When the operators' Cognito pool is set
 (`ADMIN_COGNITO_USER_POOL_ID`/`_CLIENT_ID`) it also starts the admin control
 plane with a process-backed local worker pool (`HUNTWELL_LOCAL_POOL`, default
 2) and runs the server with `RUN_DISPATCH=pool`; without that pool the admin
-is skipped and runs are `RUN_DISPATCH=local`.
+still starts (dev sign-in: email `test`, no password) and runs are `RUN_DISPATCH=local`.

@@ -1,6 +1,8 @@
 import React from 'react'
 import { Link } from 'react-router-dom'
 import { SitePage, useCta } from '../components/Site'
+import LiveDemo from '../components/LiveDemo'
+import { useAuthConfig } from './Auth'
 
 // The public site's inner pages. Every claim here maps to something the app
 // actually does — plan kinds, schedules, the watch skip, signed keys, the
@@ -33,7 +35,7 @@ function Cards({ items }: { items: Card[] }) {
   )
 }
 
-function Section({ title, lede, children }: { title: React.ReactNode; lede?: React.ReactNode; children: React.ReactNode }) {
+function Section({ title, lede, children }: { title: React.ReactNode; lede?: React.ReactNode; children?: React.ReactNode }) {
   return (
     <section className="site-sec">
       <h2>{title}</h2>
@@ -221,8 +223,11 @@ export function UseCases() {
           If it is on the web, <span className="grad-text">ask for it</span>.
         </>
       }
-      lede="People use Huntwell wherever the answer is spread across many pages and copying it out by hand would take an afternoon. A few of the common ones:"
+      lede="Clients use Huntwell to collect information from the internet in real time. Describe what you need and it searches the live web, reads the pages and returns clean, structured results. Put it on a schedule and it keeps collecting as new information appears."
     >
+      <Section title="See one run" lede="Pick an example and watch Huntwell search, read and fill in the results.">
+        <LiveDemo />
+      </Section>
       <div className="site-cases">
         {CASES.map((c) => (
           <article className="site-case" key={c.title}>
@@ -246,41 +251,47 @@ export function UseCases() {
 
 // ---- Pricing -----------------------------------------------------------------
 
-const PRICING_POINTS: Card[] = [
+/// The rate as people read a price: "$1", "$1.50".
+function dollars(n: number) {
+  return Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`
+}
+
+const UPSIDES: Card[] = [
   {
-    title: 'Browsing spends tokens',
-    body: 'Every run opens pages in a real browser, reads them and fills in your fields. That work is measured in tokens — the same unit language models use for input and output.',
+    title: 'No subscription',
+    body: 'Nothing to pay each month just to keep an account. A month you do not search costs nothing.',
     icon: (
       <>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7v5l3 2" />
+        <rect x="3" y="5" width="18" height="16" rx="2" />
+        <path d="M3 10h18M8 3v4M16 3v4" />
       </>
     ),
   },
   {
-    title: 'You pay for what you use',
-    body: 'There is no seat fee and no plan tier. Buy prepaid credits for your workspace; each run debits them as it spends tokens. A quiet run costs less than a deep one.',
+    title: 'No seat fees',
+    body: 'Invite your whole team. More people in the workspace never raises the price. Only the searching does.',
     icon: (
       <>
-        <path d="M12 2v20" />
-        <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+        <circle cx="8" cy="9" r="3" />
+        <circle cx="17" cy="10" r="2.5" />
+        <path d="M2 20a6 6 0 0 1 12 0" />
+        <path d="M15 20a5 5 0 0 1 7-4.6" />
       </>
     ),
   },
   {
-    title: 'Cap any run',
-    body: 'Set a token limit before you start. The run stops there, keeps what it found, and never spends past your credits.',
+    title: 'No tiers to outgrow',
+    body: 'One price for a quick list or a deep weekly search. No plan to upgrade when you need more, and no usage cliff.',
     icon: (
       <>
         <path d="M4 12h16" />
-        <path d="M12 4v16" />
-        <circle cx="12" cy="12" r="9" />
+        <path d="M4 7h16M4 17h16" />
       </>
     ),
   },
   {
-    title: 'See the cost',
-    body: 'Every execution shows the tokens it used and what that came to, so you can tell a cheap search from an expensive one.',
+    title: 'Costs follow the work',
+    body: 'A small search spends little and a big one spends more. A scheduled search can check for anything new first and skip the work when nothing has changed.',
     icon: (
       <>
         <path d="M3 3v18h18" />
@@ -288,26 +299,64 @@ const PRICING_POINTS: Card[] = [
       </>
     ),
   },
+  {
+    title: 'A cap on every run',
+    body: 'Set a limit before a search starts. It stops there, keeps what it found, and never spends past your credit.',
+    icon: (
+      <>
+        <rect x="5" y="11" width="14" height="10" rx="2" />
+        <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+      </>
+    ),
+  },
+  {
+    title: 'See every cent',
+    body: 'Each run shows what it used and what that came to, and what each new result cost, so you can tell a good search from an expensive one.',
+    icon: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v10M9.5 9.5a2.5 2 0 0 1 5 0c0 2.5-5 2-5 4.5a2.5 2 0 0 0 5 0" />
+      </>
+    ),
+  },
 ]
 
 export function Pricing() {
+  // The rate billing actually uses; $1 until the server says otherwise.
+  const rate = dollars(useAuthConfig()?.usd_per_mtoken ?? 1)
   return (
     <SitePage
       eyebrow="Pricing"
       title={
         <>
-          Pay for the pages it <span className="grad-text">reads</span>, not a monthly seat.
+          {rate} per million <span className="grad-text">AI tokens</span>.
         </>
       }
-      lede="Huntwell charges by the tokens a run spends while browsing and filling results. Use more, pay more; use less, pay less."
+      lede="One flat rate. You pay for what you use and nothing else. No subscription, no seat fees, no tiers."
     >
-      <Section title="How billing works" lede="One meter, tied to the work the browser actually does.">
-        <Cards items={PRICING_POINTS} />
-      </Section>
+      <div className="price-card">
+        <div className="price-amount">
+          <span className="price-n">{rate}</span>
+          <span className="price-per">per million AI tokens</span>
+        </div>
+        <ul className="price-list">
+          <li>Every search, every kind of result, the same rate</li>
+          <li>Buy credit up front and each run draws from it as it goes</li>
+          <li>Unused credit stays in your workspace</li>
+          <li>Your whole team included</li>
+        </ul>
+      </div>
+
       <Section
-        title="Ready when you are"
-        lede="Add a card, buy credits, and the next run draws from them. Unused credits stay in the workspace."
-      >
+        title="What is an AI token?"
+        lede="Tokens are how AI measures the work it does. When Huntwell searches for you, the AI reads web pages and writes your results, and every word it reads or writes is counted in small pieces called tokens. A token is about three quarters of a word, so a million AI tokens is roughly 750,000 words."
+      />
+
+      <Section title="Why pay this way" lede="You pay for the searching Huntwell does for you, and for nothing that sits idle.">
+        <Cards items={UPSIDES} />
+      </Section>
+
+      <Section title="Ready when you are" lede="Add a card, buy credit, and your next search draws from it.">
         <CtaRow />
       </Section>
     </SitePage>

@@ -137,6 +137,111 @@ export function Field({
   )
 }
 
+/// A password box with Show / Hide. For choosing a password above all: a
+/// browser may fill one in itself, and someone who never saw it cannot sign in
+/// anywhere else — Show lets them read (or retype) what is about to be saved.
+export function PasswordInput({
+  value,
+  onChange,
+  autoComplete,
+  minLength,
+  required,
+}: {
+  value: string
+  onChange: (v: string) => void
+  autoComplete: 'new-password' | 'current-password'
+  minLength?: number
+  required?: boolean
+}) {
+  const [shown, setShown] = useState(false)
+  return (
+    <div className="pw-field">
+      <input
+        type={shown ? 'text' : 'password'}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        autoComplete={autoComplete}
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        minLength={minLength}
+        required={required}
+      />
+      <button
+        type="button"
+        className="pw-toggle"
+        onClick={() => setShown((v) => !v)}
+        aria-pressed={shown}
+        aria-label={shown ? 'Hide password' : 'Show password'}
+      >
+        {shown ? 'Hide' : 'Show'}
+      </button>
+    </div>
+  )
+}
+
+/// The rule the identity pool enforces (`identity::check_password_strength`).
+export const PASSWORD_RULE = 'At least 12 characters, with upper and lower case and a digit.'
+
+/// `PASSWORD_RULE` as the pool checks it — so a form never submits a password
+/// that will be refused (on the reset page that would cost them their code).
+export const passwordStrong = (p: string) => [...p].length >= 12 && /\p{Ll}/u.test(p) && /\p{Lu}/u.test(p) && /[0-9]/.test(p)
+
+/// Strong, both boxes filled in and the same — the gate on every "choose a
+/// password" form's submit, so a slip of the finger can't become a password
+/// nobody knows.
+export const passwordsMatch = (password: string, confirm: string) => passwordStrong(password) && password === confirm
+
+/// Choosing a password: the password, then the same again. Says "don't match"
+/// only once the second can no longer be on its way to matching the first, so
+/// it doesn't nag while they type. The form disables its submit until
+/// `passwordsMatch`.
+export function NewPasswordFields({
+  label = 'Password',
+  value,
+  onChange,
+  confirm,
+  onConfirm,
+}: {
+  label?: string
+  value: string
+  onChange: (v: string) => void
+  confirm: string
+  onConfirm: (v: string) => void
+}) {
+  const mismatch = confirm.length > 0 && confirm !== value && !value.startsWith(confirm)
+  const matched = passwordsMatch(value, confirm)
+  // Red once they have moved on to the second box with a password the rule
+  // refuses — not while the first is still being typed.
+  const weak = value.length > 0 && confirm.length > 0 && !passwordStrong(value)
+  return (
+    <>
+      <div className="field">
+        <label>{label}</label>
+        <PasswordInput value={value} onChange={onChange} autoComplete="new-password" required minLength={12} />
+        <div className={weak ? 'hint bad' : 'hint'} role={weak ? 'alert' : undefined}>
+          {weak ? `Not strong enough. ${PASSWORD_RULE}` : PASSWORD_RULE}
+        </div>
+      </div>
+      <div className="field">
+        <label>Confirm {label.toLowerCase()}</label>
+        <PasswordInput value={confirm} onChange={onConfirm} autoComplete="new-password" required />
+        {mismatch ? (
+          <div className="hint bad" role="alert">
+            The passwords don't match.
+          </div>
+        ) : matched ? (
+          <div className="hint ok">Passwords match.</div>
+        ) : confirm.length > 0 && confirm === value ? (
+          <div className="hint">They match.</div>
+        ) : (
+          <div className="hint">Type it again to make sure.</div>
+        )}
+      </div>
+    </>
+  )
+}
+
 /// The dimmed, blurred sheet. Portaled to `document.body` so a parent
 /// transform or overflow (the results pane) cannot trap `position: fixed`.
 export function ModalBackdrop({

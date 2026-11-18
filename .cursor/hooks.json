@@ -3,62 +3,62 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "sessionEnd": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "stop": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "afterAgentResponse": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "preToolUse": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "postToolUse": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "afterShellExecution": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "subagentStop": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "afterAgentThought": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ],
     "subagentStart": [
       {
-        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 22"
+        "command": "/Users/mhalko/.multi-dev/bin/mdhook hook --thread-id 8"
       }
     ]
   }

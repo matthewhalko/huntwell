@@ -8,6 +8,7 @@ import { useDraftOutreach } from './Outreach'
 import { MapIcon } from '../components/icons'
 import Grid, { LINK_COLUMN, useNarrow } from '../components/Grid'
 import type { ColDef } from 'ag-grid-community'
+import { AddToCrm } from './Crm'
 
 
 export function ProspectTable({ planId }: { planId?: number }) {
@@ -132,7 +133,7 @@ export function ProspectTable({ planId }: { planId?: number }) {
         <div className="row">
           <input type="text" placeholder="Search name, company, email…" value={q} onChange={(e) => (setPage(0), setQ(e.target.value))} style={{ width: 260 }} />
           <input type="number" placeholder="Min value" min={0} value={minValue || ''} onChange={(e) => (setPage(0), setMinValue(+e.target.value || 0))} style={{ width: 130 }} />
-          {rows === null ? <Loading inline /> : <span className="muted">{total} artifacts</span>}
+          {rows === null ? <Loading inline /> : <span className="muted">{total} {total === 1 ? 'result' : 'results'}</span>}
         </div>
         <div className="row">
           <a className="btn" href={csvUrl()}>
@@ -198,6 +199,7 @@ export function ProspectTable({ planId }: { planId?: number }) {
                 <button className="btn primary sm" onClick={() => outreach.start(open.prospect_id)} disabled={outreach.busy}>
                   {outreach.busy ? 'Writing…' : 'Draft outreach'}
                 </button>
+                <AddToCrm key={open.prospect_id} prospectId={open.prospect_id} />
               </span>
             )
           }
@@ -412,6 +414,7 @@ function UnifiedResults({ q }: { q: string }) {
                 >
                   {outreach.busy ? 'Writing…' : 'Draft outreach'}
                 </button>
+                <AddToCrm key={`${open.kind}-${open.id}`} {...(open.kind === 'artifact' ? { artifactId: open.id } : { prospectId: open.id })} />
               </span>
             )
           }

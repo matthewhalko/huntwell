@@ -6,6 +6,8 @@ import { ResultDialog } from './ResultDialog'
 import { useDraftOutreach } from '../pages/Outreach'
 import { Loading } from './ui'
 import Grid, { LINK_COLUMN, useNarrow } from './Grid'
+import { useLoadView } from './Skeleton'
+import { AddToCrm } from '../pages/Crm'
 
 const NUMERIC = (t: string) => t === 'money' || t === 'number'
 
@@ -79,7 +81,9 @@ export function ArtifactTable({ planId }: { planId: number }) {
     // is one tap away in the row's dialog.
     const title = cols.find((f) => f.role === 'title') || cols.find((f) => f.type === 'text') || cols[0]
     const figure = cols.find((f) => NUMERIC(f.type))
-    const kept = (f: FieldSpec) => !narrow || f === title || f === figure
+    // Every column, phone or not: a phone shows these rows as cards (Grid),
+    // which have room for all of them.
+    const kept = (_f: FieldSpec) => true
     const out: ColDef<Artifact>[] = cols.filter(kept).map((f) => {
       const base: ColDef<Artifact> = {
         colId: f.key,
@@ -97,7 +101,7 @@ export function ArtifactTable({ planId }: { planId: number }) {
       if (f.type === 'longtext') return { ...base, flex: 2 }
       return { ...base, flex: f.role === 'title' ? 1.6 : 1.1 }
     })
-    if (write && !narrow) {
+    if (write) {
       out.push({
         colId: 'delete',
         headerName: '',
@@ -127,7 +131,8 @@ export function ArtifactTable({ planId }: { planId: number }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schema, write, narrow])
 
-  if (rows === null) return <Loading />
+  const rowsView = useLoadView(rows !== null)
+  if (rows === null || rowsView !== 'ready') return rowsView === 'skeleton' ? <Loading /> : null
 
   return (
     <>
@@ -201,6 +206,7 @@ export function ArtifactTable({ planId }: { planId: number }) {
                 <button className="btn primary sm" onClick={() => outreach.start({ artifact_id: open.artifact_id })} disabled={outreach.busy}>
                   {outreach.busy ? 'Writing…' : 'Draft outreach'}
                 </button>
+                <AddToCrm key={open.artifact_id} artifactId={open.artifact_id} />
               </span>
             )
           }

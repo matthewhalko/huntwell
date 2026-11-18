@@ -28,6 +28,8 @@ execution.sql
 execution_log.sql
 api_key.sql
 api_audit.sql
+# Sign-in codes for the Chrome extension (exchanged for an api_key).
+extension_grant.sql
 account_browser.sql
 account_usage.sql
 credit_purchase.sql
@@ -39,4 +41,15 @@ admin_user.sql
 route_log.sql
 mail_outbox.sql
 slack_outbox.sql
+# CRMs a workspace connected, which plans push to them, and what was pushed.
+crm_connection.sql
+plan_crm.sql
+crm_push.sql
+# The built-in CRM (the `crm` module): contacts and what happened with them.
+contact.sql
+contact_activity.sql
+# Support chats from the site and the app, answered in admin → Support.
+support_conversation.sql
+support_message.sql
+support_attachment.sql
 setting.sql

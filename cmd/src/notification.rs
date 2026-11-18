@@ -62,8 +62,7 @@ async fn on_draft_failed(db: &Db, event: &crate::bus::Event) -> Result<()> {
         .await?
         .map(|p| p.source)
         .unwrap_or_else(|| format!("plan {plan_id}"));
-    let base = crate::config::get("HUNTWELL_PUBLIC_URL").unwrap_or_default();
-    let link = format!("{}/app/plans/{}", base.trim_end_matches('/'), plan_id);
+    let link = format!("{}/app/plans/{}", crate::mail::link_base(), plan_id);
     let msg = crate::mail::draft_failed(&plan_name, &link);
     crate::store::queue_mail(db, Some(account_id), &acc.email, "draft_failed", &msg).await?;
     tracing::info!(plan_id, account_id, "queued a draft-failure notice");
@@ -77,6 +76,17 @@ pub async fn serve(db: Db) -> Result<()> {
         tracing::warn!("no mail provider configured — queued mail will be logged, not delivered");
     }
     let mut tick = tokio::time::interval(Duration::from_secs(5));
+    // Support chats are a conversation, so their Slack threads keep up faster
+    // than the mail. Replies typed in Slack reach the website (`/slack/events`).
+    tokio::spawn({
+        let db = db.clone();
+        async move {
+            loop {
+                crate::support::slack::drain(&db).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    });
     tracing::info!("notification service ready");
     loop {
         tick.tick().await;
@@ -92,9 +102,20 @@ pub async fn serve(db: Db) -> Result<()> {
                     break;
                 }
             };
+            // A run on a worker queued its link with a mark only this service
+            // can fill. Without the setting here it cannot be fixed by retrying:
+            // held, with the reason on the row and in the log.
+            let email = match crate::mail::with_public_url(&mail.email, crate::config::get("HUNTWELL_PUBLIC_URL").as_deref()) {
+                Ok(e) => e,
+                Err(why) => {
+                    tracing::error!(mail_id = mail.mail_id, to = mail.to, "not sent: {why}");
+                    let _ = store::mark_mail_failed(&db, mail.mail_id, why, None).await;
+                    continue;
+                }
+            };
             // Keyed by the row, so a send that succeeded but could not be recorded
             // is not a second email when its lease expires and it is sent again.
-            match crate::mail::send_keyed(&mail.to, &mail.email, Some(&format!("huntwell-mail-{}", mail.mail_id))).await {
+            match crate::mail::send_keyed(&mail.to, &email, Some(&format!("huntwell-mail-{}", mail.mail_id))).await {
                 Ok(()) => {
                     if let Err(e) = store::mark_mail_sent(&db, mail.mail_id).await {
                         // Sent but not recorded: the lease will expire and it

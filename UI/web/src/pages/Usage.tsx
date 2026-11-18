@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { AutoReloadCard } from '../components/AutoReloadCard'
-import { SkeletonRows } from '../components/Skeleton'
+import { SkeletonRows, useLoadView } from '../components/Skeleton'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ago, api, Billing, can, fmtDate, fmtTokens, money, Overview, Prospect, Run, Usage as UsageT, usd } from '../api'
 import { useAuth } from '../auth'
@@ -132,6 +132,7 @@ export default function Usage() {
 
   const o = data?.overview
 
+  const usageView = useLoadView(billing !== null && usage !== null)
   return (
     <>
       <div className="page-head">
@@ -153,7 +154,8 @@ export default function Usage() {
         </div>
       )}
 
-      {(billing === null || usage === null) && !loadFailed ? (
+      {(billing === null || usage === null || usageView !== 'ready') && !loadFailed ? (
+        usageView !== 'skeleton' ? null : 
         // Until the card and the balance are known: their shape, not an "Add
         // payment method" button that vanishes a moment later.
         <div aria-busy="true" aria-label="Loading">

@@ -55,7 +55,115 @@ export const LINK_COLUMN = {
   sortable: false,
 } as const
 
-export default function Grid<T>({ rows, columns, getRowId, onRowClick, visibleRows = 12, fill, loading, options }: GridProps<T>) {
+/// A column's value for one row, read the way AG Grid would: its valueGetter,
+/// else its field.
+function valueOf<T>(col: ColDef<T>, row: T): unknown {
+  if (typeof col.valueGetter === 'function') {
+    try {
+      return (col.valueGetter as (p: { data: T }) => unknown)({ data: row })
+    } catch {
+      return undefined
+    }
+  }
+  if (typeof col.field === 'string') {
+    return col.field.split('.').reduce<unknown>((v, k) => (v && typeof v === 'object' ? (v as Record<string, unknown>)[k] : undefined), row)
+  }
+  return undefined
+}
+
+/// What a column shows for a row: its cellRenderer (given the same
+/// `{ value, data }` it gets in the grid), else its valueFormatter, else the
+/// value itself. `null` when there is nothing to show.
+function shownOf<T>(col: ColDef<T>, row: T): React.ReactNode {
+  const value = valueOf(col, row)
+  if (typeof col.cellRenderer === 'function') {
+    return React.createElement(col.cellRenderer as React.ComponentType<{ value: unknown; data: T }>, { value, data: row })
+  }
+  if (value === null || value === undefined || value === '') return null
+  if (typeof col.valueFormatter === 'function') {
+    const s = (col.valueFormatter as (p: { value: unknown; data: T }) => string)({ value, data: row })
+    return s === '' ? null : s
+  }
+  return String(value)
+}
+
+const blank = (v: unknown) => v === null || v === undefined || v === ''
+
+/**
+ * Phone width: the same rows as cards. A grid with several columns cannot fit
+ * a phone without dropping most of them; a card keeps them all. The first
+ * column is the card's title, every other titled column is a label and its
+ * value (left out when empty), and untitled columns — a link, a delete
+ * button — sit along the card's foot. Columns render exactly as in the grid,
+ * so a page needs no second description of its data.
+ */
+function GridCards<T>({ rows, columns, getRowId, onRowClick, fill }: GridProps<T>) {
+  const [title, ...rest] = columns
+  const fields = rest.filter((c) => (c.headerName ?? '').trim() !== '')
+  const actions = rest.filter((c) => (c.headerName ?? '').trim() === '')
+  return (
+    <div className={'grid-cards' + (fill ? ' fill' : '')} role="list">
+      {rows.map((row, i) => {
+        const open = onRowClick ? () => onRowClick(row) : undefined
+        return (
+          <div
+            key={getRowId ? getRowId(row) : i}
+            role="listitem"
+            className={'grid-card' + (open ? ' clickable' : '')}
+            tabIndex={open ? 0 : undefined}
+            onClick={(e) => {
+              const t = e.target as HTMLElement
+              if (t.closest('a,button,input,textarea,select')) return
+              open?.()
+            }}
+            onKeyDown={(e) => {
+              if (open && (e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+                e.preventDefault()
+                open()
+              }
+            }}
+          >
+            {title && <div className="grid-card-title">{shownOf(title, row) ?? '—'}</div>}
+            {fields.length > 0 && (
+              <dl className="grid-card-fields">
+                {fields.map((c, n) => {
+                  // Empty is left out, even where the column would draw a "—":
+                  // on a card that is a line saying nothing. A column with no
+                  // field or getter can only be judged by what it renders.
+                  const sourced = typeof c.valueGetter === 'function' || typeof c.field === 'string'
+                  if (sourced && blank(valueOf(c, row))) return null
+                  const shown = shownOf(c, row)
+                  if (shown === null) return null
+                  return (
+                    <React.Fragment key={c.colId ?? c.field ?? n}>
+                      <dt>{c.headerName}</dt>
+                      <dd>{shown}</dd>
+                    </React.Fragment>
+                  )
+                })}
+              </dl>
+            )}
+            {actions.length > 0 && (
+              <div className="grid-card-actions">
+                {actions.map((c, n) => (
+                  <React.Fragment key={c.colId ?? c.field ?? n}>{shownOf(c, row)}</React.Fragment>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+export default function Grid<T>(props: GridProps<T>) {
+  const narrow = useNarrow()
+  if (narrow && !(props.loading && props.rows.length === 0)) return <GridCards {...props} />
+  return <TableGrid {...props} />
+}
+
+function TableGrid<T>({ rows, columns, getRowId, onRowClick, visibleRows = 12, fill, loading, options }: GridProps<T>) {
   // Sensible for every table we have: sortable, resizable, and text that is
   // too long ellipsises rather than pushing the column wide. Every column
   // flexes by default, so together they always fill the grid exactly, in the

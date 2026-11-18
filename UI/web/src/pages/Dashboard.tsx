@@ -200,7 +200,6 @@ export default function Dashboard() {
             onKeyDown={onKey}
             rows={3}
             placeholder={ph}
-            autoFocus
           />
           <div className="ask-actions">
             <span className="muted sm">

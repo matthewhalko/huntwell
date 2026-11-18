@@ -40,3 +40,20 @@ ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS design_id bigint REFERENCES
 -- The custom-schema row a draft was written to (2026-10-06): any result can
 -- be drafted to, not only a prospect, and its Email column fills the To.
 ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS artifact_id bigint REFERENCES public.artifact (artifact_id) ON DELETE SET NULL;
+
+-- The recipient's LinkedIn profile, when the record had one (2026-10-13):
+-- "Open in LinkedIn" goes straight to it with the message copied.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS recipient_linkedin text NOT NULL DEFAULT '';
+
+-- Sending through the Huntwell Chrome extension (2026-10-20). A draft is
+-- queued for a channel; the extension opens the person's page, fills the
+-- message, and the person presses Send — Huntwell never does. `sent_at` /
+-- `sent_via` record that it went (seen by the extension, or marked by hand).
+-- The person's Reddit username, without "u/"; LinkedIn has its own column above.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS recipient_reddit varchar(40) NOT NULL DEFAULT '';
+-- '' (not queued) | 'linkedin' | 'reddit'.
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS send_channel varchar(16) NOT NULL DEFAULT '';
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS queued_at timestamptz;
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS sent_at timestamptz;
+ALTER TABLE public.outreach ADD COLUMN IF NOT EXISTS sent_via varchar(16) NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS outreach_queue_idx ON public.outreach (account_id, queued_at) WHERE send_channel <> '' AND sent_at IS NULL;

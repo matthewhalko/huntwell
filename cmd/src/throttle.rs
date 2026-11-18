@@ -120,6 +120,14 @@ pub static VERIFY_RESENDS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
 /// Operator sign-in failures, per address. Tighter: there is one operator.
 pub static ADMIN_LOGIN_FAILURES: Limiter = Limiter::new(5, 15 * 60, 15 * 60);
 
+/// Support chats started, per address (a visitor) or account: five an hour.
+/// Each one posts to the operators' Slack, so a script must not fill it.
+pub static SUPPORT_CHATS: Limiter = Limiter::new(5, 60 * 60, 60 * 60);
+
+/// Messages in one support chat: twenty in ten minutes. Plenty for a person
+/// typing, and a ceiling on anyone pasting into it in a loop.
+pub static SUPPORT_MESSAGES: Limiter = Limiter::new(20, 10 * 60, 10 * 60);
+
 #[cfg(test)]
 mod tests {
     use super::*;

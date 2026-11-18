@@ -442,22 +442,80 @@ pub async fn verify_email_code(db: &Db, account_id: i64, code_hash: &str) -> Res
     Ok(CodeCheck::Wrong { left })
 }
 
-/// Record the password-reset code just sent for `email`. Nothing happens for
-/// an address with no account — and the caller says nothing either way.
-pub async fn set_reset_token(db: &Db, email: &str, code_hash: &str) -> Result<Option<Account>> {
+/// How long a password reset — its code and its link — stays good. A day,
+/// not the sign-up code's 15 minutes: a reset is often sent by an operator to
+/// someone who reads it later. Guessing is no easier for it: the code still
+/// takes five wrong tries, and the link is a long random token.
+pub const RESET_VALID_HOURS: i64 = 24;
+
+/// Record the password reset just sent for `email`: its code's hash and its
+/// link's. A new one replaces the last. Nothing happens for an address with no
+/// account — and the caller says nothing either way.
+pub async fn set_reset_token(db: &Db, email: &str, code_hash: &str, link_hash: &str) -> Result<Option<Account>> {
     let row = sqlx::query(&format!(
-        r#"UPDATE account SET reset_token_hash=$2, reset_sent_at=now(), reset_attempts=0
+        r#"UPDATE account SET reset_token_hash=$2, reset_link_hash=$3, reset_sent_at=now(), reset_attempts=0
            WHERE email=$1 RETURNING {ACCOUNT_COLS}"#
     ))
     .bind(email.trim().to_lowercase())
     .bind(code_hash)
+    .bind(link_hash)
     .fetch_optional(db)
     .await?;
     row.map(|r| Account::from_row(&r).map_err(Into::into)).transpose()
 }
 
-/// Check a reset code for `email`. Same discipline as the sign-up code: 15
-/// minutes, five guesses, constant-time on the hash, and a spent code is
+/// The account a reset link is for, while it is good — for the reset page to
+/// say whose password is being set. Looking does not spend it.
+pub async fn reset_link_account(db: &Db, link_hash: &str) -> Result<Option<Account>> {
+    if link_hash.is_empty() {
+        return Ok(None);
+    }
+    let row = sqlx::query(&format!(
+        r#"SELECT {ACCOUNT_COLS} FROM account
+           WHERE reset_link_hash=$1 AND reset_sent_at > now() - make_interval(hours => $2::int)"#
+    ))
+    .bind(link_hash)
+    .bind(RESET_VALID_HOURS as i32)
+    .fetch_optional(db)
+    .await?;
+    row.map(|r| Account::from_row(&r).map_err(Into::into)).transpose()
+}
+
+/// Spend a reset link: atomically, so two submits cannot both have it. Clears
+/// the code too (one reset, two ways in), and — like the code — proves the
+/// address. `restore_reset_link` puts it back if the password then could not
+/// be set.
+pub async fn claim_reset_link(db: &Db, link_hash: &str) -> Result<Option<Account>> {
+    if link_hash.is_empty() {
+        return Ok(None);
+    }
+    let row = sqlx::query(&format!(
+        r#"UPDATE account SET reset_link_hash='', reset_token_hash='', reset_attempts=0,
+                  email_verified_at=COALESCE(email_verified_at, now())
+           WHERE reset_link_hash=$1 AND reset_sent_at > now() - make_interval(hours => $2::int)
+           RETURNING {ACCOUNT_COLS}"#
+    ))
+    .bind(link_hash)
+    .bind(RESET_VALID_HOURS as i32)
+    .fetch_optional(db)
+    .await?;
+    row.map(|r| Account::from_row(&r).map_err(Into::into)).transpose()
+}
+
+/// Un-spend a claimed link after the identity store refused the new password
+/// (or was down), so the person can try again from the same email — unless a
+/// newer reset has been sent meanwhile.
+pub async fn restore_reset_link(db: &Db, account_id: i64, link_hash: &str) -> Result<()> {
+    sqlx::query(r#"UPDATE account SET reset_link_hash=$2 WHERE account_id=$1 AND reset_link_hash=''"#)
+        .bind(account_id)
+        .bind(link_hash)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Check a reset code for `email`. Same discipline as the sign-up code — five
+/// guesses (but good for `RESET_VALID_HOURS`), constant-time on the hash, and a spent code is
 /// wiped so nothing is gained by trying on. On success the code is consumed;
 /// the caller then sets the password.
 pub async fn check_reset_code(db: &Db, email: &str, code_hash: &str) -> Result<CodeCheck> {
@@ -469,14 +527,15 @@ pub async fn check_reset_code(db: &Db, email: &str, code_hash: &str) -> Result<C
     .fetch_optional(db)
     .await?;
     let Some((account_id, hash, sent_at, attempts)) = row else { return Ok(CodeCheck::NeedNew) };
-    let fresh = sent_at.is_some_and(|t| Utc::now() - t < chrono::Duration::minutes(VERIFY_CODE_MINUTES));
+    let fresh = sent_at.is_some_and(|t| Utc::now() - t < chrono::Duration::hours(RESET_VALID_HOURS));
     if hash.trim().is_empty() || !fresh || attempts >= VERIFY_MAX_ATTEMPTS {
         return Ok(CodeCheck::NeedNew);
     }
     if constant_time_eq(hash.trim().as_bytes(), code_hash.as_bytes()) {
-        // Consumed — and the address is proven, which is what verification asks.
+        // Consumed, and the link with it — and the address is proven, which
+        // is what verification asks.
         let row = sqlx::query(&format!(
-            r#"UPDATE account SET reset_token_hash='', reset_attempts=0,
+            r#"UPDATE account SET reset_token_hash='', reset_link_hash='', reset_attempts=0,
                       email_verified_at=COALESCE(email_verified_at, now())
                WHERE account_id=$1 RETURNING {ACCOUNT_COLS}"#
         ))
@@ -1199,10 +1258,18 @@ pub async fn purge_account(db: &Db, account_id: i64) -> Result<Purge> {
         r#"DELETE FROM invite WHERE workspace_id=$1"#,
         r#"DELETE FROM api_key WHERE account_id=$1 OR created_by=$1"#,
         r#"DELETE FROM api_audit WHERE account_id=$1"#,
+        r#"DELETE FROM extension_grant WHERE account_id=$1 OR person_id=$1"#,
         r#"UPDATE outreach_version SET created_by=NULL WHERE created_by=$1 AND account_id<>$1"#,
         r#"DELETE FROM outreach_version WHERE account_id=$1"#,
         r#"DELETE FROM outreach WHERE account_id=$1"#,
         r#"DELETE FROM outreach_profile WHERE account_id=$1"#,
+        r#"DELETE FROM crm_push WHERE account_id=$1"#,
+        r#"DELETE FROM plan_crm WHERE account_id=$1"#,
+        r#"DELETE FROM crm_connection WHERE account_id=$1"#,
+        r#"DELETE FROM contact_activity WHERE account_id=$1"#,
+        r#"DELETE FROM contact WHERE account_id=$1"#,
+        r#"DELETE FROM support_conversation WHERE account_id=$1"#,
+        r#"UPDATE support_conversation SET workspace_id=NULL WHERE workspace_id=$1"#,
         r#"DELETE FROM plan WHERE account_id=$1"#,
         // Belt and braces: anything still carrying the account's id after its
         // plans went.
@@ -3986,6 +4053,111 @@ pub fn next_fire(time: &str, days: &str, tz_name: &str, now: DateTime<Utc>) -> O
     None
 }
 
+/// A scheduled plan as the operator's schedule view shows it, across every
+/// workspace: who it belongs to, when it fires, and how long its runs take.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledPlan {
+    pub plan_id: i64,
+    pub account_id: i64,
+    pub plan: String,
+    pub owner_email: String,
+    pub timezone: String,
+    pub schedule_time: String,
+    pub schedule_days: String,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub effort: String,
+    /// Mean of its last ten finished runs, in minutes; `None` without history.
+    pub avg_minutes: Option<f64>,
+    pub runs_measured: i64,
+    pub last_status: String,
+    pub last_started_at: Option<DateTime<Utc>>,
+}
+
+/// Every plan with a schedule switched on, in every workspace. Operator-only:
+/// the admin's schedule page, which is the whole installation's.
+pub async fn all_scheduled_plans(db: &Db) -> Result<Vec<ScheduledPlan>> {
+    let rows = sqlx::query(
+        r#"SELECT p.plan_id, p.account_id, p.source, coalesce(a.email,'') AS email, coalesce(nullif(a.timezone,''),'UTC') AS tz,
+                  p.schedule_time, p.schedule_days, p.next_run_at, p.effort,
+                  d.avg_minutes, coalesce(d.n,0) AS n,
+                  coalesce(l.status,'') AS last_status, l.started_at AS last_started_at
+           FROM plan p
+           LEFT JOIN account a ON a.account_id = p.account_id
+           LEFT JOIN LATERAL (
+               SELECT avg(extract(epoch FROM (r.finished_at - r.started_at)) / 60.0)::float8 AS avg_minutes, count(*) AS n
+               FROM (SELECT started_at, finished_at FROM execution
+                     WHERE plan_id = p.plan_id AND finished_at IS NOT NULL AND status = 'succeeded'
+                     ORDER BY execution_id DESC LIMIT 10) r
+           ) d ON true
+           LEFT JOIN LATERAL (
+               SELECT status, started_at FROM execution WHERE plan_id = p.plan_id ORDER BY execution_id DESC LIMIT 1
+           ) l ON true
+           WHERE p.schedule_enabled AND p.schedule_time <> ''
+           ORDER BY p.next_run_at NULLS LAST, p.plan_id"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ScheduledPlan {
+            plan_id: r.get("plan_id"),
+            account_id: r.get("account_id"),
+            plan: r.get("source"),
+            owner_email: r.get("email"),
+            timezone: r.get("tz"),
+            schedule_time: r.get("schedule_time"),
+            schedule_days: r.get("schedule_days"),
+            next_run_at: r.get("next_run_at"),
+            effort: r.get("effort"),
+            avg_minutes: r.get("avg_minutes"),
+            runs_measured: r.get("n"),
+            last_status: r.get("last_status"),
+            last_started_at: r.get("last_started_at"),
+        })
+        .collect())
+}
+
+/// Runs going or waiting right now, across every workspace, for the timeline.
+/// (execution_id, plan_id, plan name, status, started_at)
+pub async fn active_runs_all(db: &Db) -> Result<Vec<(i64, i64, String, String, DateTime<Utc>)>> {
+    Ok(sqlx::query_as(
+        r#"SELECT e.execution_id, e.plan_id, p.source, e.status, e.started_at
+           FROM execution e JOIN plan p ON p.plan_id = e.plan_id
+           WHERE e.status IN ('queued','running') ORDER BY e.started_at"#,
+    )
+    .fetch_all(db)
+    .await?)
+}
+
+/// How many runs the installation can execute at once: the local process
+/// pool's children plus every running worker VM's slots, on enabled hosts.
+pub async fn run_capacity(db: &Db) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"SELECT (coalesce((SELECT sum(pool_size) FROM host WHERE enabled AND endpoint = ''), 0)
+                 + coalesce((SELECT sum(v.slots) FROM vm v JOIN host h ON h.host_id = v.host_id
+                             WHERE h.enabled AND v.role = 'worker' AND v.status = 'Running'), 0))::bigint"#,
+    )
+    .fetch_one(db)
+    .await?)
+}
+
+/// Every time a schedule fires in `[from, to)`, by the same rule the scheduler
+/// uses (`next_fire`), capped so a mistake cannot produce a flood.
+pub fn fires_between(time: &str, days: &str, tz: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    let mut cursor = from - Duration::seconds(1);
+    while out.len() < 64 {
+        match next_fire(time, days, tz, cursor) {
+            Some(t) if t < to => {
+                out.push(t);
+                cursor = t + Duration::seconds(1);
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
 pub async fn refresh_schedule(db: &Db, plan_id: i64) -> Result<Option<DateTime<Utc>>> {
     let row = sqlx::query(
         r#"SELECT schedule_enabled, schedule_time, schedule_days, account_id
@@ -4076,6 +4248,8 @@ pub struct ApiKeyRow {
     pub uses: i64,
     pub revoked: bool,
     pub expired: bool,
+    /// 'signed' (the /v1 API) or 'mcp' (the /mcp endpoint, for Claude).
+    pub kind: String,
     #[serde(skip)]
     pub account_id: i64,
     /// The teammate who made it; `None` for older keys and operator-issued ones.
@@ -4089,7 +4263,7 @@ pub fn new_api_token() -> String {
 }
 
 const KEY_COLS: &str = r#"k.key_id, k.secret_sealed, k.token_hint, k.label, k.plan_id, coalesce(p.source,'') AS source, k.allow_cidr,
-k.expires_at, k.created_at, k.last_used_at, k.last_used_ip, k.uses, k.revoked, k.account_id, k.created_by,
+k.expires_at, k.created_at, k.last_used_at, k.last_used_ip, k.uses, k.revoked, k.account_id, k.created_by, k.kind,
 (k.expires_at IS NOT NULL AND k.expires_at <= now()) AS expired"#;
 
 fn key_from(r: &sqlx::postgres::PgRow) -> ApiKeyRow {
@@ -4110,6 +4284,7 @@ fn key_from(r: &sqlx::postgres::PgRow) -> ApiKeyRow {
         uses: r.get::<i32, _>("uses") as i64,
         revoked: r.get("revoked"),
         expired: r.get("expired"),
+        kind: r.get("kind"),
         account_id: r.get("account_id"),
         created_by: r.get("created_by"),
     }
@@ -4123,6 +4298,7 @@ pub async fn create_api_key(
     plan_id: Option<i64>,
     expires_in_days: i64,
     allow_cidr: &str,
+    mcp: bool,
 ) -> Result<ApiKeyRow> {
     if let Some(pid) = plan_id {
         if get_plan(db, account_id, pid).await?.is_none() {
@@ -4130,18 +4306,20 @@ pub async fn create_api_key(
         }
     }
     crate::cidr::parse_list(allow_cidr).map_err(|e| anyhow!("allowed addresses: {e}"))?;
-    let token = new_api_token();
+    // An MCP key is the bearer credential itself (Claude cannot sign), so it
+    // has no secret, a prefix that says what it is, and works only at /mcp.
+    let token = if mcp { new_api_token().replacen("psk_", "hwm_", 1) } else { new_api_token() };
     let hash = sha256_hex(&token);
     let hint: String = token.chars().take(12).collect();
     // A signing secret, sealed for storage. `None` when the deployment has no
     // signing key configured — the key then works as a bearer token, which is
     // how every key worked before signing existed.
     let secret = crate::web::signing::new_secret();
-    let sealed = crate::web::signing::seal_secret(&secret);
+    let sealed = if mcp { None } else { crate::web::signing::seal_secret(&secret) };
     let expires = (expires_in_days > 0).then(|| Utc::now() + Duration::days(expires_in_days));
     let key_id: i64 = sqlx::query_scalar(
-        r#"INSERT INTO api_key (account_id,plan_id,token_hash,token_hint,label,allow_cidr,expires_at,secret_sealed,created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING key_id"#,
+        r#"INSERT INTO api_key (account_id,plan_id,token_hash,token_hint,label,allow_cidr,expires_at,secret_sealed,created_by,kind)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING key_id"#,
     )
     .bind(account_id)
     .bind(plan_id)
@@ -4152,6 +4330,7 @@ pub async fn create_api_key(
     .bind(expires)
     .bind(&sealed)
     .bind(created_by)
+    .bind(if mcp { "mcp" } else { "signed" })
     .fetch_one(db)
     .await?;
     let mut row = get_api_key(db, account_id, key_id).await?.ok_or_else(|| anyhow!("key vanished"))?;
@@ -5086,6 +5265,53 @@ pub async fn set_connected_logins(db: &Db, account_id: i64, on: bool) -> Result<
     Ok(())
 }
 
+/// Optional modules an operator can switch on per workspace: (id, name).
+/// `crm` is the built-in CRM (`web::contacts`). A module not listed here is
+/// dropped on save, so a typo can never switch on something that is not there.
+pub const MODULES: &[(&str, &str)] = &[("crm", "CRM")];
+
+/// The modules switched on for a workspace. Read from the row every time, like
+/// [`connected_logins_enabled`]: turning one off takes effect on the next request.
+pub async fn account_modules(db: &Db, account_id: i64) -> Vec<String> {
+    let raw: String = sqlx::query_scalar(r#"SELECT modules FROM account WHERE account_id=$1"#)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    parse_modules(&raw)
+}
+
+fn parse_modules(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in raw.split(',').map(|m| m.trim().to_ascii_lowercase()) {
+        if MODULES.iter().any(|(id, _)| *id == m) && !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+pub async fn has_module(db: &Db, account_id: i64, module: &str) -> bool {
+    account_modules(db, account_id).await.iter().any(|m| m == module)
+}
+
+/// Set a workspace's modules. Operator-only. Unknown ids are dropped.
+pub async fn set_account_modules(db: &Db, account_id: i64, modules: &[String]) -> Result<Vec<String>> {
+    let clean = parse_modules(&modules.join(","));
+    let n = sqlx::query(r#"UPDATE account SET modules=$2 WHERE account_id=$1"#)
+        .bind(account_id)
+        .bind(clean.join(","))
+        .execute(db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        bail!("no such account");
+    }
+    Ok(clean)
+}
+
 /// The account's Browserbase Context id, if one has been created and the
 /// workspace is allowed to use it.
 ///
@@ -5604,7 +5830,7 @@ pub async fn set_account_kinds(db: &Db, account_id: i64, kinds: &str) -> Result<
 /// Accounts for the admin console: who exists, and what they may build.
 pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
     let rows = sqlx::query(
-        r#"SELECT a.account_id, a.email, a.display_name, a.enabled_kinds, a.connected_logins, a.created_at,
+        r#"SELECT a.account_id, a.email, a.display_name, a.enabled_kinds, a.connected_logins, a.modules, a.created_at,
                   (a.mfa_enabled_at IS NOT NULL) AS mfa_enabled, a.sell_usd_per_mtoken,
                   (SELECT count(*) FROM plan p WHERE p.account_id = a.account_id) AS plans,
                   coalesce((SELECT u.credit_usd_micros FROM account_usage u WHERE u.account_id = a.account_id), 0) AS credit_micros,
@@ -5623,6 +5849,7 @@ pub async fn list_accounts_brief(db: &Db, limit: i64) -> Result<Vec<Value>> {
                 "display_name": r.get::<String, _>("display_name"),
                 "kinds": r.get::<String, _>("enabled_kinds"),
                 "connected_logins": r.get::<bool, _>("connected_logins"),
+                "modules": parse_modules(&r.get::<String, _>("modules")),
                 "mfa_enabled": r.get::<bool, _>("mfa_enabled"),
                 // Its own rate, or null when it pays the installation's.
                 "sell_usd_per_mtoken": r.get::<Option<f64>, _>("sell_usd_per_mtoken"),
@@ -6211,14 +6438,23 @@ pub struct OutreachRow {
     pub design_id: Option<i64>,
     /// The custom-schema row it was written to, if not a prospect.
     pub artifact_id: Option<i64>,
+    pub recipient_linkedin: String,
     /// What it was written for: the profile's name, or the plan's.
     pub campaign: Option<String>,
+    /// Their Reddit username, without "u/".
+    pub recipient_reddit: String,
+    /// Queued for the Chrome extension: 'linkedin' | 'reddit', '' when not.
+    pub send_channel: String,
+    pub queued_at: Option<DateTime<Utc>>,
+    /// When it went, and how ('linkedin' | 'reddit' | 'email' | 'other').
+    pub sent_at: Option<DateTime<Utc>>,
+    pub sent_via: String,
 }
 
 const OUTREACH_COLS: &str = r#"o.outreach_id, o.created_by, o.prospect_id, o.recipient_name, o.recipient_email,
 o.recipient_title, o.recipient_company, o.recipient_notes, o.subject, o.body, o.footer, o.version,
 o.created_at, o.updated_at, coalesce(nullif(a.display_name,''), a.email, '') AS created_by_name, o.plan_id,
-o.design_id, o.artifact_id,
+o.design_id, o.artifact_id, o.recipient_linkedin, o.recipient_reddit, o.send_channel, o.queued_at, o.sent_at, o.sent_via,
 coalesce((SELECT d.name FROM outreach_design d WHERE d.design_id=o.design_id AND d.account_id=o.account_id),
          (SELECT p.source FROM plan p WHERE p.plan_id=o.plan_id AND p.account_id=o.account_id AND p.outreach_custom)) AS campaign"#;
 
@@ -6246,6 +6482,777 @@ pub struct Recipient {
     pub company: String,
     #[serde(default)]
     pub notes: String,
+    /// Their LinkedIn profile URL, when the record had one. Not part of the
+    /// prompt; it is where "Open in LinkedIn" goes.
+    #[serde(default)]
+    pub linkedin: String,
+}
+
+// ---------------------------------------------------------------------------
+// The built-in CRM (the `crm` module): contacts and their activity log.
+// Not the CRM *integrations* below, which push results to someone else's CRM.
+// ---------------------------------------------------------------------------
+
+/// A contact's stages, in pipeline order: (id, label). Fixed on purpose.
+pub const CONTACT_STAGES: &[(&str, &str)] =
+    &[("lead", "Lead"), ("contacted", "Contacted"), ("qualified", "Qualified"), ("customer", "Customer"), ("lost", "Not a fit")];
+
+/// What can be logged against a contact: (id, label).
+pub const ACTIVITY_KINDS: &[(&str, &str)] =
+    &[("note", "Note"), ("email", "Email"), ("call", "Call"), ("meeting", "Meeting"), ("linkedin", "LinkedIn"), ("reddit", "Reddit")];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactRow {
+    pub contact_id: i64,
+    pub name: String,
+    pub email: String,
+    pub phone: String,
+    pub title: String,
+    pub company: String,
+    pub website: String,
+    pub linkedin: String,
+    pub location: String,
+    pub notes: String,
+    pub stage: String,
+    pub follow_up_on: Option<chrono::NaiveDate>,
+    pub last_touch_at: Option<DateTime<Utc>>,
+    pub source_kind: String,
+    pub source_id: Option<i64>,
+    pub plan_id: Option<i64>,
+    pub source_plan: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+const CONTACT_COLS: &str = "contact_id, name, email, phone, title, company, website, linkedin, location, notes, stage, follow_up_on, \
+     last_touch_at, source_kind, source_id, plan_id, source_plan, created_at, updated_at";
+
+fn contact_from(r: &sqlx::postgres::PgRow) -> ContactRow {
+    ContactRow {
+        contact_id: r.get("contact_id"),
+        name: r.get("name"),
+        email: r.get("email"),
+        phone: r.get("phone"),
+        title: r.get("title"),
+        company: r.get("company"),
+        website: r.get("website"),
+        linkedin: r.get("linkedin"),
+        location: r.get("location"),
+        notes: r.get("notes"),
+        stage: r.get("stage"),
+        follow_up_on: r.get("follow_up_on"),
+        last_touch_at: r.get("last_touch_at"),
+        source_kind: r.get("source_kind"),
+        source_id: r.get("source_id"),
+        plan_id: r.get("plan_id"),
+        source_plan: r.get("source_plan"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+/// The editable part of a contact, as a person types it. Bounded and trimmed
+/// by [`ContactFields::clean`] before it is written.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ContactFields {
+    pub name: String,
+    pub email: String,
+    pub phone: String,
+    pub title: String,
+    pub company: String,
+    pub website: String,
+    pub linkedin: String,
+    pub location: String,
+    pub notes: String,
+    pub stage: String,
+    pub follow_up_on: Option<chrono::NaiveDate>,
+}
+
+fn bounded(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect()
+}
+
+impl ContactFields {
+    /// Trimmed, bounded, an unknown stage read as `lead`. Err when there is
+    /// nothing to call the contact by.
+    pub fn clean(&self) -> std::result::Result<ContactFields, &'static str> {
+        let c = ContactFields {
+            name: bounded(&self.name, 255),
+            email: bounded(&self.email, 320).to_lowercase(),
+            phone: bounded(&self.phone, 100),
+            title: bounded(&self.title, 255),
+            company: bounded(&self.company, 255),
+            website: bounded(&self.website, 2000),
+            linkedin: bounded(&self.linkedin, 2000),
+            location: bounded(&self.location, 255),
+            notes: bounded(&self.notes, 20_000),
+            stage: if CONTACT_STAGES.iter().any(|(id, _)| *id == self.stage) { self.stage.clone() } else { "lead".into() },
+            follow_up_on: self.follow_up_on,
+        };
+        if c.name.is_empty() && c.company.is_empty() && c.email.is_empty() {
+            return Err("give the contact a name, a company or an email");
+        }
+        Ok(c)
+    }
+}
+
+/// A workspace's contacts, newest change first. `q` matches name, company,
+/// email or title; `stage` narrows to one stage.
+pub async fn list_contacts(db: &Db, account_id: i64, q: &str, stage: &str, limit: i64) -> Result<Vec<ContactRow>> {
+    let like = format!("%{}%", q.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    let rows = sqlx::query(&format!(
+        r#"SELECT {CONTACT_COLS} FROM contact
+           WHERE account_id=$1 AND ($2 = '%%' OR name ILIKE $2 OR company ILIKE $2 OR email ILIKE $2 OR title ILIKE $2)
+             AND ($3 = '' OR stage = $3)
+           ORDER BY updated_at DESC LIMIT $4"#
+    ))
+    .bind(account_id)
+    .bind(&like)
+    .bind(stage)
+    .bind(limit.clamp(1, 5000))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(contact_from).collect())
+}
+
+/// How many contacts each stage holds, for the list's filter.
+pub async fn contact_stage_counts(db: &Db, account_id: i64) -> Result<HashMap<String, i64>> {
+    let rows = sqlx::query(r#"SELECT stage, count(*) AS n FROM contact WHERE account_id=$1 GROUP BY stage"#).bind(account_id).fetch_all(db).await?;
+    Ok(rows.iter().map(|r| (r.get::<String, _>("stage"), r.get::<i64, _>("n"))).collect())
+}
+
+pub async fn get_contact(db: &Db, account_id: i64, contact_id: i64) -> Result<Option<ContactRow>> {
+    let row = sqlx::query(&format!("SELECT {CONTACT_COLS} FROM contact WHERE account_id=$1 AND contact_id=$2"))
+        .bind(account_id)
+        .bind(contact_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.as_ref().map(contact_from))
+}
+
+/// A contact typed in by hand. `f` must already be [`ContactFields::clean`].
+pub async fn create_contact(db: &Db, account_id: i64, by: i64, f: &ContactFields) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"INSERT INTO contact (account_id, name, email, phone, title, company, website, linkedin, location, notes, stage, follow_up_on, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING contact_id"#,
+    )
+    .bind(account_id)
+    .bind(&f.name)
+    .bind(&f.email)
+    .bind(&f.phone)
+    .bind(&f.title)
+    .bind(&f.company)
+    .bind(&f.website)
+    .bind(&f.linkedin)
+    .bind(&f.location)
+    .bind(&f.notes)
+    .bind(&f.stage)
+    .bind(f.follow_up_on)
+    .bind(by)
+    .fetch_one(db)
+    .await?)
+}
+
+/// Replace a contact's editable fields. False when it is not this workspace's.
+pub async fn update_contact(db: &Db, account_id: i64, contact_id: i64, f: &ContactFields) -> Result<bool> {
+    Ok(sqlx::query(
+        r#"UPDATE contact SET name=$3, email=$4, phone=$5, title=$6, company=$7, website=$8, linkedin=$9, location=$10,
+                  notes=$11, stage=$12, follow_up_on=$13, updated_at=now()
+           WHERE account_id=$1 AND contact_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(contact_id)
+    .bind(&f.name)
+    .bind(&f.email)
+    .bind(&f.phone)
+    .bind(&f.title)
+    .bind(&f.company)
+    .bind(&f.website)
+    .bind(&f.linkedin)
+    .bind(&f.location)
+    .bind(&f.notes)
+    .bind(&f.stage)
+    .bind(f.follow_up_on)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Move a contact to another stage (the list's quick change).
+pub async fn set_contact_stage(db: &Db, account_id: i64, contact_id: i64, stage: &str) -> Result<bool> {
+    if !CONTACT_STAGES.iter().any(|(id, _)| *id == stage) {
+        bail!("unknown stage");
+    }
+    Ok(sqlx::query(r#"UPDATE contact SET stage=$3, updated_at=now() WHERE account_id=$1 AND contact_id=$2"#)
+        .bind(account_id)
+        .bind(contact_id)
+        .bind(stage)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+pub async fn delete_contact(db: &Db, account_id: i64, contact_id: i64) -> Result<bool> {
+    Ok(sqlx::query(r#"DELETE FROM contact WHERE account_id=$1 AND contact_id=$2"#)
+        .bind(account_id)
+        .bind(contact_id)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+/// What importing one result came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactImport {
+    /// A new contact.
+    Created(i64),
+    /// Someone already here with the same email: their blank fields were
+    /// filled from the result, nothing else changed.
+    Linked(i64),
+    /// This very result was imported before.
+    Already(i64),
+}
+
+impl ContactImport {
+    pub fn contact_id(self) -> i64 {
+        match self {
+            ContactImport::Created(id) | ContactImport::Linked(id) | ContactImport::Already(id) => id,
+        }
+    }
+}
+
+/// Bring one search result in as a contact: once per result (the source
+/// pair), and onto an existing contact when the email matches.
+pub async fn import_contact(
+    db: &Db,
+    account_id: i64,
+    by: i64,
+    source: (&str, i64),
+    plan: (i64, &str),
+    f: &ContactFields,
+) -> Result<ContactImport> {
+    let (kind, source_id) = source;
+    let mut tx = db.begin().await?;
+    if let Some(id) = sqlx::query_scalar::<_, i64>(r#"SELECT contact_id FROM contact WHERE account_id=$1 AND source_kind=$2 AND source_id=$3"#)
+        .bind(account_id)
+        .bind(kind)
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        return Ok(ContactImport::Already(id));
+    }
+    if !f.email.is_empty() {
+        let same: Option<i64> = sqlx::query_scalar(
+            r#"SELECT contact_id FROM contact WHERE account_id=$1 AND lower(email)=lower($2) ORDER BY contact_id LIMIT 1 FOR UPDATE"#,
+        )
+        .bind(account_id)
+        .bind(&f.email)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = same {
+            sqlx::query(
+                r#"UPDATE contact SET
+                     name=CASE WHEN name='' THEN $3 ELSE name END, phone=CASE WHEN phone='' THEN $4 ELSE phone END,
+                     title=CASE WHEN title='' THEN $5 ELSE title END, company=CASE WHEN company='' THEN $6 ELSE company END,
+                     website=CASE WHEN website='' THEN $7 ELSE website END, linkedin=CASE WHEN linkedin='' THEN $8 ELSE linkedin END,
+                     location=CASE WHEN location='' THEN $9 ELSE location END, updated_at=now()
+                   WHERE account_id=$1 AND contact_id=$2"#,
+            )
+            .bind(account_id)
+            .bind(id)
+            .bind(&f.name)
+            .bind(&f.phone)
+            .bind(&f.title)
+            .bind(&f.company)
+            .bind(&f.website)
+            .bind(&f.linkedin)
+            .bind(&f.location)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(ContactImport::Linked(id));
+        }
+    }
+    let id: Option<i64> = sqlx::query_scalar(
+        r#"INSERT INTO contact (account_id, name, email, phone, title, company, website, linkedin, location, notes, stage,
+                                source_kind, source_id, plan_id, source_plan, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'lead',$11,$12,$13,$14,$15)
+           ON CONFLICT DO NOTHING RETURNING contact_id"#,
+    )
+    .bind(account_id)
+    .bind(&f.name)
+    .bind(&f.email)
+    .bind(&f.phone)
+    .bind(&f.title)
+    .bind(&f.company)
+    .bind(&f.website)
+    .bind(&f.linkedin)
+    .bind(&f.location)
+    .bind(&f.notes)
+    .bind(kind)
+    .bind(source_id)
+    .bind(plan.0)
+    .bind(bounded(plan.1, 255))
+    .bind(by)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    match id {
+        Some(id) => Ok(ContactImport::Created(id)),
+        // Imported by someone else a moment ago.
+        None => {
+            let id = sqlx::query_scalar(r#"SELECT contact_id FROM contact WHERE account_id=$1 AND source_kind=$2 AND source_id=$3"#)
+                .bind(account_id)
+                .bind(kind)
+                .bind(source_id)
+                .fetch_one(db)
+                .await?;
+            Ok(ContactImport::Already(id))
+        }
+    }
+}
+
+/// Which of these results are already contacts: (kind, id) → contact_id, for
+/// the results pages' "In CRM" link.
+pub async fn contacts_for_sources(db: &Db, account_id: i64, kind: &str, ids: &[i64]) -> Result<HashMap<i64, i64>> {
+    let rows = sqlx::query(r#"SELECT source_id, contact_id FROM contact WHERE account_id=$1 AND source_kind=$2 AND source_id = ANY($3)"#)
+        .bind(account_id)
+        .bind(kind)
+        .bind(ids)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.iter().map(|r| (r.get::<i64, _>("source_id"), r.get::<i64, _>("contact_id"))).collect())
+}
+
+/// The contact with this email, if any — how a result that was matched
+/// rather than imported is still known to be in the CRM.
+pub async fn contact_by_email(db: &Db, account_id: i64, email: &str) -> Result<Option<i64>> {
+    if email.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(r#"SELECT contact_id FROM contact WHERE account_id=$1 AND lower(email)=lower($2) ORDER BY contact_id LIMIT 1"#)
+        .bind(account_id)
+        .bind(email.trim())
+        .fetch_optional(db)
+        .await?)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactActivity {
+    pub activity_id: i64,
+    pub kind: String,
+    pub body: String,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    /// Who logged it, for the timeline ("" when they have since gone).
+    pub created_by_name: String,
+}
+
+pub async fn list_contact_activity(db: &Db, account_id: i64, contact_id: i64) -> Result<Vec<ContactActivity>> {
+    let rows = sqlx::query(
+        r#"SELECT a.activity_id, a.kind, a.body, a.occurred_at, a.created_at,
+                  coalesce(nullif(u.display_name,''), u.email, '') AS who
+           FROM contact_activity a LEFT JOIN account u ON u.account_id=a.created_by
+           WHERE a.account_id=$1 AND a.contact_id=$2
+           ORDER BY a.occurred_at DESC, a.activity_id DESC LIMIT 500"#,
+    )
+    .bind(account_id)
+    .bind(contact_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ContactActivity {
+            activity_id: r.get("activity_id"),
+            kind: r.get("kind"),
+            body: r.get("body"),
+            occurred_at: r.get("occurred_at"),
+            created_at: r.get("created_at"),
+            created_by_name: r.get("who"),
+        })
+        .collect())
+}
+
+/// Keep a contact's `last_touch_at` the newest activity's time.
+async fn touch_contact(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: i64, contact_id: i64) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE contact SET updated_at=now(),
+                  last_touch_at=(SELECT max(occurred_at) FROM contact_activity WHERE account_id=$1 AND contact_id=$2)
+           WHERE account_id=$1 AND contact_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(contact_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Log something that happened with a contact. None when the contact is not
+/// this workspace's.
+pub async fn add_contact_activity(
+    db: &Db,
+    account_id: i64,
+    contact_id: i64,
+    by: i64,
+    kind: &str,
+    body: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<Option<i64>> {
+    if !ACTIVITY_KINDS.iter().any(|(id, _)| *id == kind) {
+        bail!("unknown activity kind");
+    }
+    let mut tx = db.begin().await?;
+    let id: Option<i64> = sqlx::query_scalar(
+        r#"INSERT INTO contact_activity (account_id, contact_id, kind, body, occurred_at, created_by)
+           SELECT $1, contact_id, $3, $4, $5, $6 FROM contact WHERE account_id=$1 AND contact_id=$2
+           RETURNING activity_id"#,
+    )
+    .bind(account_id)
+    .bind(contact_id)
+    .bind(kind)
+    .bind(bounded(body, 20_000))
+    .bind(occurred_at)
+    .bind(by)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if id.is_some() {
+        touch_contact(&mut tx, account_id, contact_id).await?;
+    }
+    tx.commit().await?;
+    Ok(id)
+}
+
+pub async fn delete_contact_activity(db: &Db, account_id: i64, contact_id: i64, activity_id: i64) -> Result<bool> {
+    let mut tx = db.begin().await?;
+    let gone = sqlx::query(r#"DELETE FROM contact_activity WHERE account_id=$1 AND contact_id=$2 AND activity_id=$3"#)
+        .bind(account_id)
+        .bind(contact_id)
+        .bind(activity_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    if gone {
+        touch_contact(&mut tx, account_id, contact_id).await?;
+    }
+    tx.commit().await?;
+    Ok(gone)
+}
+
+// ---------------------------------------------------------------------------
+// CRM connections, the plans that push to them, and the push ledger
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrmConnection {
+    pub connection_id: i64,
+    #[serde(skip)]
+    pub account_id: i64,
+    pub provider: String,
+    pub label: String,
+    /// Sealed. Never serialised.
+    #[serde(skip)]
+    pub credential: String,
+    #[serde(skip)]
+    pub settings_json: String,
+    pub created_at: DateTime<Utc>,
+    pub paused: bool,
+    pub last_error: String,
+    pub last_ok_at: Option<DateTime<Utc>>,
+}
+
+const CRM_COLS: &str = "connection_id, account_id, provider, label, credential, settings_json, created_at, paused, last_error, last_ok_at";
+
+fn crm_from(r: &sqlx::postgres::PgRow) -> CrmConnection {
+    CrmConnection {
+        connection_id: r.get("connection_id"),
+        account_id: r.get("account_id"),
+        provider: r.get("provider"),
+        label: r.get("label"),
+        credential: r.get("credential"),
+        settings_json: r.get("settings_json"),
+        created_at: r.get("created_at"),
+        paused: r.get("paused"),
+        last_error: r.get("last_error"),
+        last_ok_at: r.get("last_ok_at"),
+    }
+}
+
+pub async fn list_crm_connections(db: &Db, account_id: i64) -> Result<Vec<CrmConnection>> {
+    let rows = sqlx::query(&format!("SELECT {CRM_COLS} FROM crm_connection WHERE account_id=$1 ORDER BY connection_id"))
+        .bind(account_id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.iter().map(crm_from).collect())
+}
+
+pub async fn get_crm_connection(db: &Db, account_id: i64, connection_id: i64) -> Result<Option<CrmConnection>> {
+    let row = sqlx::query(&format!("SELECT {CRM_COLS} FROM crm_connection WHERE account_id=$1 AND connection_id=$2"))
+        .bind(account_id)
+        .bind(connection_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.as_ref().map(crm_from))
+}
+
+pub async fn create_crm_connection(db: &Db, account_id: i64, provider: &str, label: &str, sealed: &str, settings_json: &str, by: i64) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"INSERT INTO crm_connection (account_id, provider, label, credential, settings_json, created_by, last_ok_at)
+           VALUES ($1,$2,$3,$4,$5,$6,now()) RETURNING connection_id"#,
+    )
+    .bind(account_id)
+    .bind(provider)
+    .bind(label)
+    .bind(sealed)
+    .bind(settings_json)
+    .bind(by)
+    .fetch_one(db)
+    .await?)
+}
+
+/// Replace a connection's credential (a reconnect): unpauses it.
+pub async fn reconnect_crm(db: &Db, account_id: i64, connection_id: i64, label: &str, sealed: &str, settings_json: &str) -> Result<bool> {
+    Ok(sqlx::query(
+        r#"UPDATE crm_connection SET label=$3, credential=$4, settings_json=$5, paused=false, last_error='', last_ok_at=now()
+           WHERE account_id=$1 AND connection_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(connection_id)
+    .bind(label)
+    .bind(sealed)
+    .bind(settings_json)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+pub async fn set_crm_settings(db: &Db, account_id: i64, connection_id: i64, settings_json: &str) -> Result<bool> {
+    Ok(sqlx::query(r#"UPDATE crm_connection SET settings_json=$3 WHERE account_id=$1 AND connection_id=$2"#)
+        .bind(account_id)
+        .bind(connection_id)
+        .bind(settings_json)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+pub async fn delete_crm_connection(db: &Db, account_id: i64, connection_id: i64) -> Result<bool> {
+    Ok(sqlx::query(r#"DELETE FROM crm_connection WHERE account_id=$1 AND connection_id=$2"#)
+        .bind(account_id)
+        .bind(connection_id)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+/// How the connection is doing: refused credentials pause it.
+pub async fn note_crm_connection(db: &Db, account_id: i64, connection_id: i64, paused: bool, err: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE crm_connection SET paused=$3, last_error=$4, last_ok_at = CASE WHEN $4 = '' THEN now() ELSE last_ok_at END
+           WHERE account_id=$1 AND connection_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(connection_id)
+    .bind(paused)
+    .bind(err.chars().take(300).collect::<String>())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// A plan's link to one connection, with what it has pushed so far.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanCrm {
+    pub connection_id: i64,
+    pub enabled: bool,
+    pub since: DateTime<Utc>,
+    pub last_sync_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub created: i64,
+    pub matched: i64,
+    pub failed: i64,
+}
+
+pub async fn get_plan_crm(db: &Db, account_id: i64, plan_id: i64) -> Result<Vec<PlanCrm>> {
+    let rows = sqlx::query(
+        r#"SELECT l.connection_id, l.enabled, l.since, l.last_sync_at, l.last_error,
+                  (SELECT count(*) FROM crm_push c WHERE c.plan_id=l.plan_id AND c.connection_id=l.connection_id AND c.status='created') AS created,
+                  (SELECT count(*) FROM crm_push c WHERE c.plan_id=l.plan_id AND c.connection_id=l.connection_id AND c.status='matched') AS matched,
+                  (SELECT count(*) FROM crm_push c WHERE c.plan_id=l.plan_id AND c.connection_id=l.connection_id AND c.status='failed') AS failed
+           FROM plan_crm l WHERE l.account_id=$1 AND l.plan_id=$2 ORDER BY l.connection_id"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| PlanCrm {
+            connection_id: r.get("connection_id"),
+            enabled: r.get("enabled"),
+            since: r.get("since"),
+            last_sync_at: r.get("last_sync_at"),
+            last_error: r.get("last_error"),
+            created: r.get("created"),
+            matched: r.get("matched"),
+            failed: r.get("failed"),
+        })
+        .collect())
+}
+
+/// Turn a plan's push to a connection on or off. Turning it on for the first
+/// time starts from now, or from the beginning with `backfill`; turning it on
+/// again with `backfill` also reaches back. The connection must be this
+/// workspace's.
+pub async fn set_plan_crm(db: &Db, account_id: i64, plan_id: i64, connection_id: i64, enabled: bool, backfill: bool) -> Result<bool> {
+    if get_crm_connection(db, account_id, connection_id).await?.is_none() || get_plan(db, account_id, plan_id).await?.is_none() {
+        return Ok(false);
+    }
+    sqlx::query(
+        r#"INSERT INTO plan_crm (plan_id, connection_id, account_id, enabled, since)
+           VALUES ($1,$2,$3,$4, CASE WHEN $5 THEN 'epoch'::timestamptz ELSE now() END)
+           ON CONFLICT (plan_id, connection_id) DO UPDATE SET enabled=excluded.enabled,
+             since = CASE WHEN $5 THEN 'epoch'::timestamptz ELSE plan_crm.since END, last_error=''"#,
+    )
+    .bind(plan_id)
+    .bind(connection_id)
+    .bind(account_id)
+    .bind(enabled)
+    .bind(backfill)
+    .execute(db)
+    .await?;
+    Ok(true)
+}
+
+/// Plan links with work to do, claimed so one pass at a time works each.
+/// Returns (account_id, plan_id, connection_id, since).
+pub async fn claim_crm_links(db: &Db, lease_secs: i64, gap_secs: i64, limit: i64) -> Result<Vec<(i64, i64, i64, DateTime<Utc>)>> {
+    Ok(sqlx::query_as(
+        r#"UPDATE plan_crm l SET sync_started_at=now()
+           FROM crm_connection c
+           WHERE c.connection_id=l.connection_id AND (l.plan_id, l.connection_id) IN (
+               SELECT l2.plan_id, l2.connection_id FROM plan_crm l2 JOIN crm_connection c2 ON c2.connection_id=l2.connection_id
+               WHERE l2.enabled AND NOT c2.paused
+                 AND (l2.sync_started_at IS NULL OR l2.sync_started_at < now() - make_interval(secs => $1::double precision))
+                 AND (l2.last_sync_at IS NULL OR l2.last_sync_at < now() - make_interval(secs => $2::double precision))
+               ORDER BY l2.last_sync_at NULLS FIRST LIMIT $3
+               FOR UPDATE OF l2 SKIP LOCKED)
+           RETURNING l.account_id, l.plan_id, l.connection_id, l.since"#,
+    )
+    .bind(lease_secs as f64)
+    .bind(gap_secs as f64)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// A pass over a link is done ("" = no link-level problem).
+pub async fn finish_crm_link(db: &Db, account_id: i64, plan_id: i64, connection_id: i64, err: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE plan_crm SET sync_started_at=NULL, last_sync_at=now(), last_error=$4
+           WHERE account_id=$1 AND plan_id=$2 AND connection_id=$3"#,
+    )
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(connection_id)
+    .bind(err.chars().take(300).collect::<String>())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Ask for a link to be worked at the next pass, not after the usual gap.
+pub async fn hurry_crm_link(db: &Db, account_id: i64, plan_id: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE plan_crm SET last_sync_at=NULL WHERE account_id=$1 AND plan_id=$2"#)
+        .bind(account_id)
+        .bind(plan_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Rows of a plan still owed to a connection: first seen since `since`, and
+/// not in the ledger — or in it as failed, fewer than three times, and not in
+/// the last ten minutes. Oldest first.
+const CRM_PENDING: &str = r#"(cp.push_id IS NULL OR (cp.status='failed' AND cp.attempts < 3 AND cp.updated_at < now() - interval '10 minutes'))"#;
+
+pub async fn crm_pending_prospects(db: &Db, account_id: i64, plan_id: i64, connection_id: i64, since: DateTime<Utc>, limit: i64) -> Result<Vec<ProspectRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {PROSPECT_COLS} FROM prospect pr JOIN plan p ON p.plan_id = pr.plan_id
+           LEFT JOIN crm_push cp ON cp.connection_id=$3 AND cp.row_kind='prospect' AND cp.row_id=pr.prospect_id
+           WHERE pr.account_id=$1 AND pr.plan_id=$2 AND pr.first_seen_utc >= $4 AND {CRM_PENDING}
+           ORDER BY pr.prospect_id LIMIT $5"#
+    ))
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(connection_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(ProspectRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+pub async fn crm_pending_artifacts(db: &Db, account_id: i64, plan_id: i64, connection_id: i64, since: DateTime<Utc>, limit: i64) -> Result<Vec<ArtifactRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {ARTIFACT_COLS} FROM artifact a JOIN plan p ON p.plan_id = a.plan_id
+           LEFT JOIN crm_push cp ON cp.connection_id=$3 AND cp.row_kind='artifact' AND cp.row_id=a.artifact_id
+           WHERE a.account_id=$1 AND a.plan_id=$2 AND a.first_seen_utc >= $4 AND {CRM_PENDING}
+           ORDER BY a.artifact_id LIMIT $5"#
+    ))
+    .bind(account_id)
+    .bind(plan_id)
+    .bind(connection_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(ArtifactRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Write a row's outcome to the ledger: once per row per connection, a
+/// failure counted towards its retries.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_crm_push(
+    db: &Db,
+    account_id: i64,
+    connection_id: i64,
+    plan_id: i64,
+    row_kind: &str,
+    row_id: i64,
+    status: &str,
+    ids: (&str, &str, &str),
+    error: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO crm_push (account_id, connection_id, plan_id, row_kind, row_id, status, external_person_id, external_org_id, external_lead_id, error)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (connection_id, row_kind, row_id) DO UPDATE SET status=excluded.status,
+             external_person_id=excluded.external_person_id, external_org_id=excluded.external_org_id,
+             external_lead_id=excluded.external_lead_id, error=excluded.error,
+             attempts=crm_push.attempts + 1, updated_at=now()"#,
+    )
+    .bind(account_id)
+    .bind(connection_id)
+    .bind(plan_id)
+    .bind(row_kind)
+    .bind(row_id)
+    .bind(status)
+    .bind(ids.0)
+    .bind(ids.1)
+    .bind(ids.2)
+    .bind(error.chars().take(300).collect::<String>())
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// One version of a draft's text and what produced it.
@@ -6274,8 +7281,8 @@ pub async fn create_outreach(
     let mut tx = db.begin().await?;
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO outreach (account_id, created_by, prospect_id, recipient_name, recipient_email, recipient_title,
-                                 recipient_company, recipient_notes, subject, body, footer, plan_id, design_id, artifact_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING outreach_id"#,
+                                 recipient_company, recipient_notes, subject, body, footer, plan_id, design_id, artifact_id, recipient_linkedin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING outreach_id"#,
     )
     .bind(account_id)
     .bind(by)
@@ -6291,6 +7298,7 @@ pub async fn create_outreach(
     .bind(campaign.and_then(|c| c.plan_id))
     .bind(campaign.and_then(|c| c.design_id))
     .bind(artifact_id)
+    .bind(&to.linkedin)
     .fetch_one(&mut *tx)
     .await?;
     insert_outreach_version(&mut tx, account_id, id, 1, by, text).await?;
@@ -6370,6 +7378,138 @@ pub async fn list_outreach(db: &Db, account_id: i64, limit: i64) -> Result<Vec<O
     Ok(rows.iter().map(OutreachRow::from_row).collect::<Result<Vec<_>, _>>()?)
 }
 
+/// How a draft can be sent from the Chrome extension.
+pub const SEND_CHANNELS: &[&str] = &["linkedin", "reddit"];
+
+/// A Reddit username as Reddit allows it (3–20 of letters, digits, `_`, `-`),
+/// from "u/name", "/u/name", a profile URL or the bare name. None otherwise.
+pub fn reddit_username(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let s = s
+        .split_once("reddit.com/user/")
+        .or_else(|| s.split_once("reddit.com/u/"))
+        .map(|(_, rest)| rest)
+        .unwrap_or(s);
+    let name = s.trim_start_matches('/').trim_start_matches("u/").split(['/', '?', '#']).next().unwrap_or("");
+    (name.len() >= 3 && name.len() <= 20 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then(|| name.to_string())
+}
+
+/// Queue a draft for the extension on `channel`, or take it off the queue
+/// (`None`). `reddit` sets the username when given. Queuing again re-dates it
+/// and clears a "sent", so it can be sent again on purpose.
+pub async fn set_outreach_queue(db: &Db, account_id: i64, outreach_id: i64, channel: Option<&str>, reddit: Option<&str>) -> Result<bool> {
+    if let Some(c) = channel {
+        if !SEND_CHANNELS.contains(&c) {
+            bail!("invalid channel");
+        }
+    }
+    Ok(sqlx::query(
+        r#"UPDATE outreach SET
+             send_channel = coalesce($3, ''),
+             queued_at = CASE WHEN $3 IS NULL THEN NULL ELSE now() END,
+             sent_at = CASE WHEN $3 IS NULL THEN sent_at ELSE NULL END,
+             sent_via = CASE WHEN $3 IS NULL THEN sent_via ELSE '' END,
+             recipient_reddit = coalesce($4, recipient_reddit)
+           WHERE account_id=$1 AND outreach_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(outreach_id)
+    .bind(channel)
+    .bind(reddit)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Record that a draft went out (`via`), and take it off the queue. None when
+/// it is not this workspace's; a draft already sent keeps its first time.
+pub async fn mark_outreach_sent(db: &Db, account_id: i64, outreach_id: i64, via: &str) -> Result<Option<OutreachRow>> {
+    let n = sqlx::query(
+        r#"UPDATE outreach SET sent_at=coalesce(sent_at, now()), sent_via=CASE WHEN sent_at IS NULL THEN $3 ELSE sent_via END, send_channel=''
+           WHERE account_id=$1 AND outreach_id=$2"#,
+    )
+    .bind(account_id)
+    .bind(outreach_id)
+    .bind(via)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Ok(None);
+    }
+    get_outreach(db, account_id, outreach_id).await
+}
+
+/// The drafts waiting in the extension's queue, oldest queued first.
+pub async fn list_outreach_queue(db: &Db, account_id: i64, limit: i64) -> Result<Vec<OutreachRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {OUTREACH_COLS} FROM outreach o LEFT JOIN account a ON a.account_id=o.created_by
+           WHERE o.account_id=$1 AND o.send_channel <> '' AND o.sent_at IS NULL
+           ORDER BY o.queued_at, o.outreach_id LIMIT $2"#
+    ))
+    .bind(account_id)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(OutreachRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Remember an approved extension sign-in; returns the code to hand back.
+pub async fn create_extension_grant(db: &Db, account_id: i64, person_id: i64, challenge: &str, redirect_uri: &str) -> Result<String> {
+    let mut buf = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+    let code = format!("hwc_{}", hex::encode(buf));
+    sqlx::query(
+        r#"INSERT INTO extension_grant (code_hash, account_id, person_id, code_challenge, redirect_uri, expires_at)
+           VALUES ($1,$2,$3,$4,$5, now() + interval '5 minutes')"#,
+    )
+    .bind(sha256_hex(&code))
+    .bind(account_id)
+    .bind(person_id)
+    .bind(challenge)
+    .bind(redirect_uri)
+    .execute(db)
+    .await?;
+    Ok(code)
+}
+
+/// An approved sign-in, claimed: (workspace, person, challenge, redirect_uri).
+/// Once only — the claim and the check are one statement — and only within
+/// its five minutes.
+pub async fn take_extension_grant(db: &Db, code: &str) -> Result<Option<(i64, i64, String, String)>> {
+    let row = sqlx::query(
+        r#"UPDATE extension_grant SET used_at=now()
+           WHERE code_hash=$1 AND used_at IS NULL AND expires_at > now()
+           RETURNING account_id, person_id, code_challenge, redirect_uri"#,
+    )
+    .bind(sha256_hex(code.trim()))
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| (r.get("account_id"), r.get("person_id"), r.get("code_challenge"), r.get("redirect_uri"))))
+}
+
+/// The Chrome extension's own key: a bearer token (`hwx_…`, kind 'ext') that
+/// works only at /ext/v1, made by the person who approved the sign-in.
+pub async fn create_extension_key(db: &Db, account_id: i64, person_id: i64, label: &str) -> Result<ApiKeyRow> {
+    let token = new_api_token().replacen("psk_", "hwx_", 1);
+    let hint: String = token.chars().take(12).collect();
+    let key_id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO api_key (account_id, token_hash, token_hint, label, created_by, kind, expires_at)
+           VALUES ($1,$2,$3,$4,$5,'ext', now() + interval '180 days') RETURNING key_id"#,
+    )
+    .bind(account_id)
+    .bind(sha256_hex(&token))
+    .bind(&hint)
+    .bind(label.trim())
+    .bind(person_id)
+    .fetch_one(db)
+    .await?;
+    let mut row = get_api_key(db, account_id, key_id).await?.ok_or_else(|| anyhow!("key vanished"))?;
+    row.token = token;
+    Ok(row)
+}
+
 pub async fn list_outreach_versions(db: &Db, account_id: i64, outreach_id: i64) -> Result<Vec<OutreachVersionRow>> {
     let rows = sqlx::query(
         r#"SELECT version, subject, body, source, feedback, model, created_at FROM outreach_version
@@ -6409,6 +7549,555 @@ pub async fn recent_executions_admin(db: &Db, host_id: Option<i64>, slot: Option
     .fetch_all(db)
     .await?;
     Ok(rows.iter().map(AdminExecutionRow::from_row).collect::<Result<Vec<_>, _>>()?)
+}
+
+// ---- support chat ------------------------------------------------------------
+// Chats from the site and the app, answered in admin → Support. Not tenant
+// data: a visitor has no account, and the operator reads across all of them.
+// The customer side reaches a chat only through their session's account or a
+// visitor's token (`web::support`), never by a bare id from the request.
+
+/// The longest message either side may send, in characters.
+pub const SUPPORT_BODY_MAX: usize = 4000;
+/// The most images on one message, and the largest one. The browser scales an
+/// image down before sending, so a real screenshot is well under this.
+pub const SUPPORT_MAX_IMAGES: usize = 4;
+pub const SUPPORT_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// An image to store on a support message, its type already decided from
+/// its bytes.
+pub struct SupportImage {
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// The image types a support message may carry, recognised by their first
+/// bytes: what the browser or Slack says a file is does not count.
+pub fn support_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+const SUPPORT_COLS: &str = "conversation_id, account_id, workspace_id, email, name, token_sealed, status, page, ip, \
+     created_at, last_message_at, customer_seen_at, operator_seen_at, closed_at, closed_by, slack_reason, slack_error, \
+     slack_channel, slack_thread_ts";
+const SUPPORT_MSG_COLS: &str = "message_id, conversation_id, author, operator_email, body, created_at, slack_ts";
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct SupportConversation {
+    pub conversation_id: i64,
+    pub account_id: Option<i64>,
+    pub workspace_id: Option<i64>,
+    pub email: String,
+    pub name: String,
+    /// The visitor's token, sealed, for the link in a reply email.
+    #[serde(skip)]
+    pub token_sealed: String,
+    pub status: String,
+    pub page: String,
+    pub ip: String,
+    pub created_at: DateTime<Utc>,
+    pub last_message_at: DateTime<Utc>,
+    pub customer_seen_at: Option<DateTime<Utc>>,
+    pub operator_seen_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub closed_by: String,
+    /// '' (never announced) | 'new' | 'sent'. ('reopened' on older rows.)
+    pub slack_reason: String,
+    pub slack_error: String,
+    /// The chat's thread in the operators' channel; empty until it is posted.
+    pub slack_channel: String,
+    pub slack_thread_ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct SupportMessage {
+    pub message_id: i64,
+    pub conversation_id: i64,
+    /// 'customer' | 'operator'
+    pub author: String,
+    pub operator_email: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    /// Its ts in the Slack thread; empty while it is owed there.
+    #[serde(skip)]
+    pub slack_ts: String,
+    /// Its images (`support_attachment` ids, in order), fetched one at a
+    /// time. Filled by `support_messages`; empty from the writes.
+    #[sqlx(default)]
+    pub image_ids: Vec<i64>,
+}
+
+/// A row of the operator's inbox: the chat, its newest message, and whether
+/// the customer said something the operator has not seen.
+#[derive(Debug, Clone, Serialize)]
+pub struct SupportInboxRow {
+    #[serde(flatten)]
+    pub conversation: SupportConversation,
+    pub last_body: String,
+    pub last_author: String,
+    pub unread: bool,
+}
+
+/// Who is starting a chat.
+pub struct NewSupportChat<'a> {
+    pub account_id: Option<i64>,
+    pub workspace_id: Option<i64>,
+    pub email: &'a str,
+    pub name: &'a str,
+    /// A visitor's token: its hash for lookup and its sealed copy.
+    pub token: Option<(&'a str, &'a str)>,
+    pub page: &'a str,
+    pub ip: &'a str,
+}
+
+/// Start a chat. With its first message, Slack is owed a post about it; a
+/// visitor's chat begins without one (name, email and the bot check come
+/// first), and its first message is what announces it.
+pub async fn support_start(db: &Db, who: &NewSupportChat<'_>, body: Option<&str>, images: &[SupportImage]) -> Result<SupportConversation> {
+    let mut tx = db.begin().await?;
+    let conv: SupportConversation = sqlx::query_as(&format!(
+        r#"INSERT INTO support_conversation
+             (account_id, workspace_id, email, name, token_hash, token_sealed, page, ip, customer_seen_at, slack_due_at, slack_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now(),
+                   CASE WHEN $9 THEN now() END, CASE WHEN $9 THEN 'new' ELSE '' END)
+           RETURNING {SUPPORT_COLS}"#
+    ))
+    .bind(who.account_id)
+    .bind(who.workspace_id)
+    .bind(who.email)
+    .bind(who.name)
+    .bind(who.token.map(|t| t.0))
+    .bind(who.token.map(|t| t.1).unwrap_or(""))
+    .bind(who.page)
+    .bind(who.ip)
+    .bind(body.is_some())
+    .fetch_one(&mut *tx)
+    .await?;
+    if let Some(body) = body {
+        let id: i64 = sqlx::query_scalar(r#"INSERT INTO support_message (conversation_id, author, body) VALUES ($1,'customer',$2) RETURNING message_id"#)
+            .bind(conv.conversation_id)
+            .bind(body)
+            .fetch_one(&mut *tx)
+            .await?;
+        support_attach(&mut tx, id, images).await?;
+    }
+    tx.commit().await?;
+    Ok(conv)
+}
+
+/// A visitor's chat, by the SHA-256 of their token.
+pub async fn support_by_token(db: &Db, token_hash: &str) -> Result<Option<SupportConversation>> {
+    Ok(sqlx::query_as(&format!("SELECT {SUPPORT_COLS} FROM support_conversation WHERE token_hash=$1"))
+        .bind(token_hash)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// A signed-in person's current chat: the newest one they have not ended.
+/// `None` once they end it; their next message starts another.
+pub async fn support_for_account(db: &Db, account_id: i64) -> Result<Option<SupportConversation>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {SUPPORT_COLS} FROM support_conversation WHERE account_id=$1 AND status<>'ended' ORDER BY last_message_at DESC LIMIT 1"
+    ))
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// One of a signed-in person's chats, ended or not, by id: `None` unless it
+/// is theirs.
+pub async fn support_of_account(db: &Db, account_id: i64, conversation_id: i64) -> Result<Option<SupportConversation>> {
+    Ok(sqlx::query_as(&format!("SELECT {SUPPORT_COLS} FROM support_conversation WHERE conversation_id=$1 AND account_id=$2"))
+        .bind(conversation_id)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// One of a person's chats as their list of earlier ones shows it.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct SupportChatSummary {
+    pub conversation_id: i64,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub last_message_at: DateTime<Utc>,
+    /// Their first message, which names the chat.
+    pub title: String,
+    /// Answers they have not seen.
+    pub unread: i64,
+    /// A visitor's chat: which of their tokens it is.
+    #[serde(skip)]
+    pub token_hash: Option<String>,
+}
+
+/// A person's chats with at least one message, newest first: a signed-in
+/// person's by account, a visitor's by the hashes of the tokens this browser
+/// kept. Never more than 50.
+pub async fn support_history(db: &Db, account_id: Option<i64>, token_hashes: &[String]) -> Result<Vec<SupportChatSummary>> {
+    Ok(sqlx::query_as(
+        r#"SELECT c.conversation_id, c.status, c.created_at, c.last_message_at, left(f.body, 140) AS title, c.token_hash,
+             (SELECT count(*) FROM support_message m WHERE m.conversation_id=c.conversation_id AND m.author='operator'
+                AND (c.customer_seen_at IS NULL OR m.created_at > c.customer_seen_at)) AS unread
+           FROM support_conversation c
+           JOIN LATERAL (SELECT body FROM support_message m WHERE m.conversation_id=c.conversation_id
+                         ORDER BY (m.author='customer') DESC, message_id LIMIT 1) f ON true
+           WHERE ($1::bigint IS NOT NULL AND c.account_id=$1) OR c.token_hash = ANY($2)
+           ORDER BY c.last_message_at DESC LIMIT 50"#,
+    )
+    .bind(account_id)
+    .bind(token_hashes)
+    .fetch_all(db)
+    .await?)
+}
+
+/// The person ends their chat. It stays readable to them, but they write in a
+/// new one from here; an answer that still arrives is delivered, and does not
+/// open it again. `false` when it had already ended.
+pub async fn support_end(db: &Db, conversation_id: i64, by: &str) -> Result<bool> {
+    let n = sqlx::query(r#"UPDATE support_conversation SET status='ended', closed_at=now(), closed_by=$2 WHERE conversation_id=$1 AND status<>'ended'"#)
+        .bind(conversation_id)
+        .bind(by)
+        .execute(db)
+        .await?;
+    Ok(n.rows_affected() > 0)
+}
+
+/// Any chat, for the operator.
+pub async fn support_get(db: &Db, conversation_id: i64) -> Result<Option<SupportConversation>> {
+    Ok(sqlx::query_as(&format!("SELECT {SUPPORT_COLS} FROM support_conversation WHERE conversation_id=$1"))
+        .bind(conversation_id)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// Store a message's images, in the transaction that writes the message.
+async fn support_attach(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, message_id: i64, images: &[SupportImage]) -> Result<()> {
+    for image in images {
+        sqlx::query("INSERT INTO support_attachment (message_id, content_type, bytes) VALUES ($1,$2,$3)")
+            .bind(message_id)
+            .bind(image.content_type)
+            .bind(&image.bytes)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// One image, with the chat it is in, so the caller can check who may see
+/// it: `(conversation_id, content_type, bytes)`.
+pub async fn support_image(db: &Db, attachment_id: i64) -> Result<Option<(i64, String, Vec<u8>)>> {
+    Ok(sqlx::query_as(
+        "SELECT m.conversation_id, a.content_type, a.bytes FROM support_attachment a \
+         JOIN support_message m ON m.message_id = a.message_id WHERE a.attachment_id=$1",
+    )
+    .bind(attachment_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// A message's images, in order: `(content_type, bytes)`.
+pub async fn support_message_images(db: &Db, message_id: i64) -> Result<Vec<(String, Vec<u8>)>> {
+    Ok(sqlx::query_as("SELECT content_type, bytes FROM support_attachment WHERE message_id=$1 ORDER BY attachment_id")
+        .bind(message_id)
+        .fetch_all(db)
+        .await?)
+}
+
+/// A chat's messages after `after` (0 for all), oldest first, with their
+/// images' ids.
+pub async fn support_messages(db: &Db, conversation_id: i64, after: i64) -> Result<Vec<SupportMessage>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {SUPPORT_MSG_COLS}, \
+           COALESCE((SELECT array_agg(a.attachment_id ORDER BY a.attachment_id) FROM support_attachment a \
+                     WHERE a.message_id = support_message.message_id), '{{}}') AS image_ids \
+         FROM support_message WHERE conversation_id=$1 AND message_id>$2 ORDER BY message_id LIMIT 1000"
+    ))
+    .bind(conversation_id)
+    .bind(after)
+    .fetch_all(db)
+    .await?)
+}
+
+/// The customer writes. Every message is owed to the chat's Slack thread;
+/// the first one opens the thread, and one on a chat an operator closed opens
+/// it again. (An ended chat is refused before this, in `web::support`.)
+pub async fn support_customer_says(db: &Db, conversation_id: i64, body: &str, images: &[SupportImage]) -> Result<SupportMessage> {
+    let mut tx = db.begin().await?;
+    let msg: SupportMessage = sqlx::query_as(&format!(
+        "INSERT INTO support_message (conversation_id, author, body) VALUES ($1,'customer',$2) RETURNING {SUPPORT_MSG_COLS}"
+    ))
+    .bind(conversation_id)
+    .bind(body)
+    .fetch_one(&mut *tx)
+    .await?;
+    support_attach(&mut tx, msg.message_id, images).await?;
+    sqlx::query(
+        r#"UPDATE support_conversation SET last_message_at=now(), customer_seen_at=now(),
+             slack_due_at   = COALESCE(LEAST(slack_due_at, now()), now()),
+             slack_reason   = CASE WHEN slack_reason='' THEN 'new' ELSE slack_reason END,
+             -- Nothing was owed (sent, or given up on): a fresh start.
+             slack_attempts = CASE WHEN slack_due_at IS NULL THEN 0 ELSE slack_attempts END,
+             status='open', closed_at=NULL, closed_by=''
+           WHERE conversation_id=$1"#,
+    )
+    .bind(conversation_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(msg)
+}
+
+/// The customer has the chat open: everything so far is read.
+pub async fn support_customer_seen(db: &Db, conversation_id: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE support_conversation SET customer_seen_at=now() WHERE conversation_id=$1"#)
+        .bind(conversation_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Replies the customer has not seen yet.
+pub fn support_unread_for_customer(c: &SupportConversation, msgs: &[SupportMessage]) -> usize {
+    msgs.iter().filter(|m| m.author == "operator" && c.customer_seen_at.map_or(true, |s| m.created_at > s)).count()
+}
+
+/// The operator's inbox, newest activity first. `status` 'open' | 'closed'
+/// (closed by an operator or ended by the person), anything else for all.
+pub async fn support_inbox(db: &Db, status: &str, limit: i64) -> Result<Vec<SupportInboxRow>> {
+    let rows = sqlx::query(&format!(
+        r#"SELECT {cols},
+             COALESCE(l.body, '') AS last_body, COALESCE(l.author, '') AS last_author,
+             EXISTS (SELECT 1 FROM support_message m WHERE m.conversation_id=c.conversation_id AND m.author='customer'
+                       AND (c.operator_seen_at IS NULL OR m.created_at > c.operator_seen_at)) AS unread
+           FROM support_conversation c
+           LEFT JOIN LATERAL (SELECT body, author FROM support_message m WHERE m.conversation_id=c.conversation_id
+                              ORDER BY message_id DESC LIMIT 1) l ON true
+           WHERE ($1 NOT IN ('open','closed') OR c.status=$1 OR ($1='closed' AND c.status='ended'))
+             -- Begun but never written in (a visitor who gave a name and left):
+             -- nothing to answer.
+             AND l.body IS NOT NULL
+           ORDER BY c.last_message_at DESC LIMIT $2"#,
+        cols = SUPPORT_COLS.split(", ").map(|c| format!("c.{}", c.trim())).collect::<Vec<_>>().join(", ")
+    ))
+    .bind(status)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(SupportInboxRow {
+            conversation: SupportConversation::from_row(&r)?,
+            last_body: r.try_get("last_body")?,
+            last_author: r.try_get("last_author")?,
+            unread: r.try_get("unread")?,
+        });
+    }
+    Ok(out)
+}
+
+/// Open chats with something from the customer the operator has not seen.
+pub async fn support_unread_count(db: &Db) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"SELECT count(*) FROM support_conversation c WHERE c.status='open' AND EXISTS (
+             SELECT 1 FROM support_message m WHERE m.conversation_id=c.conversation_id AND m.author='customer'
+               AND (c.operator_seen_at IS NULL OR m.created_at > c.operator_seen_at))"#,
+    )
+    .fetch_one(db)
+    .await?)
+}
+
+pub async fn support_operator_seen(db: &Db, conversation_id: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE support_conversation SET operator_seen_at=now() WHERE conversation_id=$1"#)
+        .bind(conversation_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// An operator answers. Answering a closed chat opens it again; one the
+/// person ended stays ended (it is delivered, and they see it there).
+///
+/// From the admin (`slack_ts` None) the reply is owed to the chat's Slack
+/// thread, when it has one, so the thread stays the whole conversation. From
+/// Slack it is already there: its ts is recorded, and the same ts twice (Slack
+/// delivering a reply again) is `None`, recorded once.
+pub async fn support_operator_reply(
+    db: &Db,
+    conversation_id: i64,
+    operator: &str,
+    body: &str,
+    images: &[SupportImage],
+    slack_ts: Option<&str>,
+) -> Result<Option<SupportMessage>> {
+    let mut tx = db.begin().await?;
+    let msg: Option<SupportMessage> = sqlx::query_as(&format!(
+        r#"INSERT INTO support_message (conversation_id, author, operator_email, body, slack_ts) VALUES ($1,'operator',$2,$3,$4)
+           ON CONFLICT (conversation_id, slack_ts) WHERE slack_ts <> '' DO NOTHING
+           RETURNING {SUPPORT_MSG_COLS}"#
+    ))
+    .bind(conversation_id)
+    .bind(operator)
+    .bind(body)
+    .bind(slack_ts.unwrap_or(""))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(m) = &msg else {
+        return Ok(None);
+    };
+    support_attach(&mut tx, m.message_id, images).await?;
+    sqlx::query(
+        r#"UPDATE support_conversation SET last_message_at=now(), operator_seen_at=now(),
+             status    = CASE WHEN status='ended' THEN status ELSE 'open' END,
+             closed_at = CASE WHEN status='ended' THEN closed_at END,
+             closed_by = CASE WHEN status='ended' THEN closed_by ELSE '' END,
+             slack_due_at = CASE WHEN $2 AND slack_thread_ts <> '' THEN COALESCE(LEAST(slack_due_at, now()), now()) ELSE slack_due_at END
+           WHERE conversation_id=$1"#,
+    )
+    .bind(conversation_id)
+    .bind(slack_ts.is_none())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(msg)
+}
+
+/// The chat whose Slack thread this is.
+pub async fn support_by_thread(db: &Db, channel: &str, thread_ts: &str) -> Result<Option<SupportConversation>> {
+    if thread_ts.is_empty() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_as(&format!(
+        "SELECT {SUPPORT_COLS} FROM support_conversation WHERE slack_channel=$1 AND slack_thread_ts=$2"
+    ))
+    .bind(channel)
+    .bind(thread_ts)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Messages still owed to the chat's Slack thread, oldest first.
+pub async fn support_slack_pending(db: &Db, conversation_id: i64) -> Result<Vec<SupportMessage>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {SUPPORT_MSG_COLS} FROM support_message WHERE conversation_id=$1 AND slack_ts='' ORDER BY message_id LIMIT 200"
+    ))
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// A message is in the thread now, at `ts`.
+pub async fn support_slack_posted(db: &Db, message_id: i64, ts: &str) -> Result<()> {
+    sqlx::query("UPDATE support_message SET slack_ts=$2 WHERE message_id=$1")
+        .bind(message_id)
+        .bind(ts)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// History from before the chat had a thread, too old to be worth posting:
+/// marked as not owed (a ts no Slack message has, unique per message).
+pub async fn support_slack_skip(db: &Db, conversation_id: i64, before_message_id: i64) -> Result<()> {
+    sqlx::query("UPDATE support_message SET slack_ts='skip-' || message_id WHERE conversation_id=$1 AND slack_ts='' AND message_id<$2")
+        .bind(conversation_id)
+        .bind(before_message_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// The chat's thread was started: its channel and the parent post's ts.
+pub async fn support_set_thread(db: &Db, conversation_id: i64, channel: &str, ts: &str) -> Result<()> {
+    sqlx::query("UPDATE support_conversation SET slack_channel=$2, slack_thread_ts=$3 WHERE conversation_id=$1")
+        .bind(conversation_id)
+        .bind(channel)
+        .bind(ts)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Close or reopen a chat. `false` when there is no such chat, or it is one
+/// the person ended (they start a new one; it is not the operator's to reopen).
+pub async fn support_set_status(db: &Db, conversation_id: i64, open: bool, operator: &str) -> Result<bool> {
+    let n = if open {
+        sqlx::query(r#"UPDATE support_conversation SET status='open', closed_at=NULL, closed_by='' WHERE conversation_id=$1 AND status<>'ended'"#)
+            .bind(conversation_id)
+            .execute(db)
+            .await?
+    } else {
+        sqlx::query(r#"UPDATE support_conversation SET status='closed', closed_at=now(), closed_by=$2 WHERE conversation_id=$1 AND status<>'ended'"#)
+            .bind(conversation_id)
+            .bind(operator)
+            .execute(db)
+            .await?
+    };
+    Ok(n.rows_affected() > 0)
+}
+
+/// Take the next chat whose Slack post is due, leased for `lease_secs` so a
+/// second notification service skips it. Returns its attempts so far.
+pub async fn claim_due_support_slack(db: &Db, lease_secs: i64) -> Result<Option<(SupportConversation, i32)>> {
+    let row = sqlx::query(&format!(
+        r#"UPDATE support_conversation SET slack_attempts=slack_attempts+1, slack_due_at=now() + make_interval(secs => $1)
+           WHERE conversation_id = (SELECT conversation_id FROM support_conversation
+                                    WHERE slack_due_at IS NOT NULL AND slack_due_at <= now()
+                                    ORDER BY slack_due_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+           RETURNING {SUPPORT_COLS}, slack_attempts"#
+    ))
+    .bind(lease_secs as f64)
+    .fetch_optional(db)
+    .await?;
+    match row {
+        Some(r) => Ok(Some((SupportConversation::from_row(&r)?, r.try_get("slack_attempts")?))),
+        None => Ok(None),
+    }
+}
+
+/// How a pass over a chat's Slack thread ended.
+pub enum SupportSlackDone<'a> {
+    /// Everything owed went. Anything written meanwhile is due straight away.
+    Sent,
+    /// Try again in this many seconds.
+    Retry(&'a str, i64),
+    /// Will not go: Slack is not set up, or refused for good. Not owed again
+    /// until someone writes.
+    Dropped(&'a str),
+}
+
+pub async fn finish_support_slack(db: &Db, conversation_id: i64, done: SupportSlackDone<'_>) -> Result<()> {
+    let (error, retry_in, sent) = match done {
+        SupportSlackDone::Sent => ("", None, true),
+        SupportSlackDone::Retry(e, s) => (e, Some(s), false),
+        SupportSlackDone::Dropped(e) => (e, None, false),
+    };
+    sqlx::query(
+        r#"UPDATE support_conversation SET slack_error=$2,
+             slack_reason = CASE WHEN $4 THEN 'sent' ELSE slack_reason END,
+             slack_attempts = CASE WHEN $4 THEN 0 ELSE slack_attempts END,
+             slack_due_at = CASE
+               WHEN $3::bigint IS NOT NULL THEN now() + make_interval(secs => $3::bigint::float8)
+               WHEN $4 AND EXISTS (SELECT 1 FROM support_message m WHERE m.conversation_id=$1 AND m.slack_ts='') THEN now()
+               ELSE NULL END
+           WHERE conversation_id=$1"#,
+    )
+    .bind(conversation_id)
+    .bind(error)
+    .bind(retry_in)
+    .bind(sent)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6474,7 +8163,19 @@ mod tests {
     }
 
     #[test]
-    fn next_fire_respects_days_and_zone() {
+    fn fires_between_lists_each_run_in_the_window() {
+        // Daily at 09:00 New York, from Wed 2026-09-02 12:00 UTC for three days.
+        let from = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap();
+        let fires = fires_between("09:00", "", "America/New_York", from, from + Duration::days(3));
+        assert_eq!(fires.len(), 3);
+        assert_eq!(fires[0], Utc.with_ymd_and_hms(2026, 9, 2, 13, 0, 0).unwrap());
+        assert_eq!(fires[2], Utc.with_ymd_and_hms(2026, 9, 4, 13, 0, 0).unwrap());
+        // Mondays only: none in a Wed–Sat window.
+        assert!(fires_between("09:00", "1", "America/New_York", from, from + Duration::days(3)).is_empty());
+    }
+
+    #[test]
+        fn next_fire_respects_days_and_zone() {
         // Wednesday 2026-09-02 12:00 UTC == 07:00 New York.
         let now = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap();
         let next = next_fire("09:00", "", "America/New_York", now).unwrap();
@@ -6521,11 +8222,11 @@ mod tests {
 
     #[test]
     fn tokens_price_at_the_sell_rate() {
-        // Default $5 / million tokens → 5 µUSD each, $5 for a million.
+        // Default $1 / million tokens → 1 µUSD each, $1 for a million.
         assert_eq!(tokens_to_usd_micros(0), 0);
         assert_eq!(tokens_to_usd_micros(-3), 0);
-        assert_eq!(tokens_to_usd_micros(1), 5);
-        assert_eq!(tokens_to_usd_micros(1_000_000), 5_000_000);
+        assert_eq!(tokens_to_usd_micros(1), 1);
+        assert_eq!(tokens_to_usd_micros(1_000_000), 1_000_000);
     }
 
     #[test]

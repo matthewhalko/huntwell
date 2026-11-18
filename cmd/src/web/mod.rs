@@ -12,6 +12,11 @@ pub mod runner;
 pub mod scheduler;
 pub mod seo;
 pub mod outreach;
+pub mod mcp_api;
+pub mod crm;
+pub mod contacts;
+pub mod extension;
+pub mod support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -176,6 +181,8 @@ async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
     // Local dispatch: start runs that wait for room, as room opens.
     runner::spawn_local_queue(state.clone());
     billing::spawn_auto_reload(state.db.clone());
+    // Push plans' new results into connected CRMs (web::crm).
+    crm::spawn_sync(state.db.clone());
 
     let app = Router::new()
         .nest("/api", api::router())
@@ -183,12 +190,20 @@ async fn serve_app(db: Db, addr: &str, with_scheduler: bool) -> Result<()> {
         // with it; `/v1` is the promise.
         .nest("/v1", public_api::router())
         .nest("/dl", download::router())
+        // Huntwell for Chrome: its own bearer key, its own small surface.
+        .nest("/ext/v1", extension::public_router())
+        // Slack's Events API: replies typed in a support chat's thread. Proved
+        // by Slack's signature, not a session (`support::slack_events`).
+        .route(crate::support::slack::EVENTS_PATH, axum::routing::post(support::slack_events))
         .route("/healthz", get(|| async { "ok" }))
         .route("/robots.txt", get(seo::robots))
         .route("/sitemap.xml", get(seo::sitemap))
         .fallback(get(static_handler))
         .layer(middleware::from_fn_with_state(state.clone(), harden_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // MCP for the person's own Claude. Merged after the tracer on purpose:
+        // its key may be in the URL (/mcp/{key}), and that must never be logged.
+        .merge(mcp_api::router().layer(middleware::from_fn_with_state(state.clone(), harden_headers)))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
@@ -212,7 +227,7 @@ async fn harden_headers(State(state): State<App>, req: Request<Body>, next: Next
     // Nothing the API answers belongs in a browser cache: on a shared machine
     // the back button would otherwise show a signed-out user's data. A route
     // that set its own policy (the CSV downloads use ETags) keeps it.
-    if (path.starts_with("/api/") || path.starts_with("/v1/") || path.starts_with("/dl/")) && !h.contains_key(header::CACHE_CONTROL) {
+    if (path.starts_with("/api/") || path.starts_with("/v1/") || path.starts_with("/dl/") || path.starts_with("/mcp")) && !h.contains_key(header::CACHE_CONTROL) {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));

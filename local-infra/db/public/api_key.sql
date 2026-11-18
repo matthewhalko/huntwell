@@ -37,3 +37,9 @@ ALTER TABLE public.api_key ADD COLUMN IF NOT EXISTS secret_sealed text;
 -- revoked by `store::remove_member`). NULL = made before this was recorded, or
 -- by the operator endpoint, which answers only to the workspace itself.
 ALTER TABLE public.api_key ADD COLUMN IF NOT EXISTS created_by bigint;
+
+-- What a key is for (2026-10-13). 'signed': the /v1 and /dl API, every
+-- request HMAC-signed with the key's secret. 'mcp': the /mcp endpoint only,
+-- presented as a bearer token or in the connector URL — for Claude, which
+-- cannot sign. Each is refused on the other's surface.
+ALTER TABLE public.api_key ADD COLUMN IF NOT EXISTS kind varchar(8) NOT NULL DEFAULT 'signed';

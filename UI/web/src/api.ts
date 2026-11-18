@@ -62,6 +62,12 @@ export interface AuthConfig {
   /** Sign-up needs an invitation; everyone else asks to join the waitlist. */
   invite_only?: boolean
   turnstile_site_key: string | null
+  /** The standard rate per million tokens, which the Pricing page quotes. */
+  usd_per_mtoken?: number
+  /** Whether the support bubble takes visitors: only behind Turnstile. */
+  support_chat?: boolean
+  /** A dev server: email "test" with no password signs in. */
+  dev_login?: boolean
 }
 
 /** What an invitation link carries: the address it was sent to and who sent it. */
@@ -78,6 +84,8 @@ export interface Me {
   timezone_auto: boolean
   /// Plan kinds this workspace may create, from the server.
   kinds?: string[]
+  /// Optional modules an operator switched on for this workspace (`crm`, …).
+  modules?: string[]
   /// Whether they claimed the right to collect from the restricted platforms.
   platform_ack?: boolean
   platform_ack_at?: string | null
@@ -99,6 +107,11 @@ export interface Me {
 }
 
 export type Cap = 'plans' | 'credits' | 'keys'
+
+/** Whether a module is switched on for the current workspace. */
+export function hasModule(me: Me | null | undefined, module: string): boolean {
+  return !!me?.modules?.includes(module)
+}
 
 /** Whether this session may make a write of this kind. Missing `can` (an older session payload) stays allowed. */
 export function can(me: Me | null | undefined, cap: Cap): boolean {
@@ -417,6 +430,8 @@ export interface ApiKey {
   uses: number
   revoked: boolean
   expired: boolean
+  /** 'signed' — the /v1 API, every request signed. 'mcp' — Claude's connector at /mcp. */
+  kind?: 'signed' | 'mcp' | 'ext'
 }
 
 export interface Overview {
@@ -510,6 +525,8 @@ export interface Outreach {
   recipient_title: string
   recipient_company: string
   recipient_notes: string
+  /** Their LinkedIn profile, when the record had one — "Open in LinkedIn" goes there. */
+  recipient_linkedin?: string
   subject: string
   body: string
   footer: string
@@ -522,6 +539,22 @@ export interface Outreach {
   design_id?: number | null
   /** What it was written for: the profile's or the plan's name; null = the workspace's settings. */
   campaign?: string | null
+  /** Their Reddit username, without "u/". */
+  recipient_reddit?: string
+  /** Queued for Huntwell for Chrome: 'linkedin' | 'reddit'; '' when not queued. */
+  send_channel?: string
+  queued_at?: string | null
+  /** When it went, and how ('linkedin' | 'reddit' | 'email' | 'other'). */
+  sent_at?: string | null
+  sent_via?: string
+}
+
+const SENT_VIA: Record<string, string> = { linkedin: 'LinkedIn', reddit: 'Reddit', email: 'email', other: 'hand' }
+/** "Sent via LinkedIn", "Queued for Reddit", or '' — a draft's sending state in a few words. */
+export function outreachState(o: Pick<Outreach, 'sent_at' | 'sent_via' | 'send_channel'>): string {
+  if (o.sent_at) return `Sent via ${SENT_VIA[o.sent_via || 'other'] ?? o.sent_via}`
+  if (o.send_channel) return `Queued for ${SENT_VIA[o.send_channel] ?? o.send_channel}`
+  return ''
 }
 
 export interface OutreachVersion {
@@ -586,4 +619,80 @@ export function outreachBody(o: Pick<Outreach, 'body' | 'footer'>): string {
 export function outreachEmail(o: Outreach): string {
   const to = outreachTo(o)
   return `${to ? `To: ${to}\n` : ''}Subject: ${o.subject}\n\n${outreachBody(o)}`
+}
+
+/** A CRM a workspace connected (Settings → CRM integrations). The credential never comes back. */
+export interface CrmConnection {
+  connection_id: number
+  provider: string
+  provider_name: string
+  /** The CRM account, e.g. "Acme (acme.pipedrive.com)". */
+  label: string
+  /** The CRM refused the credential; nothing is pushed until it is reconnected. */
+  paused: boolean
+  last_error: string
+  last_ok_at: string | null
+  create_lead: boolean
+}
+
+/** A plan sending results to one connection, with what it has sent. */
+export interface PlanCrmLink {
+  connection_id: number
+  enabled: boolean
+  since: string
+  last_sync_at: string | null
+  last_error: string
+  created: number
+  matched: number
+  failed: number
+}
+
+/// The built-in CRM (the `crm` module): a person the workspace keeps track of.
+export interface Contact {
+  contact_id: number
+  name: string
+  email: string
+  phone: string
+  title: string
+  company: string
+  website: string
+  linkedin: string
+  location: string
+  notes: string
+  /// lead | contacted | qualified | customer | lost
+  stage: string
+  /// YYYY-MM-DD, or null.
+  follow_up_on: string | null
+  last_touch_at: string | null
+  /// 'manual', or the result it came from ('prospect' | 'artifact').
+  source_kind: string
+  source_id: number | null
+  plan_id: number | null
+  source_plan: string
+  created_at: string
+  updated_at: string
+}
+
+/// Something that happened with a contact: an email, a call, a meeting, a note.
+export interface ContactActivity {
+  activity_id: number
+  kind: string
+  body: string
+  occurred_at: string
+  created_at: string
+  created_by_name: string
+}
+
+export interface CrmOption {
+  id: string
+  label: string
+}
+
+/// What importing results into the CRM came to.
+export interface ContactImportResult {
+  created: number
+  linked: number
+  already: number
+  skipped: number
+  contact_id: number | null
 }

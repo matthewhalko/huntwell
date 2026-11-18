@@ -358,6 +358,7 @@ pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<
                 title: p.title.clone(),
                 company: p.company.clone(),
                 notes: p.notes.clone(),
+                linkedin: draft::linkedin_url(&p.linkedin).unwrap_or_default(),
             };
             (Some(p), to)
         }
@@ -368,6 +369,7 @@ pub(crate) async fn draft_new(state: &App, w: &Writer, b: CreateBody) -> Result<
                 title: r.title.trim().chars().take(200).collect(),
                 company: r.company.trim().chars().take(200).collect(),
                 notes: r.notes.trim().chars().take(2000).collect(),
+                linkedin: draft::linkedin_url(&r.linkedin).unwrap_or_default(),
             };
             if to.name.is_empty() && to.company.is_empty() {
                 return Err(bad_request("give the recipient's name or company"));
@@ -427,6 +429,7 @@ pub(crate) async fn revise_draft(state: &App, w: &Writer, id: i64, feedback: &st
         title: o.recipient_title.clone(),
         company: o.recipient_company.clone(),
         notes: o.recipient_notes.clone(),
+        linkedin: o.recipient_linkedin.clone(),
     };
     let prospect = match o.prospect_id {
         Some(pid) => store::get_prospect(&state.db, w.workspace, pid).await?,

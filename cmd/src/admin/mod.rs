@@ -152,8 +152,10 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     }
 
     // Operators sign in through their own Cognito pool. Without one there is
-    // nothing to sign in to, so say so now rather than at the login form.
-    if !crate::cognito::admin_configured() {
+    // nothing to sign in to, so say so now rather than at the login form. A
+    // dev box is the exception: it signs in as the dev operator instead
+    // (`api::dev_login_allowed`).
+    if !crate::cognito::admin_configured() && !api::dev_login_allowed() {
         anyhow::bail!(
             "no operators' Cognito pool is configured — add ADMIN_COGNITO_USER_POOL_ID, ADMIN_COGNITO_CLIENT_ID \
              (and ADMIN_COGNITO_CLIENT_SECRET, ADMIN_COGNITO_REGION) beside the AWS_COGNITO_* credential (docs/SECRETS.md)"
@@ -164,7 +166,7 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     // checkout has an operator without claiming. The operator is made in the
     // pool — or, if already there, has this password set — and recorded.
     match (crate::config::get("HUNTWELL_ADMIN_EMAIL"), crate::config::get("HUNTWELL_ADMIN_PASSWORD")) {
-        (Some(email), Some(pass)) if !email.trim().is_empty() && !pass.trim().is_empty() => {
+        (Some(email), Some(pass)) if !email.trim().is_empty() && !pass.trim().is_empty() && crate::cognito::admin_configured() => {
             use crate::cognito::{self, PoolKind};
             let email = email.trim().to_lowercase();
             let sub = match cognito::create_user_in(PoolKind::Admins, &email, &pass).await {
@@ -190,7 +192,8 @@ pub async fn serve(db: Db, addr: &str) -> Result<()> {
     // open to whoever reached it first. Mint a key and print it: holding it
     // means being able to read this output, which is the same access needed to
     // start the process at all.
-    if crate::store::count_admin_users(&db).await.unwrap_or(0) == 0 {
+    // A dev box needs no claiming: the dev sign-in makes its operator.
+    if crate::store::count_admin_users(&db).await.unwrap_or(0) == 0 && !api::dev_login_allowed() {
         let key = crate::setup::arm();
         tracing::warn!("\n{}", first_run_banner(&key, addr));
     } else {

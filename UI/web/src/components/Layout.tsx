@@ -2,7 +2,7 @@ import React from 'react'
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { ThemeToggle } from '../theme'
 import { useAuth } from '../auth'
-import { api } from '../api'
+import { api, hasModule } from '../api'
 import { browserZone } from './Setup'
 import { Workspace } from '../api'
 
@@ -15,7 +15,7 @@ function Ico({ children }: { children: React.ReactNode }) {
   )
 }
 
-const links = [
+const allLinks: { to: string; label: string; end?: boolean; module?: string; ico: React.ReactNode }[] = [
   {
     to: '/app',
     label: 'Home',
@@ -64,6 +64,20 @@ const links = [
       <Ico>
         <path d="M22 2 11 13" />
         <path d="M22 2 15 22l-4-9-9-4z" />
+      </Ico>
+    ),
+  },
+  {
+    to: '/app/crm',
+    label: 'CRM',
+    // Only for a workspace an operator switched the CRM module on for.
+    module: 'crm',
+    ico: (
+      <Ico>
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <circle cx="9" cy="7" r="4" />
+        <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+        <path d="M16 3.13a4 4 0 0 1 0 7.75" />
       </Ico>
     ),
   },
@@ -120,6 +134,9 @@ function fitCount(nav: HTMLElement, total: number): number {
   if (!rail) return total
   const cs = getComputedStyle(rail)
   const avail = rail.clientWidth - parseFloat(cs.paddingLeft || '0') - parseFloat(cs.paddingRight || '0')
+  // Not laid out yet (the first-load hold keeps the app display:none): show
+  // everything for now; the rail's ResizeObserver measures again once it has a width.
+  if (avail <= 0) return total
   // The gap between tiles is real width: without it this keeps one tile too
   // many and the row scrolls.
   const gap = parseFloat(getComputedStyle(nav).columnGap || '0') || 0
@@ -184,6 +201,7 @@ export default function Layout() {
       .then(() => refresh())
       .catch(() => {})
   }, [me?.timezone, me?.timezone_auto, me?.onboarded])
+  const links = allLinks.filter((l) => !l.module || hasModule(me, l.module))
   const nav = useNavigate()
   const loc = useLocation()
   const phone = usePhone()
@@ -200,16 +218,23 @@ export default function Layout() {
     if (fits !== null || !navRef.current) return
     setFits(fitCount(navRef.current, links.length))
   }, [phone, fits])
-  // A rotation or a resized window changes the answer; re-measure from scratch.
+  // A module switched on or off changes the tiles; measure again.
+  React.useEffect(() => setFits(null), [links.length])
+  // A rotation, a resized window, or the rail first getting a width (it is
+  // display:none under the first-load hold) changes the answer; re-measure
+  // from scratch. Watched on the rail itself, so all three are one signal.
   React.useEffect(() => {
-    if (!phone) return
-    const fn = () => setFits(null)
-    window.addEventListener('resize', fn)
-    window.addEventListener('orientationchange', fn)
-    return () => {
-      window.removeEventListener('resize', fn)
-      window.removeEventListener('orientationchange', fn)
-    }
+    const rail = navRef.current?.parentElement
+    if (!phone || !rail) return
+    let last = rail.clientWidth
+    const ro = new ResizeObserver(() => {
+      if (rail.clientWidth !== last) {
+        last = rail.clientWidth
+        setFits(null)
+      }
+    })
+    ro.observe(rail)
+    return () => ro.disconnect()
   }, [phone])
   const shown = phone ? fits ?? links.length : links.length
   const railLinks = links.slice(0, shown)

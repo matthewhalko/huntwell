@@ -6,6 +6,7 @@ import { ThemeProvider } from './theme'
 import { AuthProvider } from './auth'
 import { ConfirmProvider, ToastProvider } from './components/ui'
 import './styles.css'
+import { FirstLoadHold } from './components/Skeleton'
 
 // public/skeleton.js filled #root with a skeleton and marked it busy; React's
 // first render replaces the skeleton, and the page is no longer loading.
@@ -18,7 +19,10 @@ ReactDOM.createRoot(root).render(
         <ToastProvider>
           <ConfirmProvider>
             <BrowserRouter>
-              <App />
+              {/* Keeps the first paint's skeleton up a beat (Skeleton.tsx). */}
+              <FirstLoadHold>
+                <App />
+              </FirstLoadHold>
             </BrowserRouter>
           </ConfirmProvider>
         </ToastProvider>

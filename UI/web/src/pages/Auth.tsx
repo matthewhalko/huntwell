@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { SkeletonFields } from '../components/Skeleton'
+import { SkeletonFields, useLoadView } from '../components/Skeleton'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { api, AuthConfig, InvitationInfo } from '../api'
 import { useAuth } from '../auth'
-import { Field } from '../components/ui'
-import { ArtBackdrop } from '../components/ArtBackdrop'
+import { Field, NewPasswordFields, passwordsMatch } from '../components/ui'
+import { PatternBackdrop } from '../components/PatternBackdrop'
 
 declare global {
   interface Window {
@@ -57,7 +57,7 @@ export function useAuthConfig(): AuthConfig | null {
 /// The Turnstile widget. Reports its token up, and an empty string when the
 /// token expires or the widget resets — tokens are single-use, so after a
 /// failed submit `resetKey` bumps and a fresh one is issued.
-function Turnstile({ siteKey, onToken, resetKey }: { siteKey: string; onToken: (t: string) => void; resetKey: number }) {
+export function Turnstile({ siteKey, onToken, resetKey }: { siteKey: string; onToken: (t: string) => void; resetKey: number }) {
   const box = useRef<HTMLDivElement>(null)
   const widget = useRef<string | null>(null)
   const [err, setErr] = useState('')
@@ -97,10 +97,10 @@ function Turnstile({ siteKey, onToken, resetKey }: { siteKey: string; onToken: (
   )
 }
 
-function Shell({ title, children }: { title: string; children: React.ReactNode }) {
+export function Shell({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="auth">
-      <ArtBackdrop />
+      <PatternBackdrop />
       <div className="card raised">
         <Link to="/" className="brand" aria-label="Huntwell home" style={{ color: 'var(--text)', padding: '0 0 1rem', textDecoration: 'none', width: 'fit-content' }}>
           <span className="grad-text" aria-hidden>
@@ -116,17 +116,19 @@ function Shell({ title, children }: { title: string; children: React.ReactNode }
 }
 
 export function Login() {
-  const [email, setEmail] = useState('')
+  const loc = useLocation() as any
+  // Filled in after a password reset, which knows whose it was.
+  const [email, setEmail] = useState(typeof loc.state?.email === 'string' ? loc.state.email : '')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const { refresh } = useAuth()
   const nav = useNavigate()
-  const loc = useLocation() as any
   const cfg = useAuthConfig()
   const [token, setToken] = useState('')
   const [resetKey, setResetKey] = useState(0)
   const needsChallenge = !!cfg?.turnstile_site_key
+  const devLogin = !!cfg?.dev_login
   // Sent here from a teammate's invitation while signed out: someone new
   // creates their account from that invitation instead.
   const joinToken = typeof loc.state?.from === 'string' ? (loc.state.from.match(/^\/join\/([^/?#]+)$/)?.[1] ?? '') : ''
@@ -208,11 +210,13 @@ export function Login() {
       <form onSubmit={submit}>
         {err && <div className="error">{err}</div>}
         <Field label="Email">
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus autoComplete="email" required />
+          {/* On a dev server "test" is an address too, with no password. */}
+          <input type={devLogin ? 'text' : 'email'} value={email} onChange={(e) => setEmail(e.target.value)} autoFocus autoComplete="email" required />
         </Field>
         <Field label="Password">
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required={!devLogin} />
         </Field>
+        {devLogin && <p className="muted">Dev server: email <b>test</b>, no password, signs you in as a test user.</p>}
         {cfg?.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
         <button className="btn primary" disabled={busy || !cfg || (needsChallenge && !token)} style={{ width: '100%' }}>
           {busy ? 'Signing in…' : 'Sign in'}
@@ -269,6 +273,7 @@ function SignupForm({ cfg, invite, info }: { cfg: AuthConfig; invite?: string; i
   const [email, setEmail] = useState(info?.email || '')
   const [name, setName] = useState(info?.kind === 'platform' ? info.name : '')
   const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const { refresh } = useAuth()
@@ -278,6 +283,7 @@ function SignupForm({ cfg, invite, info }: { cfg: AuthConfig; invite?: string; i
   const needsChallenge = !!cfg.turnstile_site_key
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!passwordsMatch(password, confirm)) return setErr("The passwords don't match.")
     setBusy(true)
     setErr('')
     try {
@@ -314,11 +320,9 @@ function SignupForm({ cfg, invite, info }: { cfg: AuthConfig; invite?: string; i
         <Field label="Email" hint={info ? 'The invitation is for this address.' : undefined}>
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required readOnly={!!info} />
         </Field>
-        <Field label="Password" hint="At least 12 characters, with upper and lower case and a digit.">
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={12} />
-        </Field>
+        <NewPasswordFields value={password} onChange={setPassword} confirm={confirm} onConfirm={setConfirm} />
         {cfg.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
-        <button className="btn primary" disabled={busy || (needsChallenge && !token)} style={{ width: '100%' }}>
+        <button className="btn primary" disabled={busy || (needsChallenge && !token) || !passwordsMatch(password, confirm)} style={{ width: '100%' }}>
           {busy ? 'Creating…' : 'Create account'}
         </button>
       </form>
@@ -511,21 +515,46 @@ export function CheckEmail() {
   )
 }
 
-/// Forgot password, in two steps on one page: the address, then the code
-/// from the email plus a new password. The first step answers the same
-/// whether the address has an account, so the page cannot be used to find out.
+/// Forgot password. From the reset email's link (`?token=`) it knows whose
+/// account it is and asks only for the new password. Otherwise two steps: the
+/// address, then the code from the email plus a new password — the first
+/// answering the same whether the address has an account, so the page cannot
+/// be used to find out.
 export function Forgot() {
   const nav = useNavigate()
+  const loc = useLocation()
   const cfg = useAuthConfig()
-  const [step, setStep] = useState<'email' | 'code' | 'done'>('email')
+  // Read once, then taken out of the address bar: the token sets this
+  // account's password, so it should not sit in history or a shared screen.
+  const [linkToken] = useState(() => new URLSearchParams(loc.search).get('token')?.trim() || '')
+  const [step, setStep] = useState<'link' | 'expired' | 'email' | 'code' | 'done'>(linkToken ? 'link' : 'email')
+  const [linkFor, setLinkFor] = useState<{ email: string; name: string } | null>(null)
   const [email, setEmail] = useState('')
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const [token, setToken] = useState('')
   const [resetKey, setResetKey] = useState(0)
   const needsChallenge = !!cfg?.turnstile_site_key
+  const linkView = useLoadView(linkFor !== null)
+  useEffect(() => {
+    if (!linkToken) return
+    nav('/forgot', { replace: true })
+    api
+      .get<{ email: string; name: string }>(`/api/auth/reset/${encodeURIComponent(linkToken)}`)
+      .then((r) => {
+        setLinkFor(r)
+        setEmail(r.email)
+      })
+      .catch((e: any) => {
+        setErr(e.message)
+        setStep('expired')
+      })
+    // Once, for the token the page was opened with.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const send = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
@@ -542,14 +571,15 @@ export function Forgot() {
   }
   const finish = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!passwordsMatch(password, confirm)) return setErr("The passwords don't match.")
     setBusy(true)
     setErr('')
     try {
-      await api.post('/api/auth/reset', { email, code, password })
+      await api.post('/api/auth/reset', step === 'link' ? { token: linkToken, password } : { email, code, password })
       setStep('done')
     } catch (e: any) {
       setErr(e.message)
-      if (e.status === 410) setStep('email')
+      if (e.status === 410) setStep(step === 'link' ? 'expired' : 'email')
     } finally {
       setBusy(false)
     }
@@ -559,9 +589,44 @@ export function Forgot() {
     return (
       <Shell title="Password changed">
         <p>Your password is updated and every other session was signed out.</p>
-        <button className="btn primary" onClick={() => nav('/login', { replace: true })} style={{ width: '100%' }}>
+        <button className="btn primary" onClick={() => nav('/login', { replace: true, state: { email } })} style={{ width: '100%' }}>
           Sign in
         </button>
+      </Shell>
+    )
+  }
+  if (step === 'link') {
+    if (linkFor === null || linkView !== 'ready') {
+      return <Shell title="Choose a new password">{linkView === 'skeleton' && <SkeletonFields fields={2} />}</Shell>
+    }
+    return (
+      <Shell title="Choose a new password">
+        <p>
+          For <b>{linkFor.email}</b>.
+        </p>
+        <form onSubmit={finish}>
+          {err && <div className="error">{err}</div>}
+          {/* Lets a password manager save the new password against the right account. */}
+          <input type="email" value={linkFor.email} autoComplete="username" readOnly hidden />
+          <NewPasswordFields label="New password" value={password} onChange={setPassword} confirm={confirm} onConfirm={setConfirm} />
+          <button className="btn primary" disabled={busy || !passwordsMatch(password, confirm)} style={{ width: '100%' }}>
+            {busy ? 'Saving…' : 'Set new password'}
+          </button>
+        </form>
+      </Shell>
+    )
+  }
+  if (step === 'expired') {
+    return (
+      <Shell title="This link has expired">
+        <p>{err ? err.replace(/^./, (c) => c.toUpperCase()) : 'This reset link has expired or has already been used.'}</p>
+        <p className="muted">Reset links work once, for 24 hours. Ask for a new one and use the newest email.</p>
+        <button className="btn primary" onClick={() => { setErr(''); setStep('email') }} style={{ width: '100%' }}>
+          Send a new link
+        </button>
+        <p className="muted" style={{ marginTop: '1rem' }}>
+          Remembered it? <Link to="/login">Sign in</Link>
+        </p>
       </Shell>
     )
   }
@@ -569,11 +634,12 @@ export function Forgot() {
     return (
       <Shell title="Check your email">
         <p>
-          If <b>{email}</b> has an account, a six-digit code is on its way. Enter it with your new password.
+          If <b>{email}</b> has an account, an email is on its way. Click its link — or enter its six-digit code here
+          with your new password.
         </p>
         <form onSubmit={finish}>
           {err && <div className="error">{err}</div>}
-          <Field label="Code" hint="It expires in 15 minutes.">
+          <Field label="Code" hint="It works for 24 hours.">
             <input
               type="text"
               inputMode="numeric"
@@ -586,17 +652,15 @@ export function Forgot() {
               style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: '1.4rem', letterSpacing: '0.25em' }}
             />
           </Field>
-          <Field label="New password" hint="At least 12 characters, with upper and lower case and a digit.">
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength={12} />
-          </Field>
-          <button className="btn primary" disabled={busy || digits.length !== 6 || password.length < 12} style={{ width: '100%' }}>
+          <NewPasswordFields label="New password" value={password} onChange={setPassword} confirm={confirm} onConfirm={setConfirm} />
+          <button className="btn primary" disabled={busy || digits.length !== 6 || !passwordsMatch(password, confirm)} style={{ width: '100%' }}>
             {busy ? 'Saving…' : 'Set new password'}
           </button>
         </form>
         <p className="muted" style={{ marginTop: '1rem' }}>
           Didn't get it?{' '}
           <a href="#" onClick={(e) => { e.preventDefault(); setStep('email'); setCode('') }}>
-            Send another code
+            Send another email
           </a>
         </p>
       </Shell>
@@ -604,7 +668,7 @@ export function Forgot() {
   }
   return (
     <Shell title="Reset your password">
-      <p>Enter the address you signed up with and we'll email you a code.</p>
+      <p>Enter the address you signed up with and we'll email you a link to choose a new password.</p>
       <form onSubmit={send}>
         {err && <div className="error">{err}</div>}
         <Field label="Email">
@@ -612,7 +676,7 @@ export function Forgot() {
         </Field>
         {cfg?.turnstile_site_key && <Turnstile siteKey={cfg.turnstile_site_key} onToken={setToken} resetKey={resetKey} />}
         <button className="btn primary" disabled={busy || !cfg || (needsChallenge && !token)} style={{ width: '100%' }}>
-          {busy ? 'Sending…' : 'Send code'}
+          {busy ? 'Sending…' : 'Send reset email'}
         </button>
       </form>
       <p className="muted" style={{ marginTop: '1rem' }}>

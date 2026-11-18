@@ -3,6 +3,7 @@ import { api, Asset, can, fmtBytes, fmtDate } from '../api'
 import { useAuth } from '../auth'
 import { Empty, Loading, useConfirm, useToast } from './ui'
 import { MapIcon } from './icons'
+import { useLoadView } from './Skeleton'
 
 // A short glyph for the file type. Text, not colour — the icon rules apply.
 function typeLabel(a: Asset): string {
@@ -42,7 +43,8 @@ export function AssetGrid({ planId }: { planId: number }) {
     load()
   }
 
-  if (rows === null) return <Loading />
+  const rowsView = useLoadView(rows !== null)
+  if (rows === null || rowsView !== 'ready') return rowsView === 'skeleton' ? <Loading /> : null
   if (rows.length === 0)
     return (
       <Empty title="No files yet" icon={<MapIcon size={38} />}>

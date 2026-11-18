@@ -696,7 +696,7 @@ async fn operator_workspace(
             let _ = store::revoke_api_key(&state.db, account.account_id, k.key_id).await;
         }
     }
-    match store::create_api_key(&state.db, account.account_id, None, "park river", None, 0, &body.allow_cidr).await {
+    match store::create_api_key(&state.db, account.account_id, None, "park river", None, 0, &body.allow_cidr, false).await {
         Ok(key) => (
             StatusCode::CREATED,
             Json(json!({
@@ -1205,6 +1205,7 @@ fn outreach_json(o: &store::OutreachRow) -> Value {
             "title": o.recipient_title,
             "company": o.recipient_company,
             "notes": o.recipient_notes,
+            "linkedin": o.recipient_linkedin,
         },
         "to": to,
         "subject": o.subject,

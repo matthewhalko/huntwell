@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Huntwell</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+  <header class="top">
+    <a id="home" class="brand" href="#" title="Open Huntwell"><span class="grad-text spark" aria-hidden="true">✦</span><span>huntwell</span></a>
+    <span class="tag">for Chrome</span>
+  </header>
+
+  <main>
+    <!-- Signed out -->
+    <section id="signin" hidden>
+      <h1>Send your outreach</h1>
+      <p class="sub">Huntwell opens each person's LinkedIn or Reddit, fills your message in, and points at Send. <b>You</b> press it.</p>
+      <label class="field">
+        <span>Your Huntwell</span>
+        <input id="server" type="url" spellcheck="false" autocomplete="url" />
+      </label>
+      <button id="signin-btn" class="btn primary wide">Sign in to Huntwell</button>
+      <p id="signin-error" class="error" hidden></p>
+    </section>
+
+    <!-- Signed in -->
+    <section id="app" hidden>
+      <div id="account" class="account" hidden>
+        <div>
+          <div id="who" class="who"></div>
+          <div id="where" class="muted sm"></div>
+        </div>
+        <button id="signout" class="btn sm">Sign out</button>
+      </div>
+      <div class="row between">
+        <h1>Queue</h1>
+        <button id="refresh" class="btn sm" title="Refresh">Refresh</button>
+      </div>
+      <p id="app-error" class="error" hidden></p>
+      <div id="list" class="list" aria-live="polite"></div>
+      <div id="empty" class="empty" hidden>
+        <p><b>Nothing queued.</b></p>
+        <p class="muted sm">In Huntwell, open a draft under Outreach and choose <b>Queue for LinkedIn</b> or <b>Queue for Reddit</b>. It shows up here.</p>
+        <button id="open-outreach" class="btn sm">Open Outreach</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot muted sm">Huntwell fills it in. You press Send — always.</footer>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

@@ -4,6 +4,7 @@ import { ago, api, can, fmtTokens, PlanSummary, scheduleLabel } from '../api'
 import { useAuth } from '../auth'
 import { Badge, Empty, Loading, Spinner, StatusBadge, StatusMark, useToast } from '../components/ui'
 import { ClockIcon } from '../components/icons'
+import { useLoadView } from '../components/Skeleton'
 
 /// One plan as a table row.
 ///
@@ -112,6 +113,7 @@ export default function Plans() {
     return () => clearInterval(t)
   }, [building])
   const shown = (plans || []).filter((p) => p.Source.toLowerCase().includes(q.toLowerCase()))
+  const plansView = useLoadView(plans !== null)
   return (
     <>
       <div className="page-head">
@@ -128,8 +130,8 @@ export default function Plans() {
           )}
         </div>
       </div>
-      {plans === null ? (
-        <Loading />
+      {plans === null || plansView !== 'ready' ? (
+        plansView === 'skeleton' ? <Loading /> : null
       ) : shown.length === 0 ? (
         <Empty title={plans.length ? 'No search plans match' : 'No search plans yet'}>
           {!plans.length && write && (

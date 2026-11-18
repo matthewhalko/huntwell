@@ -500,12 +500,13 @@ pub fn production_from(env: Option<&str>, release: bool, dev: bool) -> bool {
 
 /// What we charge the customer per million billable (input + output) tokens, in
 /// US dollars. Set above Cursor's own per-token cost to make margin; the run's
-/// recorded Cursor COGS shows the spread. Defaults to $5.00 per Mtoken.
+/// recorded Cursor COGS shows the spread. Defaults to $1.00 per Mtoken, the
+/// price the public Pricing page quotes (it reads this, via `/api/auth/config`).
 pub fn sell_usd_per_mtoken() -> f64 {
     get("HUNTWELL_SELL_USD_PER_MTOKEN")
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(5.0)
+        .unwrap_or(1.0)
 }
 
 /// What we multiply Cursor's published per-token rates by when we show a

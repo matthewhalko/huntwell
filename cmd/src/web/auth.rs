@@ -164,6 +164,13 @@ fn challenge_failed(e: anyhow::Error) -> ApiError {
 /// that says nothing about why (the log has that).
 fn identity_error(e: anyhow::Error) -> ApiError {
     let msg = e.to_string();
+    // A server with no pool configured is the operator's problem, named in
+    // the log; the person gets the same "try later" as an outage, never the
+    // setting's name.
+    if msg.contains(" is not set — ") {
+        tracing::error!("identity store unusable: {msg}");
+        return ApiError(StatusCode::SERVICE_UNAVAILABLE, crate::cognito::UNAVAILABLE.into());
+    }
     if msg == crate::cognito::UNAVAILABLE {
         ApiError(StatusCode::SERVICE_UNAVAILABLE, msg)
     } else {
@@ -275,7 +282,39 @@ pub async fn config(State(state): State<App>) -> Json<serde_json::Value> {
         // The site key only when tokens will be checked: a widget nobody
         // verifies is friction with nothing behind it.
         "turnstile_site_key": if crate::turnstile::configured() { crate::turnstile::site_key() } else { None },
+        // The Pricing page quotes this, so it can never disagree with billing.
+        "usd_per_mtoken": crate::config::sell_usd_per_mtoken(),
+        // The support bubble takes visitors only behind the bot check (dev
+        // excepted); otherwise it tells them chat is unavailable.
+        "support_chat": crate::turnstile::configured() || state.dev,
+        // A dev server lets "test" with no password in (`dev_login`); the
+        // sign-in form relaxes its fields to match.
+        "dev_login": dev_login_allowed(&state),
     }))
+}
+
+/// The address "test" signs in to on a dev server.
+const DEV_LOGIN_EMAIL: &str = "test@huntwell.test";
+
+/// Only a dev server (`--dev`) that is not also marked production. Sign-in
+/// everywhere else is the pool's alone.
+fn dev_login_allowed(state: &App) -> bool {
+    state.dev && !crate::config::is_production()
+}
+
+/// Email "test", no password, on a dev server: signed in as a test account,
+/// made the first time. There is no Cognito pool on a dev box, so without
+/// this nobody could sign in through the form at all.
+async fn dev_login(state: &App, headers: &axum::http::HeaderMap) -> Result<Response, ApiError> {
+    let acc = match store::find_account_by_email(&state.db, DEV_LOGIN_EMAIL).await? {
+        Some(a) => a,
+        None => store::create_account(&state.db, DEV_LOGIN_EMAIL, "Test User", "").await?,
+    };
+    store::mark_email_verified(&state.db, acc.account_id).await?;
+    let acc = store::get_account(&state.db, acc.account_id).await?.unwrap_or(acc);
+    tracing::warn!(account_id = acc.account_id, "dev sign-in as {DEV_LOGIN_EMAIL}, without a password");
+    let cookie = start_session(state, acc.account_id, &user_agent(headers)).await?;
+    Ok(([(header::SET_COOKIE, cookie)], Json(me_json(&acc, state))).into_response())
 }
 
 fn user_agent(headers: &axum::http::HeaderMap) -> String {
@@ -383,6 +422,9 @@ pub async fn login(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
+    if dev_login_allowed(&state) && body.email.trim().eq_ignore_ascii_case("test") && body.password.is_empty() {
+        return dev_login(&state, &headers).await;
+    }
     let ip = super::client_ip(&headers, peer);
     crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
     crate::turnstile::verify(&body.turnstile_token, ip).await.map_err(challenge_failed)?;
@@ -649,20 +691,67 @@ pub async fn forgot(
     if !crate::mail::configured() {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this server cannot send email, so passwords cannot be reset here".into()));
     }
-    let code = new_code();
-    if let Some(acc) = store::set_reset_token(&state.db, &email, &store::sha256_hex(&code)).await? {
-        let msg = crate::mail::password_reset(&acc.display_name, &code);
-        store::queue_mail(&state.db, Some(acc.account_id), &acc.email, "reset", &msg).await?;
-    } else {
+    if !issue_password_reset(&state.db, &email).await? {
         tracing::info!("password reset asked for {email}, which has no account — nothing sent");
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// Email `email`'s account a password reset: a six-digit code, and a link
+/// that carries its own long token, so following it fills everything in and
+/// asks only for the new password. Both good for `store::RESET_VALID_HOURS`;
+/// using either spends both, and a new reset replaces the last. "Forgot your
+/// password?" and the admin's "Send password reset" are both this. False when
+/// the address has no account (nothing is sent).
+pub(crate) async fn issue_password_reset(db: &store::Db, email: &str) -> anyhow::Result<bool> {
+    let code = new_code();
+    let token = format!("hwr_{}", new_token());
+    let Some(acc) = store::set_reset_token(db, email, &store::sha256_hex(&code), &store::sha256_hex(&token)).await? else {
+        return Ok(false);
+    };
+    let msg = crate::mail::password_reset(&acc.display_name, &code, &crate::mail::reset_link(&token));
+    store::queue_mail(db, Some(acc.account_id), &acc.email, "reset", &msg).await?;
+    Ok(true)
+}
+
+/// Whose password a reset link sets, for the page to say so — and to know the
+/// link is still good before asking for anything. A miss is a guess at a long
+/// random token, counted with sign-in failures like an invitation's.
+pub async fn reset_link_info(
+    State(state): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ip = super::client_ip(&headers, peer);
+    crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
+    let token = token.trim();
+    let found = if token.starts_with("hwr_") && token.len() <= 128 {
+        store::reset_link_account(&state.db, &store::sha256_hex(token)).await?
+    } else {
+        None
+    };
+    match found {
+        Some(acc) => Ok(Json(serde_json::json!({ "email": acc.email, "name": acc.display_name }))),
+        None => {
+            crate::throttle::LOGIN_FAILURES.note(&ip.to_string());
+            Err(ApiError(StatusCode::GONE, RESET_LINK_GONE.into()))
+        }
+    }
+}
+
+const RESET_LINK_GONE: &str = "this reset link has expired or has already been used — ask for a new one";
+
+/// Either the link's `token`, or the `email` and the `code` typed from the
+/// email.
 #[derive(Deserialize)]
 pub struct ResetBody {
+    #[serde(default)]
     pub email: String,
+    #[serde(default)]
     pub code: String,
+    #[serde(default)]
+    pub token: String,
     pub password: String,
 }
 
@@ -677,12 +766,19 @@ pub async fn reset(
     // Guesses at the code are sign-in guesses by another name.
     let ip = super::client_ip(&headers, peer);
     crate::throttle::LOGIN_FAILURES.check(&ip.to_string()).map_err(too_many)?;
+    if !body.token.trim().is_empty() {
+        return reset_by_link(&state, &ip.to_string(), body.token.trim(), &body.password).await;
+    }
     let email = body.email.trim().to_lowercase();
     let code: String = body.code.chars().filter(|c| c.is_ascii_digit()).collect();
     if code.len() != 6 {
         return Err(bad_request("the code is six digits"));
     }
     validate_signup(&email, &body.password).map_err(|e| bad_request(e.to_string()))?;
+    // Before the code is looked at: checking it uses it up, so a password the
+    // pool would refuse must be turned away first, or the person's next try —
+    // with a good password — finds their code spent.
+    crate::identity::check_password_strength(&body.password).map_err(|e| bad_request(e.to_string()))?;
     let acc = match store::check_reset_code(&state.db, &email, &store::sha256_hex(&code)).await? {
         store::CodeCheck::Verified(acc) => acc,
         store::CodeCheck::Wrong { left } => {
@@ -701,6 +797,31 @@ pub async fn reset(
     let ended = store::delete_all_sessions(&state.db, acc.account_id).await?;
     tracing::info!("password reset for account {} — {ended} session(s) ended", acc.account_id);
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The reset email's link: the token stands in for the address and the code.
+/// The password is checked before the link is spent, and the link is given
+/// back if the identity store then refuses or fails — a reset that did not
+/// happen must not cost them the email that lets them try again.
+async fn reset_by_link(state: &App, ip: &str, token: &str, password: &str) -> Result<Json<serde_json::Value>, ApiError> {
+    let hash = if token.starts_with("hwr_") && token.len() <= 128 { store::sha256_hex(token) } else { String::new() };
+    let Some(acc) = store::reset_link_account(&state.db, &hash).await? else {
+        crate::throttle::LOGIN_FAILURES.note(ip);
+        return Err(ApiError(StatusCode::GONE, RESET_LINK_GONE.into()));
+    };
+    validate_signup(&acc.email, password).map_err(|e| bad_request(e.to_string()))?;
+    crate::identity::check_password_strength(password).map_err(|e| bad_request(e.to_string()))?;
+    let Some(acc) = store::claim_reset_link(&state.db, &hash).await? else {
+        // Spent between the look and the claim — by the other of two submits.
+        return Err(ApiError(StatusCode::GONE, RESET_LINK_GONE.into()));
+    };
+    if let Err(e) = crate::identity::set_password(&acc.email, password).await {
+        store::restore_reset_link(&state.db, acc.account_id, &hash).await?;
+        return Err(identity_error(e));
+    }
+    let ended = store::delete_all_sessions(&state.db, acc.account_id).await?;
+    tracing::info!("password reset by link for account {} — {ended} session(s) ended", acc.account_id);
+    Ok(Json(serde_json::json!({ "ok": true, "email": acc.email })))
 }
 
 /// Send a new code. Bounded: each one is an email, and each one is six fresh
@@ -753,6 +874,8 @@ pub async fn me(State(state): State<App>, AuthUser(acc): AuthUser) -> Json<serde
     let caps = store::workspace_caps(&state.db, acc.tenant(), acc.account_id).await.unwrap_or_else(|_| store::Caps::none());
     if let Some(o) = v.as_object_mut() {
         o.insert("kinds".into(), serde_json::json!(kinds));
+        // Optional modules (the built-in CRM, …): the workspace's, like kinds.
+        o.insert("modules".into(), serde_json::json!(store::account_modules(&state.db, acc.tenant()).await));
         o.insert("platform_ack".into(), serde_json::json!(ws.as_ref().is_some_and(|a| a.platform_ack_at.is_some())));
         o.insert(
             "platform_ack_at".into(),

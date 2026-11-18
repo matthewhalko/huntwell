@@ -1,0 +1,138 @@
+/* Huntwell's own tokens (UI/web/src/styles.css), light and dark — keep them in
+   step with the app. Lato is bundled (fonts/, OFL): an extension page should
+   not fetch its fonts from Google. */
+@font-face { font-family: 'Lato'; font-weight: 400; font-display: swap; src: url(fonts/lato-400.woff2) format('woff2'); }
+@font-face { font-family: 'Lato'; font-weight: 700; font-display: swap; src: url(fonts/lato-700.woff2) format('woff2'); }
+@font-face { font-family: 'Lato'; font-weight: 900; font-display: swap; src: url(fonts/lato-900.woff2) format('woff2'); }
+
+:root {
+  --chrome: #3f0e40;
+  --chrome-2: #350d36;
+  --selected: #1264a3;
+  --brand-sky: #36c5f0;
+  --brand-green: #2eb67d;
+  --brand-yellow: #ecb22e;
+  --brand-pink: #e01e5a;
+  --grad: linear-gradient(120deg, var(--brand-sky), var(--brand-green) 38%, var(--brand-yellow) 66%, var(--brand-pink));
+  --ease-spring: cubic-bezier(0.34, 1.35, 0.64, 1);
+  --font: 'Lato', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --shadow: 0 1px 2px rgba(29, 28, 29, 0.06), 0 8px 24px -14px rgba(29, 28, 29, 0.2);
+  --accent: #007a5a;
+  --accent-deep: #00604a;
+  --accent-soft: #e6f3ee;
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f8f8f8;
+  --border: #e0e0e0;
+  --text: #1d1c1d;
+  --text-2: #616061;
+  --text-3: #9a999a;
+  --link: #1264a3;
+  --bad: #e01e5a;
+  --bad-bg: #fdecf2;
+  --info: #1264a3;
+  --info-bg: #e8f2fa;
+  --linkedin: #0a66c2;
+  --reddit: #ff4500;
+  --radius: 10px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --chrome: #0b0b0d;
+    --chrome-2: #0b0b0d;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 28px -14px rgba(0, 0, 0, 0.7);
+    --accent-soft: #14261f;
+    --bg: #111113;
+    --surface: #1a1a1d;
+    --surface-2: #222226;
+    --border: #2c2c30;
+    --text: #d1d2d3;
+    --text-2: #ababad;
+    --text-3: #77787c;
+    --link: #1d9bd1;
+    --bad: #ec6390;
+    --bad-bg: #38202a;
+    --info: #6cb4ee;
+    --info-bg: #16344a;
+    color-scheme: dark;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+html { background: var(--bg); }
+body {
+  font: 14.5px/1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+[hidden] { display: none !important; }
+h1 { font-size: 19px; font-weight: 900; margin: 0 0 6px; letter-spacing: -0.02em; line-height: 1.15; }
+.sub { color: var(--text-2); margin: 0 0 16px; }
+.muted { color: var(--text-2); }
+.sm { font-size: 12.5px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.between { justify-content: space-between; }
+
+.top { background: var(--chrome); color: #fff; height: 48px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; }
+/* the app's topbar lockup: ✦ emblem + wordmark */
+.brand { display: flex; align-items: center; gap: 0.3rem; color: #fff; font-weight: 900; font-size: 1.32rem; letter-spacing: -0.02em; user-select: none; text-decoration: none; }
+.brand .spark { font-size: 1.2em; line-height: 1; display: inline-block; transition: transform 0.25s var(--ease-spring); }
+.brand:hover .spark { transform: rotate(20deg) scale(1.1); }
+.grad-text { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.tag { font-size: 11px; font-weight: 700; color: rgba(255, 255, 255, 0.7); border: 1px solid rgba(255, 255, 255, 0.25); border-radius: 999px; padding: 1px 8px; }
+
+main { padding: 16px 14px; flex: 1; }
+.foot { padding: 10px 14px 14px; text-align: center; border-top: 1px solid var(--border); }
+
+.field { display: block; margin: 0 0 12px; }
+.field span { display: block; font-weight: 700; font-size: 12.5px; margin-bottom: 4px; }
+input {
+  width: 100%; font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+}
+input:focus { outline: 2px solid var(--selected); outline-offset: -1px; }
+.btn:focus-visible { outline: 2px solid var(--selected); outline-offset: 1px; }
+
+.btn {
+  font: inherit; font-weight: 700; border-radius: 8px; padding: 7px 12px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+}
+.btn:hover { background: var(--surface-2); }
+.btn:disabled { opacity: 0.55; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: var(--accent-deep); }
+.btn.sm { padding: 4px 10px; font-size: 12.5px; }
+.btn.wide { width: 100%; padding: 10px; }
+.btn.ghost { border-color: transparent; background: none; color: var(--text-2); }
+
+.error { color: var(--bad); background: var(--bad-bg); border-radius: 8px; padding: 8px 10px; margin: 10px 0; }
+.account { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.who { font-weight: 700; overflow-wrap: anywhere; }
+.account .btn { white-space: nowrap; }
+
+.list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.item { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.item-name { font-weight: 700; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }
+.item-sub { color: var(--text-2); font-size: 12.5px; }
+.chan { flex: none; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; color: #fff; }
+.chan.linkedin { background: var(--linkedin); }
+.chan.reddit { background: var(--reddit); }
+.item-subject { font-weight: 700; font-size: 13px; margin-top: 8px; }
+.item-preview {
+  color: var(--text-2); font-size: 13px; margin-top: 2px; white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.item-note { font-size: 12px; color: var(--info); background: var(--info-bg); border-radius: 6px; padding: 5px 8px; margin-top: 8px; }
+.item-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.item-actions .btn.primary { flex: 1; }
+
+.empty { text-align: center; padding: 22px 12px; border: 1.5px dashed var(--border); border-radius: var(--radius); margin-top: 8px; }
+.empty p { margin: 0 0 6px; }

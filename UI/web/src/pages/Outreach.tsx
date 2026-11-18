@@ -11,12 +11,14 @@ import {
   OutreachVersion,
   outreachBody,
   outreachEmail,
+  outreachState,
   outreachTo,
 } from '../api'
 import { useAuth } from '../auth'
 import Grid, { useNarrow } from '../components/Grid'
 import { CopyHover, Empty, Field, Loading, Modal, useConfirm, useToast } from '../components/ui'
-import { CopyIcon, GmailIcon } from '../components/icons'
+import { CopyIcon, GmailIcon, LinkedInIcon, OutlookIcon } from '../components/icons'
+import { useLoadView } from '../components/Skeleton'
 
 /// Copy to the clipboard and say so — or say why not. True when it worked.
 function useCopy() {
@@ -117,6 +119,14 @@ export default function Outreach() {
       { field: 'recipient_company', headerName: 'Company', flex: 1.2, hide: narrow },
       { field: 'campaign', headerName: 'Written for', flex: 1, hide: narrow, valueFormatter: (p) => p.value || '—' },
       { field: 'subject', headerName: 'Subject', flex: 2 },
+      {
+        headerName: 'Status',
+        width: 160,
+        hide: narrow,
+        valueGetter: (p) => (p.data ? outreachState(p.data) : ''),
+        cellRenderer: (p: { value: string; data?: Draft }) =>
+          p.value ? <span className={'badge ' + (p.data?.sent_at ? 'ok' : 'info')}>{p.value}</span> : <span className="muted">Draft</span>,
+      },
       { field: 'created_by_name', headerName: 'By', flex: 0.8, hide: narrow },
       {
         field: 'updated_at',
@@ -130,6 +140,7 @@ export default function Outreach() {
     [narrow],
   )
 
+  const itemsView = useLoadView(items !== null)
   return (
     <>
       <div className="page-head">
@@ -196,8 +207,8 @@ export default function Outreach() {
         </div>
       )}
 
-      {items === null ? (
-        <Loading />
+      {items === null || itemsView !== 'ready' ? (
+        itemsView === 'skeleton' ? <Loading /> : null
       ) : items.length === 0 ? (
         <Empty title="No drafts yet">
           <p className="muted">
@@ -346,7 +357,7 @@ function NewDraftDialog({
   onCreated: (o: Draft) => void
 }) {
   const toast = useToast()
-  const [r, setR] = useState({ name: '', email: '', title: '', company: '', notes: '' })
+  const [r, setR] = useState({ name: '', email: '', title: '', company: '', notes: '', linkedin: '' })
   // "d:12" a saved profile, "p:7" a plan's own outreach, "" the workspace's.
   const [forWhat, setForWhat] = useState(initialDesign ? `d:${initialDesign}` : '')
   const [busy, setBusy] = useState(false)
@@ -376,6 +387,9 @@ function NewDraftDialog({
           </Field>
           <Field label="Email">
             <input type="email" value={r.email} onChange={set('email')} maxLength={320} />
+          </Field>
+          <Field label="LinkedIn">
+            <input value={r.linkedin} onChange={set('linkedin')} maxLength={300} placeholder="linkedin.com/in/…" />
           </Field>
           <Field label="Title">
             <input value={r.title} onChange={set('title')} maxLength={200} />
@@ -428,6 +442,90 @@ const SOURCE_LABEL: Record<string, string> = {
   revise: 'Revised',
   edit: 'Edited by hand',
   restore: 'Restored',
+}
+
+/// Sending through Huntwell for Chrome: queue the draft for LinkedIn or
+/// Reddit, and the extension opens their page with it filled in for the person
+/// to send. Also "Mark sent", for one sent any other way.
+function ChromeQueue({ o, write, onChange }: { o: Draft; write: boolean; onChange: (d: Draft) => void }) {
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+  const [askReddit, setAskReddit] = useState(false)
+  const [reddit, setReddit] = useState(o.recipient_reddit || '')
+  const call = async (path: string, body: object, done?: string) => {
+    setBusy(true)
+    try {
+      const r = path.endsWith('/sent') ? await api.post<{ outreach: Draft }>(path, body) : await api.put<{ outreach: Draft }>(path, body)
+      onChange(r.outreach)
+      setAskReddit(false)
+      if (done) toast(done)
+    } catch (e: any) {
+      toast(e.message, true)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const queue = (channel: 'linkedin' | 'reddit' | null, extra: object = {}) =>
+    call(`/api/outreach/${o.outreach_id}/queue`, { channel, ...extra }, channel ? `Queued — open Huntwell for Chrome to send it on ${channel === 'reddit' ? 'Reddit' : 'LinkedIn'}` : 'Taken off the queue')
+  const state = outreachState(o)
+  return (
+    <div className="outreach-queue">
+      <span className="outreach-queue-label">
+        {state ? (
+          <>
+            <span className={'badge ' + (o.sent_at ? 'ok' : 'info')}>{state}</span>
+            {o.sent_at && <span className="muted sm"> {fmtDate(o.sent_at)}</span>}
+          </>
+        ) : (
+          <span className="muted sm" title="Huntwell for Chrome opens their page with this message filled in. You press Send.">
+            Send with Huntwell for Chrome
+          </span>
+        )}
+      </span>
+      {write && (
+        <span className="row" style={{ gap: '0.4rem', flexWrap: 'wrap' }}>
+          {o.send_channel && !o.sent_at ? (
+            <button className="btn sm" disabled={busy} onClick={() => queue(null)}>
+              Take off queue
+            </button>
+          ) : askReddit ? (
+            <>
+              <input
+                className="sm"
+                value={reddit}
+                onChange={(e) => setReddit(e.target.value)}
+                placeholder="Reddit username"
+                aria-label="Their Reddit username"
+                autoFocus
+                onKeyDown={(e) => e.key === 'Enter' && queue('reddit', { reddit })}
+                style={{ width: '11rem' }}
+              />
+              <button className="btn primary sm" disabled={busy || !reddit.trim()} onClick={() => queue('reddit', { reddit })}>
+                Queue
+              </button>
+              <button className="btn ghost sm" onClick={() => setAskReddit(false)}>
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn sm" disabled={busy} onClick={() => queue('linkedin')}>
+                <LinkedInIcon /> {o.sent_at ? 'Queue again for LinkedIn' : 'Queue for LinkedIn'}
+              </button>
+              <button className="btn sm" disabled={busy} onClick={() => (o.recipient_reddit ? queue('reddit') : setAskReddit(true))}>
+                {o.sent_at ? 'Queue again for Reddit' : 'Queue for Reddit'}
+              </button>
+            </>
+          )}
+          {!o.sent_at && !askReddit && (
+            <button className="btn ghost sm" disabled={busy} onClick={() => call(`/api/outreach/${o.outreach_id}/sent`, { via: o.send_channel || 'email' }, 'Marked sent')} title="Sent it yourself? Record it.">
+              Mark sent
+            </button>
+          )}
+        </span>
+      )}
+    </div>
+  )
 }
 
 function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boolean; onClose: () => void; onChanged: () => void }) {
@@ -529,13 +627,43 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
   // Google cuts a compose link somewhere past 8,000 characters; past that,
   // copying is the way out rather than a link that loses the end of the email.
   const gmailFits = gmail.length < 7500
+  // Outlook on the web's compose window, filled in the same way. Same length
+  // limit in practice.
+  const outlook = o
+    ? 'https://outlook.office.com/mail/deeplink/compose?' +
+      (o.recipient_email ? `to=${encodeURIComponent(o.recipient_email)}&` : '') +
+      `subject=${encodeURIComponent(o.subject)}&body=${encodeURIComponent(outreachBody(o))}`
+    : ''
+  const outlookFits = outlook.length < 7500
+  // LinkedIn has no compose link: the message is copied, and their profile
+  // opens (or a people search for them, without one) for it to be pasted.
+  // The tab is opened in the click itself — a browser blocks one opened
+  // later — and the copy is started first, while this page still has focus.
+  const openLinkedIn = () => {
+    if (!o) return
+    const message = o.body.trim()
+    const copied = navigator.clipboard.writeText(message)
+    const who = [o.recipient_name, o.recipient_company].filter(Boolean).join(' ')
+    const url = o.recipient_linkedin || `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(who)}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+    copied.then(
+      () =>
+        toast(
+          message.length > 300
+            ? 'Message copied — paste it into LinkedIn. It is over 300 characters: fine for a message or InMail, too long for a connection note.'
+            : 'Message copied — paste it into LinkedIn',
+        ),
+      () => toast('Opened LinkedIn, but your browser blocked the clipboard — copy the message from here', true),
+    )
+  }
 
+  const draftView = useLoadView(o !== null)
   return (
     <Modal title={title} onClose={onClose} className="outreach-dialog">
       {err ? (
         <p className="muted">{err}</p>
-      ) : !o ? (
-        <Loading />
+      ) : !o || draftView !== 'ready' ? (
+        draftView === 'skeleton' ? <Loading /> : null
       ) : (
         <>
           <div className="outreach-copybar">
@@ -554,12 +682,35 @@ function DraftDialog({ id, write, onClose, onChanged }: { id: number; write: boo
             >
               <GmailIcon /> Open in Gmail
             </a>
+            <a
+              className={'btn sm' + (outlookFits ? '' : ' disabled')}
+              href={outlookFits ? outlook : undefined}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-disabled={!outlookFits}
+              title={outlookFits ? 'Opens Outlook on the web with this email filled in. You send it.' : 'Too long for an Outlook link — copy the email instead'}
+            >
+              <OutlookIcon /> Open in Outlook
+            </a>
+            <button
+              className="btn sm"
+              onClick={openLinkedIn}
+              title={
+                o.recipient_linkedin
+                  ? 'Copies the message and opens their LinkedIn profile. Paste it and send.'
+                  : 'Copies the message and searches LinkedIn for them. Paste it and send.'
+              }
+            >
+              <LinkedInIcon /> Open in LinkedIn
+            </button>
             {o.recipient_email && mailto.length < 1900 && (
               <a className="btn sm" href={mailto}>
                 Open in mail app
               </a>
             )}
           </div>
+
+          <ChromeQueue o={o} write={write} onChange={changed} />
 
           <dl className="outreach-meta">
             <dt>To</dt>
@@ -734,7 +885,8 @@ function ProfilesTab({
       toast(e.message, true)
     }
   }
-  if (designs === null) return <Loading />
+  const designsView = useLoadView(designs !== null)
+  if (designs === null || designsView !== 'ready') return designsView === 'skeleton' ? <Loading /> : null
   return (
     <>
       <div className="row between" style={{ marginBottom: '1rem' }}>

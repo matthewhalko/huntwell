@@ -12,6 +12,8 @@ import Runs from './pages/Runs'
 import RunView from './pages/RunView'
 import Prospects from './pages/Prospects'
 import Outreach from './pages/Outreach'
+import Crm, { ContactPage } from './pages/Crm'
+import ExtensionAuthorize from './pages/ExtensionAuthorize'
 import Usage from './pages/Usage'
 import ApiAccess from './pages/ApiAccess'
 import ApiReference from './pages/ApiReference'
@@ -21,6 +23,7 @@ import { Privacy, Terms } from './pages/Legal'
 import { Pricing, Product, UseCases } from './pages/Site'
 import { RouteMeta } from './components/Site'
 import { AppSkeleton } from './components/Skeleton'
+import SupportChat from './components/SupportChat'
 
 function RequireAuth({ children }: { children: React.ReactElement }) {
   const { me, loading } = useAuth()
@@ -28,7 +31,8 @@ function RequireAuth({ children }: { children: React.ReactElement }) {
   // The app's own frame with a skeleton in it, not a blank "Loading…" page
   // that the purple chrome then snaps in over.
   if (loading) return <AppSkeleton />
-  if (!me) return <Navigate to="/login" state={{ from: loc.pathname }} replace />
+  // The query rides along: the extension's sign-in page is all query.
+  if (!me) return <Navigate to="/login" state={{ from: loc.pathname + loc.search }} replace />
   // Signed in, but the address is not proven yet: nothing else will answer.
   if (!me.email_verified) return <Navigate to="/verify" replace />
   return children
@@ -66,6 +70,16 @@ export default function App() {
       <Route path="/pricing" element={<Pricing />} />
       <Route path="/terms" element={<Terms />} />
       <Route path="/privacy" element={<Privacy />} />
+      {/* Huntwell for Chrome's sign-in: its own page, not inside the app's frame,
+          because it opens in Chrome's small sign-in window. */}
+      <Route
+        path="/app/extension/authorize"
+        element={
+          <RequireAuth>
+            <ExtensionAuthorize />
+          </RequireAuth>
+        }
+      />
       <Route
         path="/app"
         element={
@@ -85,6 +99,8 @@ export default function App() {
         <Route path="runs/:id" element={<RunRedirect />} />
         <Route path="prospects" element={<Prospects />} />
         <Route path="outreach" element={<Outreach />} />
+        <Route path="crm" element={<Crm />} />
+        <Route path="crm/:id" element={<ContactPage />} />
         <Route path="usage" element={<Usage />} />
         <Route path="api-access" element={<ApiAccess />} />
         <Route path="api-docs" element={<ApiReference />} />
@@ -92,6 +108,8 @@ export default function App() {
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    {/* Help from anywhere: the public site, sign-in, and the app. */}
+    <SupportChat />
     </>
   )
 }

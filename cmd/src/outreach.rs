@@ -146,6 +146,22 @@ pub fn find_email(text: &str) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
+/// A LinkedIn profile or page URL found in `text`, made absolute: only
+/// linkedin.com (or a subdomain of it), http(s), no spaces, bounded. Anything
+/// else — a scraped "LinkedIn: see website" — is no link at all.
+pub fn linkedin_url(text: &str) -> Option<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | ','))
+        .map(|t| t.trim_end_matches(|c: char| matches!(c, '.' | ';' | ':')))
+        .find(|t| t.to_ascii_lowercase().contains("linkedin.com/"))
+        .and_then(|t| {
+            let full = if t.starts_with("http://") || t.starts_with("https://") { t.to_string() } else { format!("https://{}", t.trim_start_matches("//")) };
+            let url = reqwest::Url::parse(&full).ok()?;
+            let host = url.host_str()?.to_ascii_lowercase();
+            ((host == "linkedin.com" || host.ends_with(".linkedin.com")) && matches!(url.scheme(), "http" | "https") && full.len() <= 300)
+                .then(|| url.to_string())
+        })
+}
+
 /// Who a custom-schema row is, for a draft: its columns read by what they are
 /// called. An "Email"-like column (else any value that is an address) fills
 /// the To; a contact/owner/name column the name; a company/business-like one
@@ -193,6 +209,7 @@ pub fn recipient_from_record(title: &str, fields: &Value, cols: &[crate::artifac
     if to.email.is_empty() {
         to.email = cols.iter().find_map(|f| find_email(&value(&f.key))).unwrap_or_default();
     }
+    to.linkedin = cols.iter().find_map(|f| linkedin_url(&value(&f.key))).unwrap_or_default();
     if to.company.is_empty() && to.name.is_empty() {
         to.company = title.trim().chars().take(200).collect();
     }
@@ -411,6 +428,15 @@ mod tests {
         own.design.product = "Guest messaging".into();
         let p = prompt(&ws, Some(&own), "Sam", &to, &[]);
         assert!(p.contains("SENDER'S PRODUCT:\nGuest messaging") && !p.contains("Room software"));
+    }
+
+    #[test]
+    fn only_a_real_linkedin_link_is_kept() {
+        assert_eq!(linkedin_url("linkedin.com/in/ana-ruiz").as_deref(), Some("https://linkedin.com/in/ana-ruiz"));
+        assert_eq!(linkedin_url("Profile: https://www.linkedin.com/in/ana-ruiz/.").as_deref(), Some("https://www.linkedin.com/in/ana-ruiz/"));
+        for none in ["see website", "https://evil.example/linkedin.com/in/x", "https://linkedin.com.evil.example/in/x", "javascript:linkedin.com/"] {
+            assert_eq!(linkedin_url(none), None, "{none}");
+        }
     }
 
     #[test]

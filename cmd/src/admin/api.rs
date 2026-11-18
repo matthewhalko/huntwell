@@ -75,13 +75,23 @@ pub fn router(state: Admin) -> Router {
             .route("/admin/api/vms/{id}/stop", post(stop_vm))
             .route("/admin/api/vms/{id}/start", post(start_vm))
             .route("/admin/api/accounts/{id}/connected-logins", axum::routing::put(put_account_connected_logins))
+            .route("/admin/api/accounts/{id}/modules", axum::routing::put(put_account_modules))
             .route("/admin/api/accounts/{id}/mfa", axum::routing::delete(reset_account_mfa))
+            .route("/admin/api/accounts/{id}/password-reset", post(send_password_reset))
+            .route("/admin/api/support", get(support_inbox))
+            .route("/admin/api/support/slack", axum::routing::put(put_support_slack))
+            .route("/admin/api/support/slack/test", post(test_support_slack))
+            .route("/admin/api/support/image/{id}", get(support_image))
+            .route("/admin/api/support/{id}", get(support_chat))
+            .route("/admin/api/support/{id}/reply", post(support_reply))
+            .route("/admin/api/support/{id}/status", post(support_status))
             .route("/admin/api/routing", get(get_routing).put(put_routing))
             .route("/admin/api/models", get(get_models).put(put_models))
             .route("/admin/api/models/available", get(available_models))
             .route("/admin/api/features", get(get_features).put(put_features))
             .route("/admin/api/accounts", get(list_accounts))
             .route("/admin/api/waitlist", get(list_waitlist))
+            .route("/admin/api/schedule", get(schedule))
             .route("/admin/api/waitlist/invite", post(invite_signup))
             .route("/admin/api/waitlist/{id}/approve", post(approve_waitlist))
             .route("/admin/api/waitlist/{id}/decline", post(decline_waitlist))
@@ -154,11 +164,29 @@ struct Login {
     password: String,
 }
 
+/// The operator a dev box signs in as (`dev_login_allowed`).
+const DEV_OPERATOR: &str = "test@huntwell.test";
+
+/// A dev box (`HUNTWELL_DEV`, never production) has no operators' Cognito
+/// pool, so email `test` with no password signs in as `DEV_OPERATOR`, made
+/// on first use. Like the app's `web::auth::dev_login`.
+pub fn dev_login_allowed() -> bool {
+    crate::config::is_dev() && !crate::config::is_production()
+}
+
 async fn login(
     State(state): State<Admin>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<Login>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if dev_login_allowed() && req.email.trim().eq_ignore_ascii_case("test") && req.password.is_empty() {
+        store::upsert_admin_user(&state.db, DEV_OPERATOR, "dev").await.map_err(internal)?;
+        tracing::warn!("admin dev sign-in as {DEV_OPERATOR}, without a password");
+        let tok = uuid_token();
+        state.sessions.lock().await.insert(tok.clone(), DEV_OPERATOR.to_string());
+        let cookie = format!("{COOKIE}={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+        return Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))));
+    }
     // The peer itself: nothing sits in front of the admin.
     let ip = peer.ip().to_string();
     crate::throttle::ADMIN_LOGIN_FAILURES.check(&ip).map_err(|wait| {
@@ -209,7 +237,7 @@ async fn session(State(state): State<Admin>, headers: HeaderMap) -> Json<Value> 
         None => None,
     };
     // `setupRequired` is what turns the sign-in card into the first-run form.
-    Json(json!({ "email": who, "setupRequired": crate::setup::required() }))
+    Json(json!({ "email": who, "setupRequired": crate::setup::required(), "devLogin": dev_login_allowed() }))
 }
 
 #[derive(serde::Deserialize)]
@@ -905,6 +933,7 @@ async fn get_features(State(state): State<Admin>, headers: HeaderMap) -> Result<
         "kinds": store::installation_kinds(&state.db).await,
         "all": ["prospects", "artifacts", "report", "assets"],
         "default": store::DEFAULT_KINDS,
+        "modules": store::MODULES.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
     })))
 }
 
@@ -998,6 +1027,313 @@ async fn reset_account_mfa(State(state): State<Admin>, headers: HeaderMap, Path(
     crate::identity::disable_mfa(&acc.email, acc.account_id, &state.db).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     tracing::info!("two-factor reset for account {} by operator {who}", acc.account_id);
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Email someone a password reset — for a person who cannot sign in and is
+/// unsure how to start one (a password their browser made up and kept, say).
+/// Exactly what "Forgot your password?" sends (`issue_password_reset`: a code
+/// and a one-click link, good for a day, to the account's own address), so the
+/// operator never sees or sets a password, and it only works for whoever reads
+/// that inbox.
+async fn send_password_reset(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let acc = store::get_account(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
+    crate::web::auth::issue_password_reset(&state.db, &acc.email).await.map_err(internal)?;
+    tracing::info!(operator = %who, account = acc.account_id, "password reset emailed by an operator");
+    Ok(Json(json!({ "ok": true, "email": acc.email })))
+}
+
+// ---- support -------------------------------------------------------------------
+//
+// The inbox for the support bubble (`web::support`, `crate::support`): every
+// chat, newest activity first; one chat with who it is from; reply, close,
+// reopen. And the Slack app that makes every chat a thread in the operators'
+// channel, answerable there (`support::slack`); its tokens sealed.
+
+#[derive(Deserialize)]
+struct InboxQuery {
+    #[serde(default)]
+    status: String,
+}
+
+/// The Slack setting as the page shows it: whether it is connected, to which
+/// channel, where Slack should send replies, and when it last did. Never a
+/// token or the signing secret.
+async fn support_slack_state(state: &Admin) -> Value {
+    use crate::support::slack as ss;
+    let get = |k: &'static str| async move { store::get_setting(&state.db, k).await.ok().flatten().unwrap_or_default() };
+    let request_url = ss::request_url();
+    json!({
+        "set": !get(ss::BOT_TOKEN_KEY).await.trim().is_empty() && !get(ss::CHANNEL_KEY).await.trim().is_empty(),
+        "label": get(ss::LABEL_KEY).await,
+        "channel": get(ss::CHANNEL_KEY).await,
+        "replies": !get(ss::SIGNING_KEY).await.trim().is_empty(),
+        "heard_at": Some(get(ss::HEARD_KEY).await).filter(|h| !h.is_empty()),
+        "request_url": request_url,
+        "manifest": ss::manifest(request_url.as_deref()),
+    })
+}
+
+async fn support_inbox(State(state): State<Admin>, headers: HeaderMap, Query(q): Query<InboxQuery>) -> Result<Json<Value>, ApiError> {
+    require(&state, &headers).await?;
+    let status = if q.status.is_empty() { "open" } else { q.status.as_str() };
+    let rows = store::support_inbox(&state.db, status, 300).await.map_err(internal)?;
+    let unread = store::support_unread_count(&state.db).await.map_err(internal)?;
+    Ok(Json(json!({ "rows": rows, "unread": unread, "slack": support_slack_state(&state).await })))
+}
+
+/// One chat, its messages, and who the person is in Huntwell. Opening it
+/// marks it read.
+async fn support_chat(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    require(&state, &headers).await?;
+    let c = store::support_get(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such chat".into()))?;
+    let messages = store::support_messages(&state.db, id, 0).await.map_err(internal)?;
+    store::support_operator_seen(&state.db, id).await.map_err(internal)?;
+    let mut customer = Value::Null;
+    if let Some(a) = c.account_id {
+        if let Some(acc) = store::get_account(&state.db, a).await.map_err(internal)? {
+            let ws_id = c.workspace_id.unwrap_or(a);
+            let ws = store::get_account(&state.db, ws_id).await.map_err(internal)?;
+            let usage = store::ensure_usage(&state.db, ws_id).await.ok();
+            let plans = store::list_plans(&state.db, ws_id).await.map(|p| p.len()).unwrap_or(0);
+            let runs = store::list_executions(&state.db, ws_id, None, 5).await.unwrap_or_default();
+            customer = json!({
+                "account_id": acc.account_id,
+                "email": acc.email,
+                "name": acc.display_name,
+                "joined": acc.created_at,
+                "two_factor": acc.mfa_enabled_at.is_some(),
+                "workspace_id": ws_id,
+                "workspace": ws.map(|w| w.workspace_name).unwrap_or_default(),
+                "own_workspace": ws_id == a,
+                "credits_usd": usage.map(|u| u.credits_usd),
+                "plans": plans,
+                "runs": runs.iter().map(|r| json!({
+                    "id": r.execution_id, "plan": r.source, "status": r.status, "started_at": r.started_at,
+                })).collect::<Vec<_>>(),
+            });
+        }
+    }
+    Ok(Json(json!({ "conversation": c, "messages": messages, "customer": customer })))
+}
+
+/// One screenshot from a chat, for the operator.
+async fn support_image(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>) -> Result<Response, ApiError> {
+    require(&state, &headers).await?;
+    let (_, content_type, bytes) = store::support_image(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such image".into()))?;
+    Ok(([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "private, max-age=86400, immutable".to_string())], bytes).into_response())
+}
+
+#[derive(Deserialize)]
+struct SupportReply {
+    body: String,
+}
+
+async fn support_reply(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>, Json(b): Json<SupportReply>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let body = b.body.trim();
+    if body.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "write a reply first".into()));
+    }
+    if body.chars().count() > store::SUPPORT_BODY_MAX {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("a reply can be at most {} characters", store::SUPPORT_BODY_MAX)));
+    }
+    let c = store::support_get(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such chat".into()))?;
+    let msg = store::support_operator_reply(&state.db, id, &who, body, &[], None).await.map_err(internal)?;
+    // Decided on the chat as it was before this reply: whether the person
+    // has been looking at it lately.
+    let emailed = match crate::support::email_reply_if_away(&state.db, &c, body).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(conversation_id = id, "support reply not emailed: {e:#}");
+            false
+        }
+    };
+    tracing::info!(operator = %who, conversation_id = id, emailed, "support reply sent");
+    Ok(Json(json!({ "message": msg, "emailed": emailed })))
+}
+
+#[derive(Deserialize)]
+struct SupportStatus {
+    open: bool,
+}
+
+async fn support_status(State(state): State<Admin>, headers: HeaderMap, Path(id): Path<i64>, Json(b): Json<SupportStatus>) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let c = store::support_get(&state.db, id).await.map_err(internal)?.ok_or(ApiError(StatusCode::NOT_FOUND, "no such chat".into()))?;
+    if c.status == "ended" {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "they ended this chat themselves. If they write again, it will be a new chat.".into()));
+    }
+    if !store::support_set_status(&state.db, id, b.open, &who).await.map_err(internal)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such chat".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SupportSlack {
+    /// Disconnect: forget the token, the signing secret and the channel.
+    #[serde(default)]
+    off: bool,
+    /// The bot token (`xoxb-…`). Empty keeps the saved one.
+    #[serde(default)]
+    bot_token: String,
+    /// The app's signing secret. Empty keeps the saved one.
+    #[serde(default)]
+    signing_secret: String,
+    #[serde(default)]
+    channel: String,
+}
+
+async fn put_support_slack(State(state): State<Admin>, headers: HeaderMap, Json(b): Json<SupportSlack>) -> Result<Json<Value>, ApiError> {
+    use crate::support::slack as ss;
+    let who = require(&state, &headers).await?;
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.into());
+    if b.off {
+        for k in [ss::BOT_TOKEN_KEY, ss::SIGNING_KEY, ss::CHANNEL_KEY, ss::LABEL_KEY, ss::HEARD_KEY] {
+            store::set_setting(&state.db, k, "").await.map_err(internal)?;
+        }
+        tracing::info!(operator = %who, "support Slack disconnected");
+        return Ok(Json(support_slack_state(&state).await));
+    }
+    // A secret left blank keeps the saved one, so changing the channel does
+    // not mean pasting both again.
+    let saved = match ss::config(&state.db).await {
+        Ok(c) => Some(c),
+        Err(_) => None,
+    };
+    let bot = match b.bot_token.trim() {
+        "" => saved.as_ref().map(|c| c.bot.clone()).ok_or_else(|| bad("paste the bot token (xoxb-…)"))?,
+        t if ss::valid_bot_token(t) => t.to_string(),
+        _ => return Err(bad("the bot token starts xoxb-. It is on the app's OAuth & Permissions page.")),
+    };
+    let signing = match b.signing_secret.trim() {
+        "" => saved.as_ref().map(|c| c.signing.clone()).filter(|s| !s.is_empty()).ok_or_else(|| bad("paste the signing secret"))?,
+        t if ss::valid_signing_secret(t) => t.to_string(),
+        _ => return Err(bad("the signing secret is the 32-character value under Basic Information → App Credentials (not the client secret or a token).")),
+    };
+    let channel = b.channel.trim().to_uppercase();
+    if !ss::valid_channel(&channel) {
+        return Err(bad("paste the channel ID (it starts with C). In Slack, open the channel's details; the ID is at the bottom."));
+    }
+    let label = ss::check(&bot, &channel).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let seal = |t: &str| {
+        crate::web::signing::seal_secret(t).ok_or_else(|| {
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "this admin has no key to seal the secrets with (HUNTWELL_SESSION_SECRET is not set here)".into())
+        })
+    };
+    store::set_setting(&state.db, ss::BOT_TOKEN_KEY, &seal(&bot)?).await.map_err(internal)?;
+    store::set_setting(&state.db, ss::SIGNING_KEY, &seal(&signing)?).await.map_err(internal)?;
+    store::set_setting(&state.db, ss::CHANNEL_KEY, &channel).await.map_err(internal)?;
+    store::set_setting(&state.db, ss::LABEL_KEY, &label).await.map_err(internal)?;
+    tracing::info!(operator = %who, channel = %label, "support Slack connected");
+    Ok(Json(support_slack_state(&state).await))
+}
+
+async fn test_support_slack(State(state): State<Admin>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    use crate::support::slack as ss;
+    require(&state, &headers).await?;
+    let cfg = match ss::config(&state.db).await {
+        Ok(c) => c,
+        Err(ss::NoConfig::NotSet) => return Err(ApiError(StatusCode::BAD_REQUEST, "Slack is not connected".into())),
+        Err(ss::NoConfig::Broken(why)) => return Err(ApiError(StatusCode::BAD_REQUEST, why.into())),
+    };
+    let text = "*Huntwell support* is connected. Each new support chat starts a thread here; reply in the thread to answer.";
+    ss::post(&cfg, text, None, false).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.message().to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---- schedule -----------------------------------------------------------------
+//
+// Every scheduled plan in the installation, the runs it will start in the next
+// `hours`, and how long each is expected to take: the plan's own average over
+// its last ten finished runs, else a default for its effort. Plus what is
+// running now and the run capacity, so a pile-up shows before it happens.
+
+/// Minutes a run of this effort takes when the plan has no history yet.
+fn default_minutes(effort: &str) -> f64 {
+    match store::normalize_effort(effort).as_str() {
+        "quick" => 5.0,
+        "thorough" => 30.0,
+        "exhaustive" => 60.0,
+        _ => 15.0,
+    }
+}
+
+async fn schedule(State(state): State<Admin>, headers: HeaderMap, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, ApiError> {
+    require(&state, &headers).await?;
+    let hours: i64 = q.get("hours").and_then(|h| h.parse().ok()).unwrap_or(24).clamp(1, 24 * 14);
+    let now = chrono::Utc::now();
+    let plans = store::all_scheduled_plans(&state.db).await.map_err(internal)?;
+    let running = store::active_runs_all(&state.db).await.map_err(internal)?;
+    let capacity = store::run_capacity(&state.db).await.map_err(internal)?;
+    Ok(Json(schedule_view(&plans, &running, capacity, now, hours)))
+}
+
+/// The schedule page's data, from what the database said: each plan's runs in
+/// the window with their expected length, and the most expected at once.
+pub(crate) fn schedule_view(
+    plans: &[store::ScheduledPlan],
+    running: &[(i64, i64, String, String, chrono::DateTime<chrono::Utc>)],
+    capacity: i64,
+    now: chrono::DateTime<chrono::Utc>,
+    hours: i64,
+) -> Value {
+    let to = now + chrono::Duration::hours(hours);
+    let mut runs: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    let out: Vec<Value> = plans
+        .iter()
+        .map(|p| {
+            let (minutes, basis) = match p.avg_minutes {
+                Some(m) if p.runs_measured > 0 => (m.clamp(1.0, 24.0 * 60.0), format!("average of its last {} run{}", p.runs_measured, if p.runs_measured == 1 { "" } else { "s" })),
+                _ => (default_minutes(&p.effort), format!("{} effort, no runs yet", store::normalize_effort(&p.effort))),
+            };
+            let fires = store::fires_between(&p.schedule_time, &p.schedule_days, &p.timezone, now, to);
+            for f in &fires {
+                runs.push((*f, *f + chrono::Duration::seconds((minutes * 60.0) as i64)));
+            }
+            json!({
+                "plan_id": p.plan_id,
+                "account_id": p.account_id,
+                "plan": p.plan,
+                "owner": p.owner_email,
+                "timezone": p.timezone,
+                "schedule_time": p.schedule_time,
+                "schedule_days": p.schedule_days,
+                "next_run_at": p.next_run_at.map(|t| t.to_rfc3339()),
+                "effort": store::normalize_effort(&p.effort),
+                "est_minutes": (minutes * 10.0).round() / 10.0,
+                "est_basis": basis,
+                "last_status": p.last_status,
+                "last_started_at": p.last_started_at.map(|t| t.to_rfc3339()),
+                "fires": fires.iter().map(|t| t.to_rfc3339()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // The most scheduled runs expected at once in the window — the number to
+    // hold against the capacity.
+    let mut edges: Vec<(chrono::DateTime<chrono::Utc>, i32)> = runs.iter().flat_map(|(s, e)| [(*s, 1), (*e, -1)]).collect();
+    edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let (mut live, mut peak, mut peak_at) = (0, 0, None);
+    for (t, d) in edges {
+        live += d;
+        if live > peak {
+            peak = live;
+            peak_at = Some(t);
+        }
+    }
+    json!({
+        "now": now.to_rfc3339(),
+        "until": to.to_rfc3339(),
+        "hours": hours,
+        "capacity": capacity,
+        "peak": peak,
+        "peak_at": peak_at.map(|t| t.to_rfc3339()),
+        "plans": out,
+        "running": running.iter().map(|(id, plan_id, plan, status, started)| json!({
+            "execution_id": id, "plan_id": plan_id, "plan": plan, "status": status, "started_at": started.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 // ---- waitlist & invitations ---------------------------------------------------
@@ -1180,6 +1516,26 @@ async fn put_account_connected_logins(
     // is what someone will want to find afterwards.
     tracing::info!(operator = %who, account = id, on = body.on, "connected logins changed");
     Ok(Json(json!({ "ok": true, "connected_logins": body.on })))
+}
+
+#[derive(Deserialize)]
+struct ModulesReq {
+    modules: Vec<String>,
+}
+
+/// Switch a workspace's optional modules (the built-in CRM, …) on or off.
+async fn put_account_modules(
+    State(state): State<Admin>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<ModulesReq>,
+) -> Result<Json<Value>, ApiError> {
+    let who = require(&state, &headers).await?;
+    let modules = store::set_account_modules(&state.db, id, &body.modules)
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "no such account".into()))?;
+    tracing::info!(operator = %who, account = id, modules = %modules.join(","), "modules changed");
+    Ok(Json(json!({ "ok": true, "modules": modules })))
 }
 
 #[derive(Deserialize)]
@@ -1401,22 +1757,440 @@ mod money_tests {
 
     #[test]
     fn profit_is_the_charge_minus_what_cursor_said_or_our_estimate() {
-        // 1M billed tokens at the default $5/M = $5.00; Cursor reported $1.20.
+        // 1M billed tokens at the default $1/M = $1.00; Cursor reported $1.20,
+        // so this one lost money.
         let v = execution_money(&run(900_000, 100_000, 0, 1_200_000, "composer-2.5"));
-        assert_eq!(v["charged_usd_micros"], 5_000_000);
+        assert_eq!(v["charged_usd_micros"], 1_000_000);
         assert_eq!(v["cost_basis"], "reported");
-        assert_eq!(v["profit_usd_micros"], 3_800_000);
+        assert_eq!(v["profit_usd_micros"], -200_000);
         // Nothing reported: estimated from the model, and said to be.
         let v = execution_money(&run(900_000, 100_000, 0, 0, "composer-2.5"));
         assert_eq!(v["cost_basis"], "estimated");
         assert_eq!(v["cost_usd_micros"], 700_000);
-        assert_eq!(v["profit_usd_micros"], 4_300_000);
+        assert_eq!(v["profit_usd_micros"], 300_000);
         // A model with no known rate has no profit figure — not a made-up one.
         let v = execution_money(&run(900_000, 100_000, 0, 0, "mystery-1"));
         assert_eq!(v["cost_basis"], "unknown");
         assert!(v["profit_usd_micros"].is_null());
         // A run can lose money, and the number says so.
         let v = execution_money(&run(100_000, 0, 0, 2_000_000, ""));
-        assert_eq!(v["profit_usd_micros"], -1_500_000);
+        assert_eq!(v["profit_usd_micros"], -1_900_000);
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn plan(id: i64, time: &str, days: &str, avg: Option<f64>, effort: &str) -> store::ScheduledPlan {
+        store::ScheduledPlan {
+            plan_id: id,
+            account_id: 1,
+            plan: format!("plan {id}"),
+            owner_email: "a@b.test".into(),
+            timezone: "UTC".into(),
+            schedule_time: time.into(),
+            schedule_days: days.into(),
+            next_run_at: None,
+            effort: effort.into(),
+            avg_minutes: avg,
+            runs_measured: if avg.is_some() { 4 } else { 0 },
+            last_status: String::new(),
+            last_started_at: None,
+        }
+    }
+
+    #[test]
+    fn runs_are_laid_out_and_the_peak_counted() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 16, 6, 0, 0).unwrap();
+        let plans = vec![
+            plan(1, "09:00", "", Some(40.0), "normal"), // 09:00–09:40, measured
+            plan(2, "09:30", "", None, "thorough"),     // 09:30–10:00, the effort default
+            plan(3, "12:00", "", Some(5.0), "quick"),   // alone
+        ];
+        let v = schedule_view(&plans, &[], 2, now, 24);
+        assert_eq!(v["capacity"], 2);
+        assert_eq!(v["plans"][0]["fires"].as_array().unwrap().len(), 1);
+        assert_eq!(v["plans"][0]["est_minutes"], 40.0);
+        assert!(v["plans"][0]["est_basis"].as_str().unwrap().contains("last 4 runs"));
+        assert_eq!(v["plans"][1]["est_minutes"], 30.0);
+        assert!(v["plans"][1]["est_basis"].as_str().unwrap().contains("thorough effort"));
+        // 1 and 2 overlap from 09:30 to 09:40; nothing else does.
+        assert_eq!(v["peak"], 2);
+        assert_eq!(v["peak_at"], "2026-10-16T09:30:00+00:00");
+        // A week shows seven runs of a daily plan.
+        let week = schedule_view(&plans, &[], 2, now, 168);
+        assert_eq!(week["plans"][2]["fires"].as_array().unwrap().len(), 7);
+    }
+
+    /// Against the dev database, through the real router: an operator's
+    /// "Send password reset" queues the Forgot-password email — to the
+    /// account's own address, with a code the reset page accepts once, and a
+    /// link with the address and no code — and tells the operator nothing they
+    /// could sign in with. Without a session it does nothing at all.
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn an_operator_password_reset_emails_a_working_code() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let db = store::connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let tag = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let email = format!("reset+{tag}@admin.test");
+        let acc: i64 = sqlx::query_scalar("INSERT INTO account (email, display_name) VALUES ($1,'Pat Reset') RETURNING account_id")
+            .bind(&email).fetch_one(&db).await.unwrap();
+        let state: Admin = std::sync::Arc::new(super::super::AdminState {
+            db: db.clone(),
+            sessions: tokio::sync::Mutex::new(Default::default()),
+            slots: tokio::sync::Mutex::new(Default::default()),
+            local_slots: tokio::sync::Mutex::new(Default::default()),
+            pings: tokio::sync::Mutex::new(Default::default()),
+            busy: tokio::sync::Mutex::new(Default::default()),
+        });
+        // What a successful operator sign-in leaves behind.
+        state.sessions.lock().await.insert("op-token".into(), "op@admin.test".into());
+        let app = router(state.clone());
+        let call = |id: i64, cookie: Option<&str>| {
+            let mut req = Request::post(format!("/admin/api/accounts/{id}/password-reset"));
+            if let Some(c) = cookie {
+                req = req.header(header::COOKIE, format!("{COOKIE}={c}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let queued = |db: store::Db, to: String| async move {
+            sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT kind, subject, html, text FROM mail_outbox WHERE to_address=$1 ORDER BY mail_id",
+            )
+            .bind(to).fetch_all(&db).await.unwrap()
+        };
+
+        // No session, a stranger's session: refused, nothing set, nothing sent.
+        assert_eq!(call(acc, None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(acc, Some("forged")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(queued(db.clone(), email.clone()).await.is_empty());
+        let hash: String = sqlx::query_scalar("SELECT reset_token_hash FROM account WHERE account_id=$1").bind(acc).fetch_one(&db).await.unwrap();
+        assert!(hash.trim().is_empty(), "char(64): blank is padded");
+
+        // An account that isn't there.
+        assert_eq!(call(i64::MAX, Some("op-token")).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        // The real thing, twice: the second email's code replaces the first's.
+        for _ in 0..2 {
+            let res = call(acc, Some("op-token")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body: Value = serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+            assert_eq!(body, json!({ "ok": true, "email": email }), "the operator gets no code");
+        }
+        let mails = queued(db.clone(), email.clone()).await;
+        assert_eq!(mails.len(), 2);
+        let code_of = |text: &str| -> String {
+            text.split_whitespace().find(|w| w.len() == 6 && w.chars().all(|c| c.is_ascii_digit())).expect("a six-digit code").to_string()
+        };
+        let token_of = |text: &str| -> String {
+            let at = text.find("token=hwr_").expect("a reset link") + "token=".len();
+            text[at..].split_whitespace().next().unwrap().to_string()
+        };
+        let (old_code, code) = (code_of(&mails[0].3), code_of(&mails[1].3));
+        let (old_token, token) = (token_of(&mails[0].3), token_of(&mails[1].3));
+        let (kind, subject, html, text) = &mails[1];
+        assert_eq!(kind, "reset");
+        assert_eq!(subject, "Reset your Huntwell password");
+        assert!(html.contains(&code) && text.contains(&code) && text.contains("Pat Reset"));
+        assert!(html.contains(&crate::mail::reset_link(&token)) && text.contains(&crate::mail::reset_link(&token)));
+        assert!(token.len() > 40 && !token.contains(&code), "the link is its own long token, never the code");
+        assert!(text.contains("24 hours"));
+
+        // The older email is dead, link and code alike.
+        assert!(store::reset_link_account(&db, &store::sha256_hex(&old_token)).await.unwrap().is_none());
+        if old_code != code {
+            assert!(matches!(store::check_reset_code(&db, &email, &store::sha256_hex(&old_code)).await.unwrap(), store::CodeCheck::Wrong { .. }));
+        }
+
+        // The link: looking says whose it is and spends nothing; claiming
+        // spends it — and the code with it — once.
+        let link = store::sha256_hex(&token);
+        assert_eq!(store::reset_link_account(&db, &link).await.unwrap().map(|a| a.account_id), Some(acc));
+        assert_eq!(store::reset_link_account(&db, &link).await.unwrap().map(|a| a.account_id), Some(acc));
+        assert_eq!(store::claim_reset_link(&db, &link).await.unwrap().map(|a| a.account_id), Some(acc));
+        assert!(store::claim_reset_link(&db, &link).await.unwrap().is_none(), "a link works once");
+        assert!(matches!(store::check_reset_code(&db, &email, &store::sha256_hex(&code)).await.unwrap(), store::CodeCheck::NeedNew), "using the link spends the code");
+        // The identity store refused the password: the link comes back.
+        store::restore_reset_link(&db, acc, &link).await.unwrap();
+        assert!(store::reset_link_account(&db, &link).await.unwrap().is_some());
+
+        // A day, and not a minute more.
+        sqlx::query("UPDATE account SET reset_sent_at = now() - interval '23 hours 59 minutes' WHERE account_id=$1").bind(acc).execute(&db).await.unwrap();
+        assert!(store::reset_link_account(&db, &link).await.unwrap().is_some());
+        sqlx::query("UPDATE account SET reset_sent_at = now() - interval '24 hours 1 minute' WHERE account_id=$1").bind(acc).execute(&db).await.unwrap();
+        assert!(store::reset_link_account(&db, &link).await.unwrap().is_none());
+        assert!(store::claim_reset_link(&db, &link).await.unwrap().is_none());
+
+        // The code alone, from a fresh email: good after most of a day, once,
+        // and it spends the link.
+        assert_eq!(call(acc, Some("op-token")).await.unwrap().status(), StatusCode::OK);
+        let last = queued(db.clone(), email.clone()).await.pop().unwrap().3;
+        let (code, token) = (code_of(&last), token_of(&last));
+        sqlx::query("UPDATE account SET reset_sent_at = now() - interval '23 hours' WHERE account_id=$1").bind(acc).execute(&db).await.unwrap();
+        match store::check_reset_code(&db, &email, &store::sha256_hex(&code)).await.unwrap() {
+            store::CodeCheck::Verified(a) => assert_eq!(a.account_id, acc),
+            _ => panic!("the emailed code should be accepted for a day"),
+        }
+        assert!(matches!(store::check_reset_code(&db, &email, &store::sha256_hex(&code)).await.unwrap(), store::CodeCheck::NeedNew));
+        assert!(store::reset_link_account(&db, &store::sha256_hex(&token)).await.unwrap().is_none(), "using the code spends the link");
+
+        sqlx::query("DELETE FROM mail_outbox WHERE to_address=$1").bind(&email).execute(&db).await.unwrap();
+        store::purge_account(&db, acc).await.unwrap();
+    }
+
+    /// Against the dev database: the query reads every workspace's scheduled
+    /// plans with their run history. With SCHEDULE_JSON set, the page's data is
+    /// written there too (for looking at the page).
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn the_schedule_reads_every_workspace() {
+        let db = store::connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let tag = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let mut accounts = Vec::new();
+        for (who, tz) in [("ana", "America/Los_Angeles"), ("bo", "America/New_York"), ("cy", "Europe/London")] {
+            let a: i64 = sqlx::query_scalar("INSERT INTO account (email, timezone) VALUES ($1,$2) RETURNING account_id")
+                .bind(format!("{who}-{tag}@sched.test")).bind(tz).fetch_one(&db).await.unwrap();
+            accounts.push(a);
+        }
+        let mk = |a: i64, name: &'static str, time: &'static str, days: &'static str, effort: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("INSERT INTO plan (account_id, source, schedule_enabled, schedule_time, schedule_days, effort) VALUES ($1,$2,true,$3,$4,$5) RETURNING plan_id")
+                    .bind(a).bind(name).bind(time).bind(days).bind(effort).fetch_one(&db).await.unwrap()
+            }
+        };
+        let p1 = mk(accounts[0], "Coastal hotels", "09:00", "", "normal").await;
+        let _p2 = mk(accounts[0], "Dental practices", "13:30", "1,3,5", "thorough").await;
+        let _p3 = mk(accounts[1], "Fintech treasury leads", "08:00", "", "quick").await;
+        let _p4 = mk(accounts[2], "UK bike builders", "07:15", "", "exhaustive").await;
+        let _p5 = mk(accounts[1], "Roasters in Portland", "09:20", "", "normal").await;
+        // Coastal hotels has history: runs of 20 and 30 minutes, so 25 on average.
+        for m in [20, 30] {
+            sqlx::query("INSERT INTO execution (account_id, plan_id, status, started_at, finished_at) VALUES ($1,$2,'succeeded', now() - interval '2 days', now() - interval '2 days' + make_interval(mins => $3))")
+                .bind(accounts[0]).bind(p1).bind(m).execute(&db).await.unwrap();
+        }
+        let plans = store::all_scheduled_plans(&db).await.unwrap();
+        let mine: Vec<_> = plans.iter().filter(|p| accounts.contains(&p.account_id)).cloned().collect();
+        assert_eq!(mine.len(), 5);
+        let hotels = mine.iter().find(|p| p.plan_id == p1).unwrap();
+        assert_eq!(hotels.runs_measured, 2);
+        assert!((hotels.avg_minutes.unwrap() - 25.0).abs() < 0.01);
+        assert_eq!(hotels.timezone, "America/Los_Angeles");
+        if let Ok(path) = std::env::var("SCHEDULE_JSON") {
+            let v = schedule_view(&mine, &[], 2, chrono::Utc::now(), 72);
+            std::fs::write(path, v.to_string()).unwrap();
+        }
+        for a in accounts {
+            store::purge_account(&db, a).await.unwrap();
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod support_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// The Support page's endpoints through the real router: the inbox, a
+    /// chat with who it is from, a reply (emailed only when the person is
+    /// away, with the link back that opens their chat), close and reopen, and
+    /// the Slack setting. Without a session, none of it.
+    #[tokio::test]
+    #[ignore = "needs the dev database"]
+    async fn an_operator_answers_support_chats() {
+        let db = store::connect(&crate::config::database_url().unwrap(), 2).await.unwrap();
+        let tag = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let visitor = format!("visitor+{tag}@support.test");
+        let member = format!("member+{tag}@support.test");
+        let acc: i64 = sqlx::query_scalar("INSERT INTO account (email, display_name, workspace_name) VALUES ($1,'Sam Member','Acme') RETURNING account_id")
+            .bind(&member).fetch_one(&db).await.unwrap();
+        let token = crate::support::new_token();
+        let sealed = crate::web::signing::seal_secret(&token).expect("dev has a session secret");
+        let hash = store::sha256_hex(&token);
+        let v = store::support_start(&db, &store::NewSupportChat {
+            account_id: None, workspace_id: None, email: &visitor, name: "Val", token: Some((&hash, &sealed)), page: "/pricing", ip: "127.0.0.1",
+        }, Some("Is there a free trial?"), &[]).await.unwrap();
+        let m = store::support_start(&db, &store::NewSupportChat {
+            account_id: Some(acc), workspace_id: Some(acc), email: &member, name: "Sam Member", token: None, page: "/app", ip: "",
+        }, Some("My run did not start"), &[]).await.unwrap();
+
+        let state: Admin = std::sync::Arc::new(super::super::AdminState {
+            db: db.clone(),
+            sessions: tokio::sync::Mutex::new(Default::default()),
+            slots: tokio::sync::Mutex::new(Default::default()),
+            local_slots: tokio::sync::Mutex::new(Default::default()),
+            pings: tokio::sync::Mutex::new(Default::default()),
+            busy: tokio::sync::Mutex::new(Default::default()),
+        });
+        state.sessions.lock().await.insert("op-token".into(), "op@admin.test".into());
+        let app = router(state.clone());
+        let call = |method: &str, path: String, body: Option<Value>, auth: bool| {
+            let mut req = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
+            if auth {
+                req = req.header(header::COOKIE, format!("{COOKIE}=op-token"));
+            }
+            let body = body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty);
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req.body(body).unwrap()).await.unwrap();
+                let status = res.status();
+                let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let mails = |to: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, String)>("SELECT kind, html, text FROM mail_outbox WHERE to_address=$1 ORDER BY mail_id")
+                    .bind(to).fetch_all(&db).await.unwrap()
+            }
+        };
+
+        // Nobody signed in: refused, every route.
+        assert_eq!(call("GET", "/admin/api/support".into(), None, false).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("GET", format!("/admin/api/support/{}", v.conversation_id), None, false).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"x"})), false).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("PUT", "/admin/api/support/slack".into(), Some(json!({"off":true})), false).await.0, StatusCode::UNAUTHORIZED);
+
+        // The inbox: both chats, unread, newest first.
+        let (s, inbox) = call("GET", "/admin/api/support".into(), None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        let ids: Vec<i64> = inbox["rows"].as_array().unwrap().iter().map(|r| r["conversation_id"].as_i64().unwrap()).collect();
+        let pos = |id: i64| ids.iter().position(|x| *x == id).unwrap();
+        assert!(pos(m.conversation_id) < pos(v.conversation_id));
+        let row = inbox["rows"].as_array().unwrap().iter().find(|r| r["conversation_id"] == v.conversation_id).unwrap();
+        assert_eq!(row["unread"], true);
+        assert_eq!(row["last_body"], "Is there a free trial?");
+        assert!(row.get("token_sealed").is_none(), "the sealed token never leaves the server");
+        let unread_before = inbox["unread"].as_i64().unwrap();
+
+        // A signed-in person's chat comes with who they are; opening it reads it.
+        let (s, chat) = call("GET", format!("/admin/api/support/{}", m.conversation_id), None, true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(chat["customer"]["email"], member);
+        assert_eq!(chat["customer"]["workspace"], "Acme");
+        assert_eq!(chat["customer"]["own_workspace"], true);
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        let (_, inbox) = call("GET", "/admin/api/support".into(), None, true).await;
+        assert_eq!(inbox["unread"].as_i64().unwrap(), unread_before - 1);
+        assert_eq!(call("GET", "/admin/api/support/999999999".into(), None, true).await.0, StatusCode::NOT_FOUND);
+
+        // A visitor who is still on the page: the reply waits in their chat, no email.
+        sqlx::query("UPDATE support_conversation SET customer_seen_at=now() WHERE conversation_id=$1").bind(v.conversation_id).execute(&db).await.unwrap();
+        let (s, r) = call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"Yes! You can start with free credit."})), true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(r["emailed"], false);
+        assert!(mails(visitor.clone()).await.is_empty());
+        // Gone for ten minutes: the next reply is emailed too, escaped, with the link that opens their chat.
+        sqlx::query("UPDATE support_conversation SET customer_seen_at=now()-interval '10 minutes' WHERE conversation_id=$1").bind(v.conversation_id).execute(&db).await.unwrap();
+        let (_, r) = call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"Here's how <b>credit</b> works.\nSecond line."})), true).await;
+        assert_eq!(r["emailed"], true);
+        let sent = mails(visitor.clone()).await;
+        assert_eq!(sent.len(), 1);
+        let (kind, html, text) = &sent[0];
+        assert_eq!(kind, "support_reply");
+        assert!(html.contains("&lt;b&gt;credit&lt;/b&gt;") && !html.contains("<b>credit</b>"), "the reply is escaped");
+        assert!(html.contains("works.<br>Second line."));
+        assert!(text.contains(&format!("/#support={token}")), "the link opens their own chat: {text}");
+        // Empty and oversized replies are refused.
+        assert_eq!(call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"  "})), true).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"x".repeat(4001)})), true).await.0, StatusCode::BAD_REQUEST);
+        // The visitor sees the replies as unread, from "support", never the operator's address.
+        let thread = store::support_get(&db, v.conversation_id).await.unwrap().unwrap();
+        let msgs = store::support_messages(&db, v.conversation_id, 0).await.unwrap();
+        assert_eq!(store::support_unread_for_customer(&thread, &msgs), 2);
+        // A signed-in person away from the app gets the app's link, not a token.
+        sqlx::query("UPDATE support_conversation SET customer_seen_at=NULL WHERE conversation_id=$1").bind(m.conversation_id).execute(&db).await.unwrap();
+        let (_, r) = call("POST", format!("/admin/api/support/{}/reply", m.conversation_id), Some(json!({"body":"Looking now."})), true).await;
+        assert_eq!(r["emailed"], true);
+        let sent = mails(member.clone()).await;
+        assert!(sent[0].2.contains("/app#support") && !sent[0].2.contains("hwc_"));
+
+        // Close: out of the open inbox. The person writes again: open again, and owed to Slack.
+        assert_eq!(call("POST", format!("/admin/api/support/{}/status", v.conversation_id), Some(json!({"open":false})), true).await.0, StatusCode::OK);
+        let (_, inbox) = call("GET", "/admin/api/support?status=open".into(), None, true).await;
+        assert!(!inbox["rows"].as_array().unwrap().iter().any(|r| r["conversation_id"] == v.conversation_id));
+        let (_, closed) = call("GET", "/admin/api/support?status=closed".into(), None, true).await;
+        let row = closed["rows"].as_array().unwrap().iter().find(|r| r["conversation_id"] == v.conversation_id).unwrap().clone();
+        assert_eq!(row["closed_by"], "op@admin.test");
+        sqlx::query("UPDATE support_conversation SET slack_due_at=NULL WHERE conversation_id=$1").bind(v.conversation_id).execute(&db).await.unwrap();
+        store::support_customer_says(&db, v.conversation_id, "One more question", &[]).await.unwrap();
+        let (status, reason, due): (String, String, bool) =
+            sqlx::query_as("SELECT status, slack_reason, slack_due_at IS NOT NULL FROM support_conversation WHERE conversation_id=$1")
+                .bind(v.conversation_id).fetch_one(&db).await.unwrap();
+        assert_eq!((status.as_str(), reason.as_str(), due), ("open", "new", true));
+        // The person ends it: in the closed list, and not the operator's to reopen.
+        assert!(store::support_end(&db, v.conversation_id, &visitor).await.unwrap());
+        let (_, closed) = call("GET", "/admin/api/support?status=closed".into(), None, true).await;
+        assert!(closed["rows"].as_array().unwrap().iter().any(|r| r["conversation_id"] == v.conversation_id && r["status"] == "ended"));
+        assert_eq!(call("POST", format!("/admin/api/support/{}/status", v.conversation_id), Some(json!({"open":true})), true).await.0, StatusCode::BAD_REQUEST);
+        // An answer after it is delivered, and it stays ended.
+        call("POST", format!("/admin/api/support/{}/reply", v.conversation_id), Some(json!({"body":"Glad that helped."})), true).await;
+        assert_eq!(store::support_get(&db, v.conversation_id).await.unwrap().unwrap().status, "ended");
+        assert_eq!(call("POST", "/admin/api/support/999999999/status".into(), Some(json!({"open":true})), true).await.0, StatusCode::NOT_FOUND);
+
+        // Slack: the token, the signing secret and the channel are checked for
+        // shape before Slack is asked anything, and nothing is saved when they
+        // are wrong.
+        let before = store::get_setting(&db, crate::support::slack::BOT_TOKEN_KEY).await.unwrap();
+        for bad in [
+            json!({"bot_token":"xapp-1-x","signing_secret":"0123456789abcdef0123456789abcdef","channel":"C0123456789"}),
+            json!({"bot_token":"xoxb-1-2-abc","signing_secret":"xoxb-1-2-abc","channel":"C0123456789"}),
+            json!({"bot_token":"xoxb-1-2-abc","signing_secret":"0123456789abcdef0123456789abcdef","channel":"#support"}),
+        ] {
+            let (s, e) = call("PUT", "/admin/api/support/slack".into(), Some(bad), true).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        }
+        assert_eq!(store::get_setting(&db, crate::support::slack::BOT_TOKEN_KEY).await.unwrap(), before);
+        let (_, inbox) = call("GET", "/admin/api/support".into(), None, true).await;
+        assert!(inbox["slack"]["manifest"]["settings"]["socket_mode_enabled"] == false);
+        assert!(inbox["slack"].get("bot_token").is_none() && inbox["slack"].get("signing_secret").is_none());
+
+        // A visitor who gave their name and passed the bot check but never
+        // wrote: not in the inbox, nothing owed to Slack. Their first message
+        // is what announces the chat.
+        let quiet_token = crate::support::new_token();
+        let quiet_hash = store::sha256_hex(&quiet_token);
+        let q = store::support_start(&db, &store::NewSupportChat {
+            account_id: None, workspace_id: None, email: &visitor, name: "Quinn", token: Some((&quiet_hash, "")), page: "/", ip: "",
+        }, None, &[]).await.unwrap();
+        let owed = |id: i64| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (bool, String)>("SELECT slack_due_at IS NOT NULL, slack_reason FROM support_conversation WHERE conversation_id=$1")
+                    .bind(id).fetch_one(&db).await.unwrap()
+            }
+        };
+        assert_eq!(owed(q.conversation_id).await, (false, String::new()));
+        let (_, all) = call("GET", "/admin/api/support?status=all".into(), None, true).await;
+        assert!(!all["rows"].as_array().unwrap().iter().any(|r| r["conversation_id"] == q.conversation_id));
+        store::support_customer_says(&db, q.conversation_id, "Hello?", &[]).await.unwrap();
+        assert_eq!(owed(q.conversation_id).await, (true, "new".to_string()));
+        let (_, all) = call("GET", "/admin/api/support?status=open".into(), None, true).await;
+        assert!(all["rows"].as_array().unwrap().iter().any(|r| r["conversation_id"] == q.conversation_id));
+        // Every message after it is owed to the thread too.
+        sqlx::query("UPDATE support_conversation SET slack_due_at=NULL WHERE conversation_id=$1").bind(q.conversation_id).execute(&db).await.unwrap();
+        store::support_customer_says(&db, q.conversation_id, "Anyone there?", &[]).await.unwrap();
+        assert_eq!(owed(q.conversation_id).await, (true, "new".to_string()));
+        sqlx::query("DELETE FROM support_conversation WHERE conversation_id=$1").bind(q.conversation_id).execute(&db).await.unwrap();
+
+        // Leave the dev database as it was.
+        for e in [&visitor, &member] {
+            sqlx::query("DELETE FROM mail_outbox WHERE to_address=$1").bind(e).execute(&db).await.unwrap();
+        }
+        sqlx::query("DELETE FROM support_conversation WHERE conversation_id=$1").bind(v.conversation_id).execute(&db).await.unwrap();
+        store::purge_account(&db, acc).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM support_conversation WHERE conversation_id = ANY($1)")
+            .bind(vec![v.conversation_id, m.conversation_id]).fetch_one(&db).await.unwrap();
+        assert_eq!(left, 0, "purging the account took its chat with it");
     }
 }

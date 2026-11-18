@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import { ago, api, BrowserConnection, fmtDate } from '../api'
 import { useAuth } from '../auth'
-import { Field, useToast } from '../components/ui'
+import { Field, NewPasswordFields, PasswordInput, passwordsMatch, useToast } from '../components/ui'
 import { Theme, useTheme } from '../theme'
 import { TeamSection } from '../components/TeamSection'
+import { CrmIntegrations } from '../components/CrmIntegrations'
 import { Picker } from '../components/Picker'
 import { MfaSetup } from './Auth'
 
@@ -35,6 +36,7 @@ export default function Settings() {
   const [name, setName] = useState(me?.display_name || '')
   const [cur, setCur] = useState('')
   const [nw, setNw] = useState('')
+  const [nw2, setNw2] = useState('')
   const auto = me?.timezone_auto !== false
   const zone = me?.timezone || 'UTC'
   const zones = React.useMemo(() => zoneList(zone), [zone])
@@ -68,6 +70,7 @@ export default function Settings() {
       await api.post('/api/auth/password', { current: cur, new: nw })
       setCur('')
       setNw('')
+      setNw2('')
       toast('Password changed')
     } catch (e: any) {
       toast(e.message, true)
@@ -85,6 +88,7 @@ export default function Settings() {
       <div className="two">
         <div className="stack">
           <TeamSection />
+          <CrmIntegrations />
           <div className="card">
             <h3>Appearance</h3>
             <div className="seg">
@@ -122,12 +126,10 @@ export default function Settings() {
           <div className="card">
             <h3>Password</h3>
             <Field label="Current password">
-              <input type="password" value={cur} onChange={(e) => setCur(e.target.value)} autoComplete="current-password" />
+              <PasswordInput value={cur} onChange={setCur} autoComplete="current-password" />
             </Field>
-            <Field label="New password" hint="At least 10 characters.">
-              <input type="password" value={nw} onChange={(e) => setNw(e.target.value)} autoComplete="new-password" />
-            </Field>
-            <button className="btn" disabled={!cur || nw.length < 10} onClick={changePw}>
+            <NewPasswordFields label="New password" value={nw} onChange={setNw} confirm={nw2} onConfirm={setNw2} />
+            <button className="btn" disabled={!cur || !passwordsMatch(nw, nw2)} onClick={changePw}>
               Change password
             </button>
           </div>

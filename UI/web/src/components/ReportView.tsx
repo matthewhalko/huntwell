@@ -3,6 +3,7 @@ import { api, can, fmtDate, Report } from '../api'
 import { useAuth } from '../auth'
 import { Empty, Loading, useConfirm, useToast } from './ui'
 import { SearchIcon } from './icons'
+import { useLoadView } from './Skeleton'
 
 // A report plan's result: one document. The server renders the Markdown (raw
 // HTML escaped there, so this is safe to inject) and also serves a
@@ -42,7 +43,8 @@ export function ReportView({ planId }: { planId: number }) {
     load()
   }
 
-  if (rows === null) return <Loading />
+  const rowsView = useLoadView(rows !== null)
+  if (rows === null || rowsView !== 'ready') return rowsView === 'skeleton' ? <Loading /> : null
   if (rows.length === 0)
     return (
       <Empty title="No report yet" icon={<SearchIcon size={38} />}>

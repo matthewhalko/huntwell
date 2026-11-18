@@ -63,16 +63,25 @@ fn layout(preview: &str, body: &str) -> String {
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light only"><title>Huntwell</title>
+<style>
+/* Phones: the inline padding is for a desktop reading pane. Clients that
+   drop <style> keep it, which still fits; the rest get room back. */
+@media only screen and (max-width:480px){{
+  .hw-outer{{padding:12px 6px !important}}
+  .hw-body{{padding:20px 16px 18px !important}}
+  .hw-card{{padding:12px 13px !important}}
+}}
+</style>
 <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap" rel="stylesheet"></head>
 <body style="margin:0;padding:0;background:{PAPER};color:{INK};font-family:{FONT};">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0;">{preview}</div>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAPER};padding:32px 12px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="hw-outer" style="background:{PAPER};padding:32px 12px;">
 <tr><td align="center">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;border-radius:10px;overflow:hidden;border:1px solid {RULE};">
     <tr><td style="background:{CHROME};padding:10px 22px;line-height:0;">
       <img src="cid:{LOGO_CID}" width="160" height="40" alt="huntwell" style="display:block;border:0;outline:none;width:160px;height:40px;">
     </td></tr>
-    <tr><td style="background:#ffffff;padding:28px 28px 24px;">
+    <tr><td class="hw-body" style="background:#ffffff;padding:28px 28px 24px;">
       {body}
     </td></tr>
   </table>
@@ -153,32 +162,44 @@ pub fn verification(name: &str, code: &str) -> Email {
 
 /// Sent when someone asks to reset their password. Same shape as the sign-up
 /// code: one number, a short life, and a line for the person who did not ask.
-pub fn password_reset(name: &str, code: &str) -> Email {
+pub fn password_reset(name: &str, code: &str, link: &str) -> Email {
     let hello = if name.trim().is_empty() { "Hi".to_string() } else { format!("Hi {}", name.trim()) };
     let code = code.trim();
+    let hours = crate::store::RESET_VALID_HOURS;
     let body = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}{}",
         h1("Reset your password"),
-        p(&format!("{hello} — enter this code on the reset page, then choose a new password.")),
+        p(&format!("{hello} — choose a new password for your Huntwell account.")),
+        button("Set a new password", link),
+        fallback(link),
         format!(
-            r#"<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;"><tr>
-  <td style="background:{BRAND_SOFT};border-radius:10px;padding:14px 26px;font-size:34px;font-weight:700;letter-spacing:.28em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:{BRAND_DEEP};">{}</td>
+            r#"<p style="margin:22px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">On another device? Use this code on the reset page instead:</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 0;"><tr>
+  <td style="background:{BRAND_SOFT};border-radius:10px;padding:10px 20px;font-size:26px;font-weight:700;letter-spacing:.28em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:{BRAND_DEEP};">{}</td>
 </tr></table>"#,
             esc(code)
         ),
         format!(
-            r#"<p style="margin:14px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">It expires in 15 minutes. If you didn't ask to reset your password, ignore this email — your password stays as it is, and nothing happens without the code.</p>"#
+            r#"<p style="margin:18px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">The link and the code work once, for {hours} hours. If you didn't ask to reset your password, ignore this email — your password stays as it is.</p>"#
         ),
     );
     Email {
-        subject: "Your Huntwell Reset Code".into(),
-        html: layout(&format!("Your Huntwell reset code is {code}."), &body),
+        subject: "Reset your Huntwell password".into(),
+        html: layout("Set a new password for your Huntwell account.", &body),
         text: format!(
-            "{hello} — your Huntwell password reset code is:\n\n    {code}\n\n\
-             Enter it on the reset page, then choose a new password. It expires in 15 minutes.\n\
+            "{hello} — choose a new password for your Huntwell account:\n\n{link}\n\n\
+             On another device? Use this code on the reset page instead:  {code}\n\n\
+             The link and the code work once, for {hours} hours.\n\
              If you didn't ask to reset your password, ignore this email — your password stays as it is.\n"
         ),
     }
+}
+
+/// The reset page for one reset: the link's own token, which the page trades
+/// for whose account it is. Never the six-digit code — that is short enough to
+/// guess, and a link lives in an inbox for a day.
+pub fn reset_link(token: &str) -> String {
+    format!("{}/forgot?token={}", link_base(), token.trim())
 }
 
 /// Sent once the address is confirmed. The two steps mirror the in-app setup
@@ -306,6 +327,29 @@ pub fn waitlist_received(name: &str) -> Email {
     }
 }
 
+/// An operator answered a support chat while the person was away from it.
+/// The reply itself is in the message, so most never need to click; the link
+/// opens the chat where they left it.
+pub fn support_reply(name: &str, reply: &str, link: &str) -> Email {
+    let hello = if name.trim().is_empty() { "Hi".to_string() } else { format!("Hi {}", name.trim()) };
+    let quoted = esc(reply.trim()).replace("\r\n", "\n").replace('\n', "<br>");
+    let body = format!(
+        "{}{}{}{}{}",
+        h1("Huntwell support replied"),
+        p(&format!("{hello}, here is our answer to your message.")),
+        format!(
+            r#"<div style="margin:0 0 6px;padding:14px 16px;border-left:3px solid {BRAND};background:{PAPER};border-radius:6px;font-family:{FONT};font-size:15px;line-height:1.6;color:{INK};">{quoted}</div>"#
+        ),
+        button("Continue the chat", link),
+        fallback(link),
+    );
+    Email {
+        subject: "Huntwell support replied".into(),
+        html: layout("Here is our answer to your message.", &body),
+        text: format!("{hello}, here is our answer to your message.\n\n{}\n\nContinue the chat: {link}\n", reply.trim()),
+    }
+}
+
 /// Sent when building a plan did not work.
 ///
 /// Building is the one thing a user waits on without being able to do anything
@@ -334,65 +378,231 @@ pub fn draft_failed(plan: &str, link: &str) -> Email {
     }
 }
 
+/// One new result in an alert: a title, a line under it, and the plan's own
+/// columns. Built from the row by [`AlertCard::from_prospect`] /
+/// [`AlertCard::from_artifact`]; rendered by [`card_html`] / [`card_text`].
+/// Every value is scraped from the web, so all of it is escaped and bounded,
+/// and a value becomes a link only when it is plainly http(s) or an address.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AlertCard {
+    pub title: String,
+    /// The page it was found on, linked from the title when it is safe.
+    pub url: String,
+    pub subtitle: String,
+    pub fields: Vec<(String, String)>,
+}
+
+/// Fields shown on one card — enough to judge a row without opening the app.
+const CARD_FIELDS: usize = 8;
+/// Cards in one alert; the rest are a count and the button.
+pub const ALERT_CARDS: usize = 10;
+
+fn clip(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>().trim_end())
+    }
+}
+
+fn safe_url(u: &str) -> bool {
+    let u = u.trim();
+    (u.starts_with("https://") || u.starts_with("http://"))
+        && u.len() <= 2000
+        && !u.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"' | '\''))
+}
+
+fn safe_email(e: &str) -> bool {
+    let e = e.trim();
+    e.len() <= 254 && e.split_once('@').is_some_and(|(a, d)| !a.is_empty() && d.contains('.')) && e.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+}
+
+/// A link's text: the host and a short path, which is what a person reads.
+fn short_url(u: &str) -> String {
+    let rest = u.trim().trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.");
+    clip(rest.trim_end_matches('/'), 48)
+}
+
+impl AlertCard {
+    pub fn from_prospect(r: &crate::store::ProspectRow) -> AlertCard {
+        let title = [&r.name, &r.company].iter().map(|s| s.trim()).find(|s| !s.is_empty()).unwrap_or("(no name)").to_string();
+        let subtitle = [r.title.trim(), if r.name.trim().is_empty() { "" } else { r.company.trim() }]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut fields = Vec::new();
+        let mut add = |label: &str, v: &str| {
+            if !v.trim().is_empty() {
+                fields.push((label.to_string(), v.trim().to_string()));
+            }
+        };
+        add("Email", &r.email);
+        add("Phone", &r.phone);
+        add("Location", &r.location);
+        add("Website", &r.website);
+        add("LinkedIn", &r.linkedin);
+        add("Industry", &r.industry);
+        if let Some(v) = r.estimated_value.filter(|v| *v > 0) {
+            add("Est. value", &money(v as f64));
+        }
+        add("Notes", &r.notes);
+        AlertCard { title, url: String::new(), subtitle, fields }
+    }
+
+    /// A custom-columns row: its title (else its first column), linked to the
+    /// page it came from, then the plan's columns in the plan's order.
+    pub fn from_artifact(r: &crate::store::ArtifactRow, cols: &[crate::artifact::FieldSpec]) -> AlertCard {
+        let values: Vec<(String, String)> = cols
+            .iter()
+            .map(|f| {
+                let v = match r.fields.get(&f.key) {
+                    Some(serde_json::Value::String(s)) => s.trim().to_string(),
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    Some(serde_json::Value::Bool(b)) => if *b { "Yes" } else { "No" }.to_string(),
+                    _ => String::new(),
+                };
+                (if f.label.trim().is_empty() { f.key.clone() } else { f.label.clone() }, v)
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let title = if r.title.trim().is_empty() { values.first().map(|(_, v)| v.clone()).unwrap_or_else(|| "(untitled)".into()) } else { r.title.trim().to_string() };
+        let fields = values.into_iter().filter(|(_, v)| v.trim() != title.trim()).collect();
+        AlertCard { title, url: r.url.trim().to_string(), subtitle: String::new(), fields }
+    }
+
+    /// A report or a file: its title alone.
+    pub fn titled(title: &str) -> AlertCard {
+        AlertCard { title: title.trim().to_string(), ..Default::default() }
+    }
+}
+
+/// One value, as HTML: a link when it is a URL or an address, else text.
+fn value_html(v: &str) -> String {
+    let v = v.trim();
+    if safe_url(v) {
+        format!(r#"<a href="{}" style="color:{BRAND};text-decoration:underline;word-break:break-all;">{}</a>"#, esc(v), esc(&short_url(v)))
+    } else if safe_email(v) {
+        format!(r#"<a href="mailto:{0}" style="color:{BRAND};text-decoration:underline;word-break:break-all;">{0}</a>"#, esc(v))
+    } else {
+        esc(&clip(v, 240))
+    }
+}
+
+/// A card that holds up on a phone: one column, nothing fixed-width, a label
+/// over its value so a long value wraps under it instead of squeezing beside it.
+fn card_html(c: &AlertCard) -> String {
+    let title = clip(&c.title, 140);
+    let title_html = if safe_url(&c.url) {
+        format!(r#"<a href="{}" style="color:{INK};text-decoration:none;">{}</a>"#, esc(&c.url), esc(&title))
+    } else {
+        esc(&title)
+    };
+    let subtitle = if c.subtitle.trim().is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div style="margin-top:2px;font-size:13px;line-height:1.45;color:{MUTED};">{}</div>"#, esc(&clip(&c.subtitle, 160)))
+    };
+    let fields: String = c
+        .fields
+        .iter()
+        .take(CARD_FIELDS)
+        .map(|(label, v)| {
+            format!(
+                r#"<tr><td class="hw-field" style="padding:7px 0 0;font-family:{FONT};">
+<div style="font-size:11px;line-height:1.3;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:{MUTED};">{}</div>
+<div style="font-size:14px;line-height:1.45;color:{INK};word-break:break-word;overflow-wrap:anywhere;">{}</div></td></tr>"#,
+                esc(&clip(label, 40)),
+                value_html(v)
+            )
+        })
+        .collect();
+    let more = c.fields.len().saturating_sub(CARD_FIELDS);
+    let more = if more > 0 {
+        format!(r#"<tr><td style="padding:7px 0 0;font-size:12px;color:{MUTED};">+{more} more in the app</td></tr>"#)
+    } else {
+        String::new()
+    };
+    let link = if safe_url(&c.url) {
+        format!(
+            r#"<tr><td style="padding:10px 0 0;font-size:13px;"><a href="{}" style="color:{BRAND};font-weight:700;text-decoration:none;">View source ↗</a></td></tr>"#,
+            esc(&c.url)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 12px;border:1px solid {RULE};border-radius:10px;border-collapse:separate;">
+<tr><td class="hw-card" style="padding:14px 16px;font-family:{FONT};">
+<div style="font-size:16px;line-height:1.35;font-weight:700;color:{INK};word-break:break-word;">{title_html}</div>{subtitle}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{fields}{more}{link}</table>
+</td></tr></table>"#
+    )
+}
+
+fn card_text(c: &AlertCard) -> String {
+    let mut out = format!("■ {}", clip(&c.title, 140));
+    if !c.subtitle.trim().is_empty() {
+        out.push_str(&format!("\n  {}", clip(&c.subtitle, 160)));
+    }
+    for (label, v) in c.fields.iter().take(CARD_FIELDS) {
+        out.push_str(&format!("\n  {}: {}", clip(label, 40), clip(v, 240)));
+    }
+    if safe_url(&c.url) {
+        out.push_str(&format!("\n  {}", c.url.trim()));
+    }
+    out
+}
+
 /// Sent when a run stored rows the plan had not seen before.
 ///
-/// The point of the message is the number and a way in, so both are above the
-/// fold; the sample rows are there to make it obvious at a glance whether the
-/// run found the right sort of thing, without opening anything. Nothing about
-/// what the plan is *for* is in here — a subject line that reads "3 new rows in
-/// Reno Crosstrek listings" is enough context, and email is not a private place
-/// to put someone's scraped data.
-pub fn new_records(plan: &str, noun: &str, found: i64, total: i64, samples: &[String], link: &str) -> Email {
+/// The number and a way in come first, then the new rows themselves as cards —
+/// each with the plan's columns, so a row can be judged from the inbox, on a
+/// phone as well as a desktop (one column, labels over values, nothing wider
+/// than the screen). At most [`ALERT_CARDS`]; past that, a count and the button.
+/// The rows are the plan owner's own results, sent only to them.
+pub fn new_records(plan: &str, noun: &str, found: i64, total: i64, cards: &[AlertCard], link: &str) -> Email {
     let n = found.max(0);
     let one = n == 1;
     let headline = format!("{n} new {} in {plan}", if one { noun.trim_end_matches('s').to_string() } else { noun.to_string() });
-    let sample_html = if samples.is_empty() {
-        String::new()
-    } else {
-        let items = samples
-            .iter()
-            .map(|s| {
-                format!(
-                    r#"<tr><td style="padding:9px 0;border-top:1px solid {RULE};font-size:14px;line-height:1.5;color:{INK};">{}</td></tr>"#,
-                    esc(s)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        format!(r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:4px 0 6px;">{items}</table>"#)
-    };
-    let more = if n > samples.len() as i64 && !samples.is_empty() {
-        p(&format!("…and {} more.", n - samples.len() as i64))
+    let shown = &cards[..cards.len().min(ALERT_CARDS)];
+    let cards_html: String = shown.iter().map(card_html).collect();
+    let rest = n - shown.len() as i64;
+    let more = if rest > 0 && !shown.is_empty() {
+        p(&format!("…and {rest} more in the plan."))
     } else {
         String::new()
     };
     let body = format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         h1(&headline),
         p(&format!(
             "Your latest execution added {n} {} that {} not there before. The plan now holds {total}.",
             if one { "row" } else { "rows" },
             if one { "was" } else { "were" }
         )),
-        sample_html,
-        more,
         button("Open the plan", link),
+        if shown.is_empty() { String::new() } else { format!(r#"<div style="margin:4px 0 0;">{cards_html}</div>"#) },
+        more,
+        if shown.len() > 3 { button("See them all", link) } else { String::new() },
         format!(
             r#"<p style="margin:14px 0 0;color:{MUTED};font-size:13px;line-height:1.6;">You get this because alerts are on for this plan. Turn them off on the plan itself.</p>"#
         ),
     );
-    let sample_text = if samples.is_empty() {
+    let cards_text = if shown.is_empty() {
         String::new()
     } else {
-        format!("\n{}\n", samples.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n"))
+        format!("\n{}\n", shown.iter().map(card_text).collect::<Vec<_>>().join("\n\n"))
     };
+    let more_text = if rest > 0 && !shown.is_empty() { format!("\n…and {rest} more in the plan.\n") } else { String::new() };
     Email {
         subject: headline.clone(),
         html: layout(&format!("{n} added. The plan now holds {total}."), &body),
         text: format!(
             "{headline}\n\n\
              Your latest execution added {n} that were not there before. The plan now holds {total}.\n\
-             {sample_text}\n\
+             {cards_text}{more_text}\n\
              Open the plan:\n{link}\n\n\
              You get this because alerts are on for this plan. Turn them off on the plan itself.\n"
         ),
@@ -521,6 +731,36 @@ fn from_address() -> String {
     crate::config::get("HUNTWELL_MAIL_FROM").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "Huntwell <no-reply@huntwell.app>".into())
 }
 
+/// Stands in for `HUNTWELL_PUBLIC_URL` in a message queued by a process that
+/// does not have it — a run on a worker VM, which is deliberately never given
+/// it. The notification service, which has it, fills it in at send
+/// ([`with_public_url`]). Plain ASCII that escaping leaves alone.
+pub const PUBLIC_URL_MARK: &str = "{{huntwell_public_url}}";
+
+/// The site's address for a link in a message: this process's
+/// `HUNTWELL_PUBLIC_URL`, else [`PUBLIC_URL_MARK`] for the sender to fill.
+pub fn link_base() -> String {
+    crate::config::get("HUNTWELL_PUBLIC_URL")
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| PUBLIC_URL_MARK.to_string())
+}
+
+/// Fill [`PUBLIC_URL_MARK`] in with `base`. Err when the message needs it and
+/// there is none: a message whose only call to action is a dead link is worse
+/// than one held back.
+pub fn with_public_url(email: &Email, base: Option<&str>) -> std::result::Result<Email, &'static str> {
+    if !email.html.contains(PUBLIC_URL_MARK) && !email.text.contains(PUBLIC_URL_MARK) && !email.subject.contains(PUBLIC_URL_MARK) {
+        return Ok(email.clone());
+    }
+    let base = base.map(|b| b.trim().trim_end_matches('/')).filter(|b| !b.is_empty()).ok_or("HUNTWELL_PUBLIC_URL is not set on the notification service, so its link cannot be filled in")?;
+    Ok(Email {
+        subject: email.subject.replace(PUBLIC_URL_MARK, base),
+        html: email.html.replace(PUBLIC_URL_MARK, &esc(base)),
+        text: email.text.replace(PUBLIC_URL_MARK, base),
+    })
+}
+
 /// Whether mail actually leaves this server.
 pub fn configured() -> bool {
     api_key().is_some()
@@ -597,6 +837,20 @@ pub async fn send_keyed(to: &str, email: &Email, idempotency_key: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_queued_link_is_filled_in_by_the_sender_or_held() {
+        let link = format!("{PUBLIC_URL_MARK}/app/plans/7");
+        let m = new_records("Dentists", "results", 2, 9, &[AlertCard::titled("A")], &link);
+        assert!(m.html.contains(PUBLIC_URL_MARK) && m.text.contains(PUBLIC_URL_MARK), "escaping must leave the mark intact");
+        let sent = with_public_url(&m, Some("https://app.huntwell.example/")).unwrap();
+        assert!(sent.html.contains("https://app.huntwell.example/app/plans/7") && sent.text.contains("https://app.huntwell.example/app/plans/7"));
+        assert!(!sent.html.contains(PUBLIC_URL_MARK) && !sent.text.contains(PUBLIC_URL_MARK));
+        assert!(with_public_url(&m, None).is_err() && with_public_url(&m, Some(" ")).is_err());
+        // A message with no mark goes as it is, setting or not.
+        let plain = new_records("Dentists", "results", 1, 1, &[], "https://x.example/app/plans/1");
+        assert_eq!(with_public_url(&plain, None).unwrap().html, plain.html);
+    }
+
     use super::*;
 
     #[test]
@@ -621,6 +875,30 @@ mod tests {
     /// Both parts carry the link, because either one may be what gets read.
     /// Writes each message to target/mail-samples/ so it can be opened in a
     /// browser: `cargo test dump_mail_samples -- --ignored`.
+    /// What a run's alert looks like with real-shaped rows: people with every
+    /// field, one with few, and a custom-columns row with a long value.
+    fn sample_cards() -> Vec<AlertCard> {
+        let f = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        vec![
+            AlertCard {
+                title: "Dr. Ana Ruiz".into(),
+                subtitle: "Owner · Bright Smiles Dental".into(),
+                fields: f(&[("Email", "ana@brightsmiles.example"), ("Phone", "(330) 555-0100"), ("Location", "Akron, OH"),
+                    ("Website", "https://www.brightsmiles.example/"), ("LinkedIn", "https://www.linkedin.com/in/ana-ruiz-dds-4b1a2c"),
+                    ("Notes", "Six chairs, opened 2014; hiring a second hygienist according to their careers page.")]),
+                ..Default::default()
+            },
+            AlertCard { title: "Okafor Family Dentistry".into(), fields: f(&[("Phone", "(330) 555-0144"), ("Location", "Akron, OH")]), ..Default::default() },
+            AlertCard {
+                title: "Summit Dental Group".into(),
+                url: "https://directory.example/oh/akron/summit-dental-group-cuyahoga-falls".into(),
+                fields: f(&[("Practice manager", "Priya Shah"), ("Chairs", "11"), ("Accepts new patients", "Yes"),
+                    ("Services", "General dentistry, implants, Invisalign, pediatric, sedation, same-day crowns, emergency appointments")]),
+                ..Default::default()
+            },
+        ]
+    }
+
     #[test]
     #[ignore]
     fn dump_mail_samples() {
@@ -628,24 +906,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for (name, m) in [
             ("verification", verification("Ada", "482913")),
-            ("password_reset", password_reset("Ada", "271044")),
+            ("password_reset", password_reset("Ada", "271044", "https://huntwell.ai/forgot?token=hwr_0123abcd")),
             ("welcome", welcome("Ada", "https://app.example.com/app")),
             ("invite", invite("Acme", "Bob", "member", "https://app.example.com/join/tok")),
+            ("new_records", new_records("Dental practices in Akron", "results", 12, 48, &sample_cards(), "https://app.example.com/app/plans/7")),
+            ("support_reply", support_reply("Robin", "Yes! Huntwell can collect commercial listings in Austin.\nTell me which sites you use and I'll suggest a plan.", "https://huntwell.ai/#support=hwc_0123abcd")),
         ] {
             std::fs::write(dir.join(format!("{name}.html")), &m.html).unwrap();
+            std::fs::write(dir.join(format!("{name}.txt")), &m.text).unwrap();
         }
+    }
+
+    #[test]
+    fn a_reset_link_carries_its_token_and_nothing_else() {
+        let l = reset_link(" hwr_0123abcd ");
+        assert!(l.ends_with("/forgot?token=hwr_0123abcd"), "{l}");
+        assert!(!l.contains("email") && !l.contains("code"));
     }
 
     #[test]
     fn every_message_carries_its_link_in_both_parts() {
         let v = verification("Ada", "482913");
         assert!(v.html.contains("482913") && v.text.contains("482913") && !v.subject.contains("482913"));
-        let r = password_reset("Ada", "271044");
+        let r = password_reset("Ada", "271044", "https://app.example.com/forgot?token=hwr_0123abcd");
         assert!(r.html.contains("271044") && r.text.contains("271044") && !r.subject.contains("271044"));
+        assert!(r.html.contains("/forgot?token=hwr_0123abcd") && r.text.contains("/forgot?token=hwr_0123abcd"));
+        assert!(r.text.contains("24 hours") && !r.text.contains("15 minutes"));
         let i = invite("Alice", "Bob", "member", "https://app.example.com/join/tok");
         assert!(i.html.contains("/join/tok") && i.text.contains("/join/tok"));
         let w = welcome("Ada", "https://app.example.com/app");
         assert!(w.html.contains("/app") && w.text.contains("/app"));
+        let s = support_reply("Ada", "Use <b>this</b>\nthen that", "https://app.example.com/#support=hwc_ab");
+        assert!(s.html.contains("#support=hwc_ab") && s.text.contains("#support=hwc_ab"));
+        assert!(s.html.contains("Use &lt;b&gt;this&lt;/b&gt;<br>then that"), "the reply is escaped, its lines kept");
     }
 
     #[test]
@@ -690,7 +983,7 @@ mod alert_tests {
 
     #[test]
     fn the_count_and_the_plan_are_in_the_subject() {
-        let m = new_records("Reno Crosstreks", "rows", 3, 41, &["2019 Crosstrek Premium".into()], "https://x/app/plans/7");
+        let m = new_records("Reno Crosstreks", "rows", 3, 41, &[AlertCard::titled("2019 Crosstrek Premium")], "https://x/app/plans/7");
         assert_eq!(m.subject, "3 new rows in Reno Crosstreks");
         assert!(m.text.contains("The plan now holds 41."));
         assert!(m.html.contains("https://x/app/plans/7"));
@@ -706,17 +999,47 @@ mod alert_tests {
     #[test]
     fn samples_are_escaped_like_everything_else() {
         // A row label is scraped from a page, so it is markup until proven otherwise.
-        let m = new_records("P", "rows", 1, 1, &["<script>alert(1)</script>".into()], "https://x");
+        let m = new_records("P", "rows", 1, 1, &[AlertCard::titled("<script>alert(1)</script>")], "https://x");
         assert!(!m.html.contains("<script>"));
         assert!(m.html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn the_extra_line_only_appears_when_there_are_more() {
-        let two = new_records("P", "rows", 9, 9, &["a".into(), "b".into()], "https://x");
+        let two = new_records("P", "rows", 9, 9, &[AlertCard::titled("a"), AlertCard::titled("b")], "https://x");
         assert!(two.html.contains("and 7 more"));
-        let all = new_records("P", "rows", 2, 2, &["a".into(), "b".into()], "https://x");
+        let all = new_records("P", "rows", 2, 2, &[AlertCard::titled("a"), AlertCard::titled("b")], "https://x");
         assert!(!all.html.contains("more."));
+    }
+
+    #[test]
+    fn a_card_carries_the_columns_and_links_only_what_is_safe() {
+        let c = AlertCard {
+            title: "Bright <b>Smiles</b>".into(),
+            url: "javascript:alert(1)".into(),
+            subtitle: "Owner · Bright Smiles Dental".into(),
+            fields: vec![
+                ("Email".into(), "ana@brightsmiles.example".into()),
+                ("Website".into(), "https://www.brightsmiles.example/about/".into()),
+                ("Chairs".into(), "6".into()),
+                ("Bio".into(), "<img src=x onerror=alert(1)>".into()),
+            ],
+        };
+        let m = new_records("Dentists", "results", 1, 5, &[c], "https://x/app/plans/1");
+        assert!(m.html.contains("Bright &lt;b&gt;Smiles&lt;/b&gt;") && !m.html.contains("<b>Smiles"));
+        assert!(!m.html.contains("href=\"javascript"), "an unsafe URL is never a link");
+        assert!(m.html.contains(r#"href="mailto:ana@brightsmiles.example""#));
+        assert!(m.html.contains(r#"href="https://www.brightsmiles.example/about/""#) && m.html.contains(">brightsmiles.example/about</a>"));
+        assert!(m.html.contains("&lt;img") && !m.html.contains("<img src=x"));
+        assert!(m.text.contains("  Chairs: 6") && m.text.contains("  Owner · Bright Smiles Dental"));
+    }
+
+    #[test]
+    fn at_most_ten_cards_then_a_count() {
+        let cards: Vec<AlertCard> = (0..14).map(|i| AlertCard::titled(&format!("Row {i}"))).collect();
+        let m = new_records("P", "rows", 14, 14, &cards, "https://x");
+        assert!(m.html.contains("Row 9") && !m.html.contains("Row 10"));
+        assert!(m.html.contains("and 4 more in the plan"));
     }
 
     /// Against a stand-in for Resend's API: the shape of the call is the

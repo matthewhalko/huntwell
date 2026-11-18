@@ -263,6 +263,31 @@ td.row>button:last-child{margin-right:0}
 /* With the heading gone the first field would sit against the card's padding. */
 #login label:first-of-type{margin-top:0}
 
+/* ---- schedule: the Gantt timeline ---- */
+.sched-range{gap:.3rem}
+.sched-range button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.gantt{position:relative;overflow-x:auto;font-size:.8rem}
+.gantt-inner{min-width:760px}
+.g-row{display:grid;grid-template-columns:220px 1fr;align-items:center;border-bottom:1px solid var(--border);min-height:34px}
+.g-row:last-child{border-bottom:none}
+.g-label{padding:.35rem .6rem .35rem 0;min-width:0}
+.g-label b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.g-label span{color:var(--text-3);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.74rem}
+.g-track{position:relative;height:34px;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(var(--tick) - 1px),var(--border) calc(var(--tick) - 1px),var(--border) var(--tick))}
+.g-bar{position:absolute;top:8px;height:18px;min-width:4px;border-radius:4px;background:var(--cornflower);opacity:.9;cursor:default}
+.g-bar.running{background:var(--accent);opacity:1}
+.g-bar.queued{background:var(--warn);opacity:1}
+.g-bar:hover{opacity:1;outline:2px solid var(--text)}
+.g-axis .g-track{background:none;height:22px}
+.g-tick{position:absolute;top:3px;transform:translateX(-50%);color:var(--text-3);white-space:nowrap;font-size:.72rem}
+.g-day{position:absolute;top:0;bottom:0;border-left:1px dashed var(--border-strong)}
+.g-now{position:absolute;top:0;bottom:0;width:2px;background:var(--bad);z-index:2}
+.g-load .g-track{height:44px;background:none}
+.g-col{position:absolute;bottom:4px;background:var(--cornflower);opacity:.35;border-radius:2px 2px 0 0}
+.g-col.over{background:var(--bad);opacity:.75}
+.g-cap{position:absolute;left:0;right:0;border-top:2px dashed var(--warn)}
+.g-empty{padding:1.2rem 0;color:var(--text-3)}
+
 dialog{border:1px solid var(--border);border-radius:var(--radius);max-width:560px;width:92%;
   background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
@@ -279,6 +304,58 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
 .rowmenu button:disabled{color:var(--text-3);cursor:not-allowed}
 .rowmenu hr{border:none;border-top:1px solid var(--border);margin:.3rem .2rem}
 #deldlg .notice{margin:.4rem 0 1rem}
+
+/* ---------- support: inbox, chat, who it is ---------- */
+.rail-item .tile{position:relative}
+.rail-badge{position:absolute;top:-4px;right:-6px;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:var(--brand-pink);
+  color:#fff;font-size:10px;font-weight:900;line-height:17px;text-align:center;box-shadow:0 0 0 2px var(--chrome)}
+.rail-badge[hidden]{display:none}
+.seg{display:inline-flex;border:1px solid var(--border-strong);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;box-shadow:none;background:var(--surface);color:var(--text-2);padding:.4rem .85rem;font-size:.86rem;transform:none}
+.seg button+button{border-left:1px solid var(--border-strong)}
+.seg button.on{background:var(--accent-soft);color:var(--text)}
+.sup-slack{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;padding:.8rem 1.1rem}
+.sup-slack .lbl{font-weight:700}
+.sup-slack input{flex:1;min-width:14rem;font-family:var(--mono);font-size:.82rem}
+.sup-slack ol{margin:.2rem 0 0;padding-left:1.2rem;font-size:.86rem;line-height:1.55;flex-basis:100%}
+.sup-slack ol li{margin:.15rem 0}
+.sup-slack .fields{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.45rem .7rem;align-items:center;flex-basis:100%}
+.sup-slack .fields label{font-size:.84rem;color:var(--text-2)}
+.sup-slack textarea.manifest{display:none;flex-basis:100%;height:11rem;font-family:var(--mono);font-size:.76rem}
+.sup-slack textarea.manifest.on{display:block}
+.sup-wrap{display:grid;grid-template-columns:minmax(240px,320px) minmax(0,1fr);height:calc(100vh - 15rem);min-height:460px}
+.sup-list{border-right:1px solid var(--border);overflow-y:auto;overflow-x:hidden;min-width:0}
+.sup-item{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--border);border-radius:0;box-shadow:none;background:none;
+  padding:.75rem .95rem;font-weight:400;transform:none;cursor:pointer}
+.sup-item:hover{background:var(--surface-2);box-shadow:none}
+.sup-item.on{background:var(--accent-soft)}
+.sup-item .top{display:flex;justify-content:space-between;gap:.5rem;align-items:baseline}
+.sup-item .nm{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sup-item.unread .nm::before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--brand-pink);margin-right:.4rem;vertical-align:1px}
+.sup-item .when{flex:none;font-size:.75rem;color:var(--text-3)}
+.sup-item .snip{display:block;color:var(--text-2);font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:.1rem}
+.sup-empty{padding:2rem 1.2rem;color:var(--text-2);text-align:center}
+.sup-thread{display:grid;grid-template-rows:auto auto 1fr auto;min-height:0}
+.sup-head{display:flex;justify-content:space-between;gap:.8rem;align-items:flex-start;flex-wrap:wrap;padding:.85rem 1.1rem;border-bottom:1px solid var(--border)}
+.sup-head h2{margin:0;font-size:1.05rem}
+.sup-head .sub{color:var(--text-2);font-size:.84rem}
+.sup-info{display:flex;gap:.4rem 1.2rem;flex-wrap:wrap;padding:.6rem 1.1rem;border-bottom:1px solid var(--border);background:var(--surface-2);font-size:.84rem}
+.sup-info b{font-weight:700}
+.sup-info .k{color:var(--text-3);margin-right:.3rem}
+.sup-msgs{overflow-y:auto;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.55rem;min-height:0}
+.sup-msg{max-width:min(36rem,80%);padding:.55rem .8rem;border-radius:12px;background:var(--surface-2);border:1px solid var(--border);
+  white-space:pre-wrap;overflow-wrap:anywhere;align-self:flex-start}
+.sup-msg.op{align-self:flex-end;background:var(--accent-soft);border-color:transparent}
+.sup-msg .sup-shot{display:block;max-width:100%;max-height:16rem;border-radius:8px;border:1px solid var(--border);margin-bottom:.35rem}
+.sup-msg .meta{display:block;font-size:.72rem;color:var(--text-3);margin-top:.2rem}
+.sup-reply{border-top:1px solid var(--border);padding:.75rem 1.1rem;display:flex;flex-direction:column;gap:.5rem}
+.sup-reply textarea{font-family:var(--font);font-size:.95rem;min-height:84px}
+.sup-reply .row{justify-content:space-between}
+@media (max-width:900px){
+  .sup-wrap{grid-template-columns:1fr;height:auto}
+  .sup-list{max-height:260px;border-right:0;border-bottom:1px solid var(--border)}
+  .sup-thread{min-height:520px}
+}
 
 /* ---------- AG Grid, dressed in the house theme ---------- */
 #route-grid{height:380px}
@@ -306,8 +383,10 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
   <nav class="rail-nav">
     <a class="rail-item" href="#/home" data-page="home" title="Home"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10.5 9-7.5 9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg></span><span class="rlbl">Home</span></a>
     <a class="rail-item" href="#/users" data-page="users" title="Users"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="rlbl">Users</span></a>
+    <a class="rail-item" href="#/support" data-page="support" title="Support"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="rail-badge" id="sup-badge" hidden></span></span><span class="rlbl">Support</span></a>
     <a class="rail-item" href="#/models" data-page="models" title="Models"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg></span><span class="rlbl">Models</span></a>
     <a class="rail-item" href="#/routing" data-page="routing" title="Routing"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg></span><span class="rlbl">Routing</span></a>
+    <a class="rail-item" href="#/schedule" data-page="schedule" title="Schedule"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M7 14h4M9 17h6"/></svg></span><span class="rlbl">Schedule</span></a>
     <a class="rail-item" href="#/logs" data-page="logs" title="Logs"><span class="tile"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h12a2 2 0 0 0 2-2v-2H10v2a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v3h4"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M15 8h-5M15 12h-5"/></svg></span><span class="rlbl">Logs</span></a>
   </nav>
   <div class="spacer"></div>
@@ -320,6 +399,7 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
   <div class="sub">The operator console for this Huntwell installation.</div>
   <label for="li-email">Email</label><input id="li-email" type="email" autocomplete="username" onkeydown="if(event.key==='Enter')login()">
   <label for="li-pass">Password</label><input id="li-pass" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')login()">
+  <div id="li-dev" class="muted" style="margin-top:.6rem;font-size:.86rem" hidden>Dev server: email <b>test</b>, no password, signs you in as a test operator.</div>
   <div id="li-err" class="notice" role="alert" hidden></div>
   <div class="row" style="margin-top:1rem"><button class="primary" id="li-btn" onclick="login()">Sign in</button></div>
 </div>
@@ -387,7 +467,7 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
 </section>
 
 <section class="page hide" data-page="users">
-  <div class="page-head"><div><h1>Users</h1><div class="sub">Who may join, every account, what each may build, and connected logins.</div></div></div>
+  <div class="page-head"><div><h1>Users</h1><div class="sub">Who may join, every account, what each may build, its modules, and connected logins.</div></div></div>
   <div class="card">
     <div class="card-head">
       <div><h2>Waitlist &amp; invites</h2>
@@ -413,8 +493,23 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
       <button class="primary sm" onclick="saveFeatures()">Save default</button>
       <span id="features-note" class="muted"></span>
     </div>
-    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th>2FA</th><th title="What this workspace is charged per million billable tokens">Rate $/M tokens</th><th title="Spendable credit in this workspace's wallet">Credits</th><th></th></tr></thead>
+    <table style="margin-top:1.2rem"><thead><tr><th>Account</th><th>Plans</th><th>Can build</th><th>Connected logins</th><th title="Optional modules switched on for this workspace">Modules</th><th title="Two-factor, and a password reset for someone who cannot sign in">Sign-in</th><th title="What this workspace is charged per million billable tokens">Rate $/M tokens</th><th title="Spendable credit in this workspace's wallet">Credits</th><th></th></tr></thead>
     <tbody id="accounts"></tbody></table>
+  </div>
+</section>
+
+<section class="page hide" data-page="support">
+  <div class="page-head">
+    <div><h1>Support</h1>
+      <div class="sub">Chats from the website and the app. Answer here or in the chat's Slack thread: your reply shows up in their chat, and is emailed to them if they have left the page.</div></div>
+    <div class="seg" id="sup-filter" role="group" aria-label="Show">
+      <button data-f="open" class="on" onclick="supFilter('open')">Open</button><button data-f="closed" onclick="supFilter('closed')">Closed</button><button data-f="all" onclick="supFilter('all')">All</button>
+    </div>
+  </div>
+  <div class="card sup-slack" id="sup-slack"></div>
+  <div class="card pad0 sup-wrap">
+    <div class="sup-list" id="sup-list"><div class="sup-empty">Loading…</div></div>
+    <div class="sup-thread" id="sup-thread"><div class="sup-empty" style="grid-row:1/-1;align-self:center">Pick a chat on the left.</div></div>
   </div>
 </section>
 
@@ -463,6 +558,25 @@ button.more{padding:.2rem .55rem;font-size:1rem;line-height:1;letter-spacing:.08
         <div class="sub">Every placement, re-queue and reap. Sortable and filterable.</div></div>
     </div>
     <div id="route-grid" class="card pad0 hw-grid ag-theme-quartz"></div>
+  </div>
+</section>
+
+<section class="page hide" data-page="schedule">
+  <div class="page-head"><div><h1>Schedule</h1><div class="sub">Every scheduled search plan, across all workspaces, and when it will run.</div></div>
+    <div class="row sched-range" id="sched-range">
+      <button class="sm" data-h="24">24 hours</button><button class="sm" data-h="72">3 days</button><button class="sm" data-h="168">7 days</button>
+    </div>
+  </div>
+  <div class="row" id="sched-stats"></div>
+  <div class="card">
+    <div class="card-head"><div><h2>Timeline</h2>
+      <div class="sub">One row per plan; each bar is a run, as long as that plan's runs usually take. The strip on top counts runs at once against the run capacity.</div></div></div>
+    <div id="sched-gantt" class="gantt"></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><div><h2>Upcoming runs</h2><div class="sub" id="sched-upsub"></div></div></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>When</th><th>Plan</th><th>Workspace</th><th>Repeats</th><th>Takes about</th><th>Last run</th></tr></thead>
+    <tbody id="sched-up"></tbody></table></div>
   </div>
 </section>
 
@@ -699,8 +813,8 @@ async function claim(){hideNotice('fr-err');
   }catch(e){showNotice('fr-err',e.status===401?{title:'That setup key is not right.',text:'Copy it from the box the admin printed when it started; a restart mints a new one.'}:explain(e,'Could not create the operator.'))}}
 
 // ---- pages: one per rail tile, picked by the hash so a reload stays put ----
-const PAGES=['home','users','models','routing','logs'];
-function currentPage(){const p=(location.hash||'').replace(/^#\/?/,'');return PAGES.includes(p)?p:'home'}
+const PAGES=['home','users','support','models','routing','schedule','logs'];
+function currentPage(){const p=(location.hash||'').replace(/^#\/?/,'').split('/')[0];return PAGES.includes(p)?p:'home'}
 let lastLog=[];
 function showPage(name){
   document.querySelectorAll('.page').forEach(el=>el.classList.toggle('hide',el.dataset.page!==name));
@@ -709,6 +823,8 @@ function showPage(name){
   // its page is on screen, not while hidden at zero width.
   if(name==='routing'&&!routeApi&&window.agGrid){initGrid();routeApi.setGridOption('rowData',lastLog)}
   if(name==='users'&&window.agGrid){initWaitlist();loadWaitlist()}
+  if(name==='schedule')loadSchedule()
+  if(name==='support')supOpenFromHash()
   $('app').parentElement.scrollTop=0;
 }
 window.addEventListener('hashchange',()=>{if(!$('app').classList.contains('hide'))showPage(currentPage())});
@@ -720,6 +836,7 @@ async function boot(){
     // An unclaimed control plane has nothing to sign in to, so offer the one
     // thing that can be done instead of a form that cannot succeed.
     const first=!!s.setupRequired;
+    $('li-dev').hidden=!s.devLogin;
     $('firstrun').classList.toggle('hide',!first);
     $('login').classList.toggle('hide',first);
     $('app').classList.add('hide');
@@ -761,7 +878,7 @@ function paintServices(sv){
   }).join('')||'<tr><td colspan="4" class="muted">No services listed.</td></tr>';
 }
 
-async function refresh(){try{
+async function refresh(){supTick();try{
   const [o,sv]=await Promise.all([
     api('GET','/admin/api/overview'),
     api('GET','/admin/api/services'),
@@ -1108,14 +1225,18 @@ async function loadFeatures(){
       <td>${esc(a.plans)}</td>
       <td>${boxes}<br><span class="muted" style="font-size:.78rem">${own.length?'set for this account':'following the default'}</span></td>
       <td class="row">${cl}</td>
-      <td>${a.mfa_enabled?`<span class="badge ok">on</span> <button class="sm" onclick="resetMfa(${a.account_id})" title="For someone who lost their device">Reset</button>`:'<span class="muted">off</span>'}</td>
+      <td>${(f.modules||[]).map(m=>`<label class="row" style="margin:0;display:inline-flex" title="Saved as soon as it is ticked">
+        <input type="checkbox" data-module-acct="${esc(a.account_id)}" data-module="${esc(m.id)}" style="width:auto"
+          onchange="saveModules(${Number(a.account_id)})" ${(a.modules||[]).includes(m.id)?'checked':''}> ${esc(m.name)}</label>`).join(' ')}</td>
+      <td style="white-space:nowrap"><span class="muted" style="font-size:.78rem">2FA</span> ${a.mfa_enabled?`<span class="badge ok">on</span> <button class="sm" onclick="resetMfa(${a.account_id})" title="For someone who lost their device">Reset</button>`:'<span class="muted">off</span>'}
+        <br><button class="sm" style="margin-top:.3rem" onclick="sendPasswordReset(${Number(a.account_id)})" title="Email them a code to choose a new password">Send password reset</button></td>
       <td>${rate}</td>
       <td style="white-space:nowrap"><b>${fmtUsd(a.credits_usd)}</b>
         <button class="sm" onclick="openCredit(${Number(a.account_id)})" style="margin-left:.35rem">Add</button>
         ${Number(a.granted_usd)>0?`<br><span class="muted" style="font-size:.78rem">${fmtUsd(a.granted_usd)} added free</span>`:''}</td>
       <td class="row"><button class="sm" onclick="saveAccount(${a.account_id})">Save</button>
       <button class="sm" onclick="resetAccount(${a.account_id})" title="Follow the installation default again">Reset</button></td></tr>`}).join('')
-    ||'<tr><td colspan="8" class="muted">No accounts yet.</td></tr>';
+    ||'<tr><td colspan="9" class="muted">No accounts yet.</td></tr>';
   ACCOUNTS=Object.fromEntries(as.map(a=>[Number(a.account_id),a]));
 }
 
@@ -1254,6 +1375,72 @@ async function declineWaitlist(id){
   try{await api('POST',`/admin/api/waitlist/${id}/decline`);loadWaitlist()}
   catch(e){showWlNote(errText(e),true)}}
 
+// ---- schedule ----
+let SCHED_HOURS=24;
+document.addEventListener('click',e=>{const b=e.target.closest('#sched-range button');if(!b)return;SCHED_HOURS=+b.dataset.h;loadSchedule()});
+const DAY_NAMES=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function repeats(p){
+  const days=(p.schedule_days||'').split(',').filter(Boolean).map(Number);
+  const when=days.length===0?'Daily':days.length===7?'Daily':days.map(d=>DAY_NAMES[d]).join(', ');
+  return `${when} at ${esc(p.schedule_time)} <span class="muted">${esc(p.timezone)}</span>`}
+function mins(m){return m>=60?`${Math.floor(m/60)}h${Math.round(m%60)?' '+Math.round(m%60)+'m':''}`:`${Math.max(1,Math.round(m))}m`}
+function whenLabel(iso){const d=new Date(iso);
+  return d.toLocaleString(undefined,{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
+async function loadSchedule(){
+  document.querySelectorAll('#sched-range button').forEach(b=>b.classList.toggle('on',+b.dataset.h===SCHED_HOURS));
+  let r;try{r=await api('GET',`/admin/api/schedule?hours=${SCHED_HOURS}`)}catch(e){$('sched-gantt').innerHTML=`<div class="g-empty">${esc(errText(e))}</div>`;return}
+  const now=new Date(r.now).getTime(),end=new Date(r.until).getTime(),span=end-now;
+  const runs=r.plans.reduce((n,p)=>n+p.fires.length,0);
+  const over=r.capacity>0&&r.peak>r.capacity;
+  $('sched-stats').innerHTML=[['Scheduled plans',r.plans.length],['Runs coming up',runs],
+    [`Most at once${r.peak_at?' · '+whenLabel(r.peak_at):''}`,`${r.peak}${r.capacity?` / ${r.capacity}`:''}`],['Running now',r.running.length]]
+    .map(([l,n],i)=>`<div class="stat"${i===2&&over?' style="border-color:var(--bad)"':''}><div class="n"${i===2&&over?' style="color:var(--bad)"':''}>${n}</div><div class="l">${esc(l)}</div></div>`).join('');
+  // The axis: an hour a tick over a day, six over three days, a day over a week.
+  const step=(SCHED_HOURS<=24?1:SCHED_HOURS<=72?6:24)*3600e3;
+  const pct=t=>((t-now)/span*100);
+  const tickPct=step/span*100;
+  let ticks='';
+  for(let t=Math.ceil(now/step)*step;t<end;t+=step){const d=new Date(t);
+    const label=SCHED_HOURS<=24?d.toLocaleTimeString(undefined,{hour:'numeric'}):d.toLocaleString(undefined,SCHED_HOURS<=72?{weekday:'short',hour:'numeric'}:{weekday:'short',month:'short',day:'numeric'});
+    ticks+=`<span class="g-tick" style="left:${pct(t)}%">${esc(label)}</span>`}
+  let days='';
+  for(let d=new Date(now);d.getTime()<end;){d.setHours(24,0,0,0);if(d.getTime()<end)days+=`<span class="g-day" style="left:${pct(d.getTime())}%"></span>`}
+  const track=(inner,extra='')=>`<div class="g-track" style="--tick:${tickPct}%"${extra}>${days}${inner}<span class="g-now" style="left:0" title="Now"></span></div>`;
+  // Load: how many runs at once, in 96 slices, against the capacity line.
+  const N=96,cols=new Array(N).fill(0);
+  const ranges=[];
+  r.plans.forEach(p=>p.fires.forEach(f=>{const s=new Date(f).getTime();ranges.push([s,s+p.est_minutes*60e3])}));
+  r.running.forEach(x=>{const p=r.plans.find(q=>q.plan_id===x.plan_id);const s=new Date(x.started_at).getTime();ranges.push([s,Math.max(now+60e3,s+(p?p.est_minutes:15)*60e3)])});
+  for(let i=0;i<N;i++){const a=now+span*i/N,b=now+span*(i+1)/N;cols[i]=ranges.filter(([s,e])=>s<b&&e>a).length}
+  const top=Math.max(1,r.capacity||0,...cols);
+  const load=cols.map((c,i)=>c?`<span class="g-col${r.capacity&&c>r.capacity?' over':''}" style="left:${i/N*100}%;width:${100/N}%;height:${c/top*36}px" title="${c} run${c===1?'':'s'} at once"></span>`:'').join('')
+    +(r.capacity?`<span class="g-cap" style="bottom:${4+r.capacity/top*36}px" title="Run capacity: ${r.capacity}"></span>`:'');
+  // One row per plan, a bar per run. A run going now is green, one waiting amber.
+  const rows=r.plans.filter(p=>p.fires.length||r.running.some(x=>x.plan_id===p.plan_id));
+  const extraRunning=r.running.filter(x=>!r.plans.some(p=>p.plan_id===x.plan_id));
+  const bar=(s,e,cls,tip)=>{const l=Math.max(0,pct(s)),w=Math.max(.25,Math.min(100,pct(e))-l);
+    return `<span class="g-bar ${cls}" style="left:${l}%;width:${w}%" title="${esc(tip)}"></span>`};
+  const planRow=(name,sub,bars)=>`<div class="g-row"><div class="g-label"><b title="${esc(name)}">${esc(name)}</b><span title="${esc(sub)}">${esc(sub)}</span></div>${track(bars)}</div>`;
+  let html=`<div class="gantt-inner"><div class="g-row g-axis"><div class="g-label"></div>${track(ticks)}</div>`
+    +`<div class="g-row g-load"><div class="g-label"><b>Runs at once</b><span>${r.capacity?`capacity ${r.capacity}`:'capacity unknown'}</span></div>${track(load)}</div>`;
+  rows.forEach(p=>{
+    let bars=p.fires.map(f=>{const s=new Date(f).getTime();return bar(s,s+p.est_minutes*60e3,'',`${p.plan} — ${whenLabel(f)}, about ${mins(p.est_minutes)} (${p.est_basis})`)}).join('');
+    r.running.filter(x=>x.plan_id===p.plan_id).forEach(x=>{const s=new Date(x.started_at).getTime();
+      bars+=bar(s,Math.max(now+60e3,s+p.est_minutes*60e3),x.status,`${p.plan} — ${x.status} since ${whenLabel(x.started_at)} (run #${x.execution_id})`)});
+    html+=planRow(p.plan,`${p.owner} · ${p.schedule_time} ${p.timezone}`,bars)});
+  extraRunning.forEach(x=>{const s=new Date(x.started_at).getTime();
+    html+=planRow(x.plan,'not scheduled — started by hand',bar(s,now+15*60e3,x.status,`${x.plan} — ${x.status} since ${whenLabel(x.started_at)} (run #${x.execution_id})`))});
+  if(!rows.length&&!extraRunning.length)html+=`<div class="g-empty">Nothing is scheduled to run in the next ${SCHED_HOURS<=24?'24 hours':SCHED_HOURS/24+' days'}.</div>`;
+  $('sched-gantt').innerHTML=html+'</div>';
+  // The list: every run in the window, soonest first.
+  const up=[];r.plans.forEach(p=>p.fires.forEach(f=>up.push([f,p])));up.sort((a,b)=>a[0].localeCompare(b[0]));
+  $('sched-upsub').textContent=up.length?`${up.length} run${up.length===1?'':'s'} in the window, in your time; each plan's own timezone beside its schedule.`:'';
+  $('sched-up').innerHTML=up.map(([f,p])=>`<tr><td style="white-space:nowrap"><b>${esc(whenLabel(f))}</b></td><td>${esc(p.plan)}</td><td>${esc(p.owner)}</td>
+    <td>${repeats(p)}</td><td title="${esc(p.est_basis)}">${esc(mins(p.est_minutes))}</td>
+    <td>${p.last_status?`<span class="badge ${p.last_status==='succeeded'?'ok':p.last_status==='failed'?'bad':'warn'}">${esc(p.last_status)}</span> <span class="muted">${p.last_started_at?esc(ago(p.last_started_at)):''}</span>`:'<span class="muted">never</span>'}</td></tr>`).join('')
+    ||'<tr><td colspan="6" class="muted">Nothing scheduled in this window.</td></tr>';
+}
+
 async function saveFeatures(){
   const kinds=[...document.querySelectorAll('#features input[data-kind]')].filter(b=>b.checked).map(b=>b.dataset.kind);
   try{await api('PUT','/admin/api/features',{kinds});
@@ -1273,6 +1460,9 @@ async function saveRate(id){
   if(!confirm(usd_per_mtoken===null?'Put this workspace back on the default rate? It applies to tokens billed from now on.'
     :`Charge this workspace $${usd_per_mtoken} per million tokens? It applies to tokens billed from now on.`))return;
   try{await api('PUT',`/admin/api/accounts/${id}/rate`,{usd_per_mtoken});loadFeatures()}catch(e){alert(errText(e))}}
+async function sendPasswordReset(id){const a=ACCOUNTS[id];
+  if(!confirm(`Email ${a?a.email:'this account'} a password reset? They get a six-digit code (valid 15 minutes) and a link to choose a new password. Their current password keeps working until they do.`))return;
+  try{const r=await api('POST',`/admin/api/accounts/${id}/password-reset`);alert(`Password reset sent to ${r.email}.`)}catch(e){alert(errText(e))}}
 async function resetMfa(id){if(!confirm('Turn two-factor authentication off for this account? They sign in with their password alone until they set up a device again.'))return;
   try{await api('DELETE',`/admin/api/accounts/${id}/mfa`);loadFeatures()}catch(e){alert(errText(e))}}
 async function setConnectedLogins(id,on){
@@ -1280,6 +1470,11 @@ async function setConnectedLogins(id,on){
   // put real credentials into a remote browser.
   if(on&&!confirm('Let this workspace connect an authenticated session?\n\nThey will sign in to a site in a remote browser and runs will collect as that signed-in user.'))return;
   try{await api('PUT',`/admin/api/accounts/${id}/connected-logins`,{on});loadFeatures()}catch(e){alert(e.message)}}
+
+// A module is a switch, so it saves when ticked rather than waiting for the row's Save.
+async function saveModules(id){
+  const modules=[...document.querySelectorAll(`input[data-module-acct="${id}"]`)].filter(b=>b.checked).map(b=>b.dataset.module);
+  try{await api('PUT',`/admin/api/accounts/${id}/modules`,{modules});loadFeatures()}catch(e){alert(errText(e));loadFeatures()}}
 
 async function resetAccount(id){
   try{await api('PUT',`/admin/api/accounts/${id}/kinds`,{kinds:[]});loadFeatures()}catch(e){alert(e.message)}}
@@ -1377,6 +1572,124 @@ async function saveRouting(){const strat=document.querySelector('[name=strat]:ch
   if(strat==='pinned'&&pin){const[h,p]=pin.split(':');body.pinned_host_id=+h;body.pinned_slot=p}
   await api('PUT','/admin/api/routing',body);$('routing-note').textContent='saved';
   setTimeout(()=>$('routing-note').textContent='',1500)}
+
+// ---- support -------------------------------------------------------------------
+// The inbox polls with everything else (5s). The open chat re-renders its
+// messages only, never the reply box, so a half-typed answer survives.
+const SUP={filter:'open',sel:null,rows:[],count:-1,editingSlack:false};
+function supWhen(iso){const d=new Date(iso);const s=(Date.now()-d)/1000;
+  return s<86400?ago(iso):d.toLocaleDateString(undefined,{month:'short',day:'numeric'})}
+function supFilter(f){SUP.filter=f;document.querySelectorAll('#sup-filter button').forEach(b=>b.classList.toggle('on',b.dataset.f===f));loadSupport()}
+function supOpenFromHash(){const id=+((location.hash.split('/')[2])||0);SUP.sel=id||SUP.sel;loadSupport();if(SUP.sel)loadChat(true)}
+async function supTick(){
+  try{
+    const onPage=!$('app').classList.contains('hide')&&currentPage()==='support';
+    if(onPage){await loadSupport();if(SUP.sel)await loadChat(false)}
+    else{const r=await api('GET','/admin/api/support?status=open');paintBadge(r.unread)}
+  }catch(e){}
+}
+function paintBadge(n){const b=$('sup-badge');b.hidden=!n;b.textContent=n>9?'9+':String(n)}
+async function loadSupport(){
+  const r=await api('GET','/admin/api/support?status='+SUP.filter);
+  SUP.rows=r.rows;paintBadge(r.unread);if(!SUP.editingSlack)paintSlack(r.slack);
+  $('sup-list').innerHTML=r.rows.length?r.rows.map(c=>{
+    const who=c.name?.trim()?c.name:c.email;
+    const snip=(c.last_author==='operator'?'You: ':'')+(c.last_body||'Screenshot');
+    return `<button class="sup-item${c.conversation_id===SUP.sel?' on':''}${c.unread?' unread':''}" onclick="pickChat(${c.conversation_id})">
+      <span class="top"><span class="nm">${esc(who)}</span><span class="when">${esc(supWhen(c.last_message_at))}</span></span>
+      <span class="snip">${esc(snip)}</span></button>`}).join('')
+    :`<div class="sup-empty">${SUP.filter==='open'?'No open chats. Nice.':'Nothing here.'}</div>`;
+}
+function paintSlack(sl){
+  const el=$('sup-slack');SUP.slack=sl;
+  if(sl.set){
+    const ear=!sl.replies?`<span class="badge warn">replies not heard</span>`
+      :sl.heard_at?`<span class="badge ok" title="Slack last called ${esc(ago(sl.heard_at))}">replies heard</span>`
+      :`<span class="badge warn">no word from Slack yet</span>`;
+    const note=!sl.replies?'Add the signing secret (Change) so replies typed in Slack reach the person.'
+      :sl.heard_at?'':sl.request_url?`Slack sends replies to <code>${esc(sl.request_url)}</code>. In the app's <b>Event Subscriptions</b>, that Request URL must show as verified.`
+      :'Slack has no address to send replies to: set HUNTWELL_PUBLIC_URL.';
+    el.innerHTML=`<span class="lbl">Slack</span><span class="muted">Each chat is a thread in <span class="badge ok">${esc(sl.label||sl.channel)}</span> ${ear}</span>
+    <span class="row" style="margin-left:auto"><button class="sm" onclick="testSlack(this)">Send test</button><button class="sm" onclick="editSlack()">Change</button></span>
+    <span class="muted" id="sup-slack-note" style="flex-basis:100%;font-size:.84rem">${note}</span>`}
+  else{el.innerHTML=`<span class="lbl">Slack</span><span class="muted">Connect Slack and every chat becomes a thread you can answer right there.</span>
+    <span class="row" style="margin-left:auto"><button class="sm primary" onclick="editSlack()">Connect Slack</button></span>`}
+}
+function editSlack(){SUP.editingSlack=true;const sl=SUP.slack||{};const keep=sl.set?' (leave blank to keep)':'';
+  const url=sl.request_url?`<code>${esc(sl.request_url)}</code>`:'<i>this site</i>/slack/events (HUNTWELL_PUBLIC_URL is not set here)';
+  $('sup-slack').innerHTML=`<span class="lbl">Connect Slack</span>
+  <ol>
+    <li>At <a href="https://api.slack.com/apps?new_app=1" target="_blank" rel="noopener">api.slack.com/apps</a>: <b>Create New App → From a manifest</b>, pick your workspace, and paste <a href="#" onclick="event.preventDefault();copyManifest(this)">this manifest</a> (JSON).</li>
+    <li><b>Install to Workspace</b>, then copy the <b>Bot User OAuth Token</b> (xoxb-…) from <b>OAuth &amp; Permissions</b>.</li>
+    <li>From <b>Basic Information → App Credentials</b>, copy the <b>Signing Secret</b>.</li>
+    <li>In the channel, type <code>/invite @Huntwell Support</code>. Its ID (C…) is at the bottom of the channel's details.</li>
+    <li>After you connect: in <b>Event Subscriptions</b>, the Request URL ${url} must show as verified. If Slack could not reach it when the app was made, press <b>Retry</b> there.</li>
+  </ol>
+  <textarea class="manifest" id="sup-manifest" readonly>${esc(JSON.stringify(sl.manifest||{},null,2))}</textarea>
+  <div class="fields">
+    <label for="sup-bot">Bot token</label><input id="sup-bot" placeholder="xoxb-…${keep}" autocomplete="off" spellcheck="false">
+    <label for="sup-sign">Signing secret</label><input id="sup-sign" placeholder="32 characters${keep}" autocomplete="off" spellcheck="false">
+    <label for="sup-chan">Channel ID</label><input id="sup-chan" placeholder="C0123456789" value="${esc(sl.channel||'')}" autocomplete="off" spellcheck="false">
+  </div>
+  <span class="row"><button class="sm primary" onclick="saveSlack(this)">Connect</button>${sl.set?`<button class="sm" onclick="offSlack()">Disconnect</button>`:''}<button class="sm" onclick="SUP.editingSlack=false;loadSupport()">Cancel</button></span>
+  <div class="muted" style="flex-basis:100%;font-size:.84rem">Anyone in that channel can answer customers. A thread reply starting with <code>//</code> stays in Slack.</div>
+  <div class="muted" id="sup-slack-note" style="flex-basis:100%"></div>`;$(sl.set?'sup-chan':'sup-bot').focus()}
+async function copyManifest(a){const t=$('sup-manifest');t.classList.add('on');t.select();
+  try{await navigator.clipboard.writeText(t.value);a.textContent='this manifest (copied)'}catch(e){}}
+async function saveSlack(b){b.disabled=true;$('sup-slack-note').textContent='Checking with Slack…';
+  try{const sl=await api('PUT','/admin/api/support/slack',{bot_token:$('sup-bot').value,signing_secret:$('sup-sign').value,channel:$('sup-chan').value});
+    SUP.editingSlack=false;paintSlack(sl)}
+  catch(e){$('sup-slack-note').textContent=errText(e)}finally{b.disabled=false}}
+async function offSlack(){if(!confirm('Disconnect Slack? Chats stay here; nothing more is posted to the channel.'))return;
+  try{const sl=await api('PUT','/admin/api/support/slack',{off:true});SUP.editingSlack=false;paintSlack(sl)}
+  catch(e){$('sup-slack-note').textContent=errText(e)}}
+async function testSlack(b){b.disabled=true;const n=$('sup-slack-note');
+  try{await api('POST','/admin/api/support/slack/test');n.textContent='Sent. Check the channel.'}
+  catch(e){n.textContent=errText(e)}finally{b.disabled=false}}
+function pickChat(id){SUP.sel=id;history.replaceState(null,'','#/support/'+id);
+  document.querySelectorAll('.sup-item').forEach(b=>b.classList.remove('on'));loadChat(true)}
+async function loadChat(fresh){
+  const id=SUP.sel;let r;
+  try{r=await api('GET','/admin/api/support/'+id)}catch(e){if(e.status===404){SUP.sel=null;$('sup-thread').innerHTML='<div class="sup-empty" style="grid-row:1/-1;align-self:center">That chat is gone.</div>'}return}
+  if(id!==SUP.sel)return;
+  const c=r.conversation,u=r.customer;
+  if(fresh||!$('sup-reply-'+id)){
+    $('sup-thread').innerHTML=`<div class="sup-head" id="sup-head"></div><div class="sup-info" id="sup-info"></div>
+      <div class="sup-msgs" id="sup-msgs"></div>
+      <div class="sup-reply"><textarea id="sup-reply-${id}" placeholder="Write a reply…" onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();sendReply()}"></textarea>
+        <div class="row"><span class="muted" id="sup-reply-note" style="font-size:.84rem">⌘/Ctrl + Enter to send</span><button class="primary" id="sup-send" onclick="sendReply()">Send reply</button></div></div>`;
+    SUP.count=-1;
+  }
+  const who=c.name?.trim()?`${esc(c.name)} <span class="muted">&lt;${esc(c.email)}&gt;</span>`:esc(c.email);
+  $('sup-head').innerHTML=`<div><h2>${who}</h2><div class="sub">${c.account_id?'Signed in':'Visitor'}${c.page?' · started on '+esc(c.page):''} · ${esc(new Date(c.created_at).toLocaleString())}
+      ${c.slack_error?` · <span class="badge warn" title="${esc(c.slack_error)}">not posted to Slack</span>`:''}</div></div>
+    <div class="row">${c.status==='open'?`<button class="sm" onclick="setChat(false)">Close chat</button>`:c.status==='ended'?`<span class="badge" title="They start a new chat to write again.">ended by them</span>`:`<span class="badge">closed</span><button class="sm" onclick="setChat(true)">Reopen</button>`}</div>`;
+  const info=$('sup-info');
+  if(u){const credit=u.credits_usd==null?'—':'$'+Number(u.credits_usd).toFixed(2);
+    const runs=(u.runs||[]).map(x=>`${esc(x.plan)} <span class="muted">(${esc(x.status)}, ${esc(ago(x.started_at))})</span>`).join(' · ')||'none yet';
+    info.hidden=false;info.innerHTML=`<span><span class="k">Account</span><b>#${u.account_id}</b> · joined ${esc(new Date(u.joined).toLocaleDateString())}${u.two_factor?' · 2FA on':''}</span>
+      <span><span class="k">Workspace</span><b>${esc(u.workspace||'(unnamed)')}</b>${u.own_workspace?'':' (a team they belong to)'}</span>
+      <span><span class="k">Credit</span><b>${credit}</b></span><span><span class="k">Plans</span><b>${u.plans}</b></span>
+      <span style="flex-basis:100%"><span class="k">Recent runs</span>${runs}</span>`}
+  else{info.hidden=false;info.innerHTML=`<span class="muted">Not signed in. Replies are emailed to ${esc(c.email)} when they are not on the page.${c.ip?' · IP '+esc(c.ip):''}</span>`}
+  const box=$('sup-msgs');const near=box.scrollHeight-box.scrollTop-box.clientHeight<80;
+  if(r.messages.length!==SUP.count){
+    box.innerHTML=r.messages.map(m=>`<div class="sup-msg${m.author==='operator'?' op':''}">${(m.image_ids||[]).map(i=>`<a href="/admin/api/support/image/${i}" target="_blank" rel="noopener"><img class="sup-shot" src="/admin/api/support/image/${i}" alt="Screenshot"></a>`).join('')}${esc(m.body)}<span class="meta">${m.author==='operator'?esc(m.operator_email)+' · ':''}${esc(new Date(m.created_at).toLocaleString())}</span></div>`).join('');
+    if(near||SUP.count===-1)box.scrollTop=box.scrollHeight;
+    SUP.count=r.messages.length;
+  }
+  if(fresh){$('sup-reply-'+id).focus();loadSupport()}
+}
+async function sendReply(){
+  const ta=$('sup-reply-'+SUP.sel);const body=ta.value.trim();if(!body)return;
+  const b=$('sup-send');b.disabled=true;const note=$('sup-reply-note');
+  try{const r=await api('POST',`/admin/api/support/${SUP.sel}/reply`,{body});ta.value='';
+    note.textContent=r.emailed?'Sent, and emailed to them (they are not on the page).':'Sent. They are on the page and will see it there.';
+    await loadChat(false);loadSupport()}
+  catch(e){note.textContent=errText(e)}finally{b.disabled=false}}
+async function setChat(open){
+  try{await api('POST',`/admin/api/support/${SUP.sel}/status`,{open});await loadChat(false);loadSupport()}
+  catch(e){alert(errText(e))}}
 
 boot();
 </script>

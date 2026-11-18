@@ -30,8 +30,8 @@ const PAGE_META: Record<string, { title: string; description: string }> = {
     description: 'Sales prospecting, market and listing watch, hiring research, research briefs, tenders and document collection: what people use Huntwell for.',
   },
   '/pricing': {
-    title: 'Pricing — pay for the tokens a run spends | Huntwell',
-    description: 'Huntwell charges by how many tokens a browse uses. Prepaid credits, no seat fee, and a cap on every run.',
+    title: 'Pricing — one flat rate, pay for what you use | Huntwell',
+    description: 'One flat price per million AI tokens. Pay only for what you use: no subscription, no seat fees, no tiers, and a cap on every run.',
   },
   '/terms': { title: 'Terms of Service | Huntwell', description: 'The terms that apply to using Huntwell.' },
   '/privacy': { title: 'Privacy Policy | Huntwell', description: 'What Huntwell collects, why, and what you can ask us to do with it.' },

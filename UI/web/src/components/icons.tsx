@@ -186,3 +186,26 @@ export function GmailIcon({ size = 14 }: { size?: number }) {
   )
 }
 
+/** LinkedIn's "in" mark, for "Open in LinkedIn". Brand colour: --linkedin. */
+export function LinkedInIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden style={{ flex: 'none' }}>
+      <rect width="24" height="24" rx="4" style={{ fill: 'var(--linkedin)' }} />
+      <path
+        style={{ fill: 'var(--brand-on-color)' }}
+        d="M7.1 9.6h-2.6V19h2.6V9.6zM5.8 5a1.5 1.5 0 100 3 1.5 1.5 0 000-3zM19.5 13.6c0-2.6-1.4-4.2-3.6-4.2-1.3 0-2.2.7-2.6 1.4V9.6h-2.5V19h2.6v-4.9c0-1.3.6-2.2 1.7-2.2 1.1 0 1.6.8 1.6 2.2V19h2.8v-5.4z"
+      />
+    </svg>
+  )
+}
+
+/** An envelope in Outlook's blue, for "Open in Outlook". Brand colour: --outlook. */
+export function OutlookIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden style={{ flex: 'none' }}>
+      <rect x="1" y="4" width="22" height="16" rx="3" style={{ fill: 'var(--outlook)' }} />
+      <path d="M3.5 7.5 12 13l8.5-5.5" fill="none" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ stroke: 'var(--brand-on-color)' }} />
+    </svg>
+  )
+}
+
